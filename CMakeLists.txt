@@ -174,12 +174,14 @@ if (LLAMA_HIPBLAS)
         list(APPEND CMAKE_PREFIX_PATH /opt/rocm)
     endif()
 
+
     if (NOT ${CMAKE_C_COMPILER_ID} MATCHES "Clang")
         message(WARNING "Only LLVM is supported for HIP, hint: CC=/opt/rocm/llvm/bin/clang")
     endif()
     if (NOT ${CMAKE_CXX_COMPILER_ID} MATCHES "Clang")
         message(WARNING "Only LLVM is supported for HIP, hint: CXX=/opt/rocm/llvm/bin/clang++")
     endif()
+
     find_package(hip)
     find_package(hipblas)
     find_package(rocblas)
@@ -210,7 +212,7 @@ if (LLAMA_HIPBLAS)
         if (GGML_HIP_NO_VMM)
             add_compile_definitions(GGML_HIP_NO_VMM)
         endif()
-                
+
         add_compile_definitions(GGML_USE_HIPBLAS GGML_USE_HIP GGML_USE_CUDA SD_USE_CUBLAS)
         add_library(ggml-rocm OBJECT ${GGML_SOURCES_CUDA})
 
@@ -544,11 +546,15 @@ add_library(common2
             tools/mtmd/clip.h
             src/unicode.h
             src/unicode.cpp
+            common/unicode.h
+            common/unicode.cpp
             src/llama-impl.h
             src/llama-impl.cpp
             src/unicode-data.cpp
             otherarch/utils.cpp
             otherarch/utils.h
+            common/reasoning-budget.cpp
+            common/reasoning-budget.h
             tools/mtmd/mtmd-audio.cpp
             tools/mtmd/mtmd-audio.h)
 target_include_directories(common2 PUBLIC . ./ggml/include ./ggml/src ./ggml/src/ggml-cpu ./include ./otherarch ./otherarch/tools ./vendor/stb ./vendor ./otherarch/sdcpp ./otherarch/sdcpp/thirdparty ./tools ./common)
@@ -570,9 +576,16 @@ target_compile_features(whisper_adapter PUBLIC cxx_std_17) # don't bump
 target_link_libraries(whisper_adapter PRIVATE common2 ggml ${LLAMA_EXTRA_LIBS})
 set_target_properties(whisper_adapter PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+add_library(music_adapter
+            otherarch/acestep/music_adapter.cpp)
+target_include_directories(music_adapter PUBLIC . ./ggml/include ./ggml/src ./ggml/src/ggml-cpu ./include ./otherarch ./otherarch/tools ./vendor/stb ./vendor ./otherarch/acestep ./tools ./common)
+target_compile_features(music_adapter PUBLIC cxx_std_17) # don't bump
+target_link_libraries(music_adapter PRIVATE common2 ggml ${LLAMA_EXTRA_LIBS})
+set_target_properties(music_adapter PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(tts_adapter
             otherarch/tts_adapter.cpp)
-target_include_directories(tts_adapter PUBLIC . ./ggml/include ./ggml/src ./ggml/src/ggml-cpu ./include ./otherarch ./otherarch/tools ./vendor/stb ./vendor ./otherarch/ttscpp/include ./otherarch/ttscpp/src ./tools ./common)
+target_include_directories(tts_adapter PUBLIC . ./ggml/include ./ggml/src ./ggml/src/ggml-cpu ./include ./otherarch ./otherarch/tools ./vendor/stb ./vendor ./otherarch/ttscpp/include ./otherarch/ttscpp/src ./otherarch/qwen3tts ./tools ./common)
 target_compile_features(tts_adapter PUBLIC cxx_std_17) # don't bump
 target_link_libraries(tts_adapter PRIVATE common2 ggml ${LLAMA_EXTRA_LIBS})
 set_target_properties(tts_adapter PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -599,7 +612,7 @@ if (LLAMA_CUBLAS)
     set_target_properties(${TARGET} PROPERTIES PREFIX "")
     set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME "koboldcpp_cublas")
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_link_libraries(${TARGET} PUBLIC Threads::Threads ggml ggml_v1 ggml_v2 ggml_v3 common2 gpttype_adapter whisper_adapter tts_adapter embeddings_adapter sdtype_adapter ${LLAMA_EXTRA_LIBS})
+    target_link_libraries(${TARGET} PUBLIC Threads::Threads ggml ggml_v1 ggml_v2 ggml_v3 common2 gpttype_adapter whisper_adapter music_adapter tts_adapter embeddings_adapter sdtype_adapter ${LLAMA_EXTRA_LIBS})
     target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
     add_custom_command(
@@ -624,7 +637,7 @@ if (LLAMA_HIPBLAS)
     set_target_properties(${TARGET} PROPERTIES PREFIX "")
     set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME "koboldcpp_hipblas")
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_link_libraries(${TARGET} PRIVATE Threads::Threads ggml ggml_v1 ggml_v2 ggml_v3 common2 gpttype_adapter whisper_adapter tts_adapter embeddings_adapter sdtype_adapter ${LLAMA_EXTRA_LIBS})
+    target_link_libraries(${TARGET} PRIVATE Threads::Threads ggml ggml_v1 ggml_v2 ggml_v3 common2 gpttype_adapter whisper_adapter music_adapter tts_adapter embeddings_adapter sdtype_adapter ${LLAMA_EXTRA_LIBS})
     target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
     add_custom_command(

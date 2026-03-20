@@ -15,6 +15,7 @@ enum ffn_op_type {
     FFN_GELU_ERF,
     FFN_SILU,
     FFN_GELU_QUICK,
+    FFN_RELU_SQR,
 };
 
 enum norm_type {
@@ -45,7 +46,7 @@ struct clip_hparams {
     float image_std[3];
 
     // for models using dynamic image size, we need to have a smaller image size to warmup
-    // otherwise, user will get OOM everytime they load the model
+    // otherwise, user will get OOM every time they load the model
     int32_t warmup_image_size = 0;
     int32_t warmup_audio_size = 3000;
 
@@ -61,6 +62,7 @@ struct clip_hparams {
     std::unordered_set<int32_t> vision_feature_layer;
     int32_t attn_window_size = 0;
     int32_t n_wa_pattern = 0;
+    std::unordered_set<int32_t> wa_layer_indexes; // explicit layer indexes that use full attention (for irregular patterns like YoutuVL)
 
     // audio
     int32_t n_mel_bins = 0; // whisper preprocessor
@@ -172,6 +174,45 @@ struct clip_layer {
     }
 };
 
+// Expanded MobileNetV5 block structure for Gemma3n vision encoder
+struct mobilenetv5_block {
+    // Stage 0 (Edge Residual)
+    ggml_tensor * s0_conv_exp_w = nullptr;
+    ggml_tensor * s0_bn1_w      = nullptr;
+    ggml_tensor * s0_conv_pwl_w = nullptr;
+    ggml_tensor * s0_bn2_w      = nullptr;
+
+    // Stage 1+ (Universal Inverted Residual)
+    ggml_tensor * dw_start_w    = nullptr;
+    ggml_tensor * dw_start_bn_w = nullptr;
+
+    ggml_tensor * pw_exp_w      = nullptr;
+    ggml_tensor * pw_exp_bn_w   = nullptr;
+
+    ggml_tensor * dw_mid_w      = nullptr;
+    ggml_tensor * dw_mid_bn_w   = nullptr;
+
+    ggml_tensor * pw_proj_w     = nullptr;
+    ggml_tensor * pw_proj_bn_w  = nullptr;
+
+    ggml_tensor * layer_scale_w = nullptr;
+
+    // Attention (MQA) components
+    ggml_tensor * attn_q_w = nullptr;
+    ggml_tensor * attn_k_w = nullptr;
+    ggml_tensor * attn_v_w = nullptr;
+    ggml_tensor * attn_o_w = nullptr;
+
+    // Optional downsampling/norm in attention
+    ggml_tensor * attn_k_dw_w   = nullptr;
+    ggml_tensor * attn_k_norm_w = nullptr;
+    ggml_tensor * attn_v_dw_w   = nullptr;
+    ggml_tensor * attn_v_norm_w = nullptr;
+
+    // Block norm (often present in attention blocks)
+    ggml_tensor * attn_norm_w   = nullptr;
+};
+
 struct clip_model {
     clip_modality modality = CLIP_MODALITY_VISION;
     projector_type proj_type = PROJECTOR_TYPE_MLP;
@@ -180,7 +221,7 @@ struct clip_model {
     // embeddings
     ggml_tensor * class_embedding = nullptr;
     ggml_tensor * patch_embeddings_0 = nullptr;
-    ggml_tensor * patch_embeddings_1 = nullptr;  // second Conv2D kernel when we decouple Conv3D along temproal dimension (Qwen2VL)
+    ggml_tensor * patch_embeddings_1 = nullptr;  // second Conv2D kernel when we decouple Conv3D along temporal dimension (Qwen2VL)
     ggml_tensor * patch_bias = nullptr;
     ggml_tensor * position_embeddings = nullptr;
     ggml_tensor * norm_embd_w = nullptr;
@@ -288,6 +329,23 @@ struct clip_model {
     ggml_tensor * mm_input_proj_w = nullptr;
     ggml_tensor * mm_soft_emb_norm_w = nullptr;
 
+    // mobilenetv5 for gemma3n
+    std::vector<mobilenetv5_block> mobilenet_blocks;
+    std::vector<int> mobilenet_stage_ends;
+    ggml_tensor * mobilenet_stem_conv_w = nullptr;
+    ggml_tensor * mobilenet_stem_conv_b = nullptr;
+    ggml_tensor * mobilenet_stem_norm_w = nullptr;
+    ggml_tensor * mm_post_proj_norm_w = nullptr;
+
+    // Multi-Scale Fusion Adapter (MSFA) components
+    ggml_tensor * msfa_concat_conv_w = nullptr;
+    ggml_tensor * msfa_concat_norm_w = nullptr;
+    ggml_tensor * msfa_ffn_expand_w = nullptr;
+    ggml_tensor * msfa_ffn_project_w = nullptr;
+    ggml_tensor * msfa_ffn_expand_bn = nullptr;
+    ggml_tensor * msfa_ffn_project_bn = nullptr;
+
+
     // pixtral, glm4v
     ggml_tensor * token_embd_img_break = nullptr;
     ggml_tensor * mm_patch_merger_w = nullptr;
@@ -319,7 +377,8 @@ struct clip_model {
 
     bool audio_has_avgpool() const {
         return proj_type == PROJECTOR_TYPE_QWEN2A
-            || proj_type == PROJECTOR_TYPE_VOXTRAL;
+            || proj_type == PROJECTOR_TYPE_VOXTRAL
+            || proj_type == PROJECTOR_TYPE_MUSIC_FLAMINGO;
     }
 
     bool audio_has_stack_frames() const {
