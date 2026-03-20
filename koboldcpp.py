@@ -6915,7 +6915,7 @@ def show_gui():
             runmode_untouched = True
             fetch_gpu_properties(False,True,True)
         else:
-            fetch_gpu_properties(True,True,True,True)
+            fetch_gpu_properties(True,True,True,False)
         found_new_backend = False
 
         # check for avx2 and avx support
