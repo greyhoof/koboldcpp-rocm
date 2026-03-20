@@ -6274,18 +6274,6 @@ def show_gui():
     contextsize_text = ["256", "512", "1024", "2048", "3072", "4096", "6144", "8192", "10240", "12288", "14336", "16384", "20480", "24576", "28672", "32768", "40960", "49152", "57344", "65536", "81920", "98304", "114688", "131072"]
     quantkv_text = ["F16 (Off)","8-Bit","4-Bit"]
 
-    if "Use CUDA" in runopts:
-        antirunopts.remove("hipBLAS (ROCm)")
-    if "Use hipBLAS (ROCm)" in runopts:
-        antirunopts.remove("CUDA")
-    if os.name != 'nt':
-        if "NoAVX2 Mode (Old CPU)" in antirunopts:
-            antirunopts.remove("NoAVX2 Mode (Old CPU)")
-        if "Failsafe Mode (Old CPU)" in antirunopts:
-            antirunopts.remove("Failsafe Mode (Old CPU)")
-        if "CLBlast NoAVX2 (Old CPU)" in antirunopts:
-            antirunopts.remove("CLBlast NoAVX2 (Old CPU)")
-
     if not any(runopts):
         exitcounter = 999
         exit_with_error(2,"KoboldCPP couldn't locate any backends to use (i.e Default, Vulkan, CUDA).\n\nTo use the program, please run the 'make' command from the directory.","No Backends Available!")
