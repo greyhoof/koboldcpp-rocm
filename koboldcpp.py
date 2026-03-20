@@ -165,6 +165,8 @@ saved_stderr_py = None
 stdout_nullfile = None
 stdout_nullfile_py = None
 
+CLDevices = ["1","2","3","4"]
+CLDevicesNames = ["","","",""]
 CUDevices = ["1","2","3","4","All"]
 CUDevicesNames = ["","","","",""]
 VKDevicesNames = ["","","",""]
@@ -1694,8 +1696,40 @@ def detect_memory_vk(gpumem_ignore_limit_min, gpumem_ignore_limit_max):
 
         return 0
 
+def detect_memory_cl(gpumem_ignore_limit_min, gpumem_ignore_limit_max):
 
-def fetch_gpu_properties(testCU,testVK,testmemory=False):
+    try: # Get OpenCL GPU names on windows using a special binary. overwrite at known index if found.
+        basepath = os.path.abspath(os.path.dirname(__file__))
+        output = ""
+        data = None
+        try:
+            output = subprocess.run(["clinfo","--json"], capture_output=True, text=True, check=True, encoding='utf-8', timeout=10).stdout
+            data = json.loads(output)
+        except Exception:
+            output = subprocess.run([((os.path.join(basepath, "simpleclinfo.exe")) if os.name == 'nt' else "clinfo"),"--json"], capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS, encoding='utf-8', timeout=10).stdout
+            data = json.loads(output)
+        plat = 0
+        dev = 0
+        lowestclmem = 0
+        for platform in data["devices"]:
+            dev = 0
+            for device in platform["online"]:
+                dname = device["CL_DEVICE_NAME"]
+                dmem = int(device["CL_DEVICE_GLOBAL_MEM_SIZE"])
+                idx = plat+dev*2
+                if idx<len(CLDevices):
+                    CLDevicesNames[idx] = dname
+                    if dmem > gpumem_ignore_limit_min and dmem < gpumem_ignore_limit_max:
+                        lowestclmem = dmem if lowestclmem==0 else (dmem if dmem<lowestclmem else lowestclmem)
+                dev += 1
+            plat += 1
+        return lowestclmem
+    except Exception:
+        pass
+
+    return 0
+
+def fetch_gpu_properties(testCL,testCU,testVK,testmemory=False):
     gpumem_ignore_limit_min = 1024*1024*600 #600 mb min
     gpumem_ignore_limit_max = 1024*1024*1024*300 #300 gb max
 
@@ -1712,6 +1746,13 @@ def fetch_gpu_properties(testCU,testVK,testmemory=False):
         if testmemory:
             print(f'detected Vulkan memory: {vkmem/(1024*1024)} MB')
 
+    if testCL:
+        clmem = detect_memory_cl(gpumem_ignore_limit_min, gpumem_ignore_limit_max)
+        MaxMemory[0] = max(clmem,MaxMemory[0])
+        if testmemory:
+            print(f'detected OpenCL memory: {clmem/(1024*1024)} MB')
+
+
     # Check VRAM detection after all backends have been tested
     if MaxMemory[0] < (1024*1024*256):
         print("Unable to detect VRAM.")
@@ -1719,7 +1760,7 @@ def fetch_gpu_properties(testCU,testVK,testmemory=False):
     return
 
 def auto_set_backend_cli():
-    fetch_gpu_properties(True,True)
+    fetch_gpu_properties(False,True,True)
     found_new_backend = False
 
     # check for avx2 and avx support
@@ -6872,7 +6913,9 @@ def show_gui():
         if manual_select:
             print("\nA .kcppt template was selected from GUI - automatically selecting your backend...")
             runmode_untouched = True
-        fetch_gpu_properties(True,True)
+            fetch_gpu_properties(False,True,True)
+        else:
+            fetch_gpu_properties(True,True,True,True)
         found_new_backend = False
 
         # check for avx2 and avx support
@@ -6882,7 +6925,7 @@ def show_gui():
 
         #autopick cublas if suitable, requires at least 3.5GB VRAM to auto pick
         #we do not want to autoselect hip/cublas if the user has already changed their desired backend!
-        if eligible_cuda and exitcounter < 100 and MaxMemory[0]>3500000000 and (("Use CUDA" in runopts and CUDevicesNames[0]!="") or "Use hipBLAS (ROCm)" in runopts) and (any(CUDevicesNames)) and runmode_untouched:
+        if eligible_cuda and exitcounter < 100 and MaxMemory[0]>3500000000 and (("Use CUDA" in runopts and CUDevicesNames[0]!="") or "Use hipBLAS (ROCm)" in runopts) and (any(CUDevicesNames) or any(CLDevicesNames)) and runmode_untouched:
             if "Use CUDA" in runopts:
                 runopts_var.set("Use CUDA")
                 gpu_choice_var.set("1")
@@ -9113,7 +9156,7 @@ def main(launch_args, default_args):
         return
 
     if args.testmemory:
-        fetch_gpu_properties(True, True, testmemory=True)
+        fetch_gpu_properties(True, True, True, testmemory=True)
         return
 
     #prevent disallowed combos
@@ -9740,7 +9783,7 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
                 print("No GPU or CPU backend was selected. Trying to assign one for you automatically...")
                 auto_set_backend_cli()
             if MaxMemory[0] == 0: #try to get gpu vram for cuda if not picked yet
-                fetch_gpu_properties(True,True)
+                fetch_gpu_properties(False, True,True)
                 pass
             if args.autofit:
                 print("Forced autofit is selected, moecpu and overridetensors will be set automatically.")
