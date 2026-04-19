@@ -213,6 +213,7 @@ if (LLAMA_HIPBLAS)
 
         add_compile_definitions(GGML_USE_HIPBLAS GGML_USE_HIP GGML_USE_CUDA SD_USE_CUBLAS)
         #add_library(ggml-rocm OBJECT ${GGML_SOURCES_CUDA})
+        add_library(ggml-rocm OBJECT ${GGML_SOURCES_ROCM})
 
         set_property(TARGET ggml-rocm PROPERTY C_STANDARD 11)
         set_property(TARGET ggml-rocm PROPERTY CXX_STANDARD 17)
@@ -225,7 +226,7 @@ if (LLAMA_HIPBLAS)
             target_compile_definitions(ggml-rocm PUBLIC GGML_CUDA_FORCE_DMMV)
         endif()
 
-        set_source_files_properties(${GGML_SOURCES_CUDA} PROPERTIES LANGUAGE CXX)
+        set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE CXX)
         target_link_libraries(ggml-rocm PUBLIC hip::device hip::host roc::rocblas roc::hipblas)
 
         add_library(ggml-v2-rocm OBJECT ${GGML_V2_CUDA_SOURCES})

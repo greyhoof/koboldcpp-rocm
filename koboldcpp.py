@@ -6451,8 +6451,6 @@ def RunServerMultiThreaded(addr, port, server_handler):
         certpath = os.path.abspath(args.ssl[0])
         keypath = os.path.abspath(args.ssl[1])
         context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        context.minimum_version = ssl.TLSVersion.TLSv1_2
-        context.maximum_version = ssl.TLSVersion.TLSv1_3
         context.load_cert_chain(certfile=certpath, keyfile=keypath)
         ipv4_sock = context.wrap_socket(ipv4_sock, server_side=True)
         if ipv6_sock:
@@ -6916,11 +6914,10 @@ def show_gui():
     terminalonly = ctk.IntVar()
     pipelineparallel = ctk.IntVar(value=1)
     quietmode = ctk.IntVar(value=0)
-    checkforupdates = ctk.IntVar()
     nocertifymode = ctk.IntVar(value=0)
 
     lowvram_var = ctk.IntVar()
-    mmq_var = ctk.IntVar(value=0)
+    mmq_var = ctk.IntVar(value=1)
     quantkv_var = ctk.IntVar(value=0)
     blas_threads_var = ctk.StringVar()
     blas_size_var = ctk.IntVar()
@@ -7962,14 +7959,13 @@ def show_gui():
     makecheckbox(network_tab, "Multiuser Mode", multiuser_var, 3,tooltiptxt="Allows requests by multiple different clients to be queued and handled in sequence.")
     makecheckbox(network_tab, "Remote Tunnel", remotetunnel_var, 3, 1,tooltiptxt="Creates a trycloudflare tunnel.\nAllows you to access koboldcpp from other devices over an internet URL.")
     makecheckbox(network_tab, "Quiet Mode", quietmode, 4,tooltiptxt="Prevents all generation related terminal output from being displayed.")
-    makecheckbox(network_tab, "Check For Updates", checkforupdates, 5, tooltiptxt="Check for updates on startup")
     makecheckbox(network_tab, "NoCertify Mode (Insecure)", nocertifymode, 4, 1,tooltiptxt="Allows insecure SSL connections. Use this if you have cert errors and need to bypass certificate restrictions.")
     makecheckbox(network_tab, "Shared Multiplayer", multiplayer_var, 5,tooltiptxt="Hosts a shared multiplayer session that others can join.")
     makecheckbox(network_tab, "Enable WebSearch", websearch_var, 5, 1,tooltiptxt="Enable the local search engine proxy so Web Searches can be done.")
 
-    makefileentry(network_tab, "SSL Cert:", "Select SSL cert.pem file",ssl_cert_var, 6, width=200 ,filetypes=[("Unencrypted Certificate PEM", "*.pem")], singlerow=True, singlecol=False,tooltiptxt="Select your unencrypted .pem SSL certificate file for https.\nCan be generated with OpenSSL.")
-    makefileentry(network_tab, "SSL Key:", "Select SSL key.pem file", ssl_key_var, 8, width=200, filetypes=[("Unencrypted Key PEM", "*.pem")], singlerow=True, singlecol=False, tooltiptxt="Select your unencrypted .pem SSL key file for https.\nCan be generated with OpenSSL.")
-    makelabelentry(network_tab, "Password: ", password_var, 9, 150,tooltip="Enter a password required to use this instance.\nThis key will be required for all text endpoints.\nImage endpoints are not secured.")
+    makefileentry(network_tab, "SSL Cert:", "Select SSL cert.pem file",ssl_cert_var, 7, width=200 ,filetypes=[("Unencrypted Certificate PEM", "*.pem")], singlerow=True, singlecol=False,tooltiptxt="Select your unencrypted .pem SSL certificate file for https.\nCan be generated with OpenSSL.")
+    makefileentry(network_tab, "SSL Key:", "Select SSL key.pem file", ssl_key_var, 9, width=200, filetypes=[("Unencrypted Key PEM", "*.pem")], singlerow=True, singlecol=False, tooltiptxt="Select your unencrypted .pem SSL key file for https.\nCan be generated with OpenSSL.")
+    makelabelentry(network_tab, "Password: ", password_var, 10, 200,tooltip="Enter a password required to use this instance.\nThis key will be required for all text endpoints.\nImage endpoints are not secured.")
 
     makelabelentry(network_tab, "Max Req. Size (MB):", maxrequestsize_var, row=20, width=50, tooltip="Specify a max request payload size. Any requests to the server larger than this size will be dropped. Do not change if unsure.")
     makelabelentry(network_tab, "IP Rate Limiter (s):", ratelimit_var, row=22, width=50, tooltip="Rate limits each IP to allow a new request once per X seconds. Do not change if unsure.")
@@ -8446,7 +8442,6 @@ def show_gui():
         terminalonly.set(1 if "cli" in dict and dict["cli"] else 0)
         pipelineparallel.set(0 if "nopipelineparallel" in dict and dict["nopipelineparallel"] else 1)
         quietmode.set(1 if "quiet" in dict and dict["quiet"] else 0)
-        checkforupdates.set(1 if "checkforupdates" in dict and dict["checkforupdates"] else 0)
         nocertifymode.set(1 if "nocertify" in dict and dict["nocertify"] else 0)
         nomodel.set(1 if "nomodel" in dict and dict["nomodel"] else 0)
         lowvram_var.set(1 if "lowvram" in dict and dict["lowvram"] else 0)
@@ -8801,7 +8796,7 @@ def show_gui():
     def display_wiki():
         LaunchWebbrowser("https://github.com/LostRuins/koboldcpp/wiki#the-koboldcpp-faq-and-knowledgebase","Cannot launch help in browser.")
     def display_updates():
-        LaunchWebbrowser("https://github.com/YellowRoseCx/koboldcpp-rocm/releases/latest","Cannot launch updates in browser.")
+        LaunchWebbrowser("https://github.com/greyhoof/koboldcpp-rocm/releases/latest","Cannot launch updates in browser.")
 
     ctk.CTkButton(tabs , text = "Launch", fg_color="#2f8d3c", hover_color="#2faa3c", command = guilaunch, width=100, height = 35 ).grid(row=1,column=1, stick="se", padx=(25), pady=5)
 
@@ -8844,144 +8839,6 @@ def show_gui():
             print("Error: No valid model files were selected. Cannot continue.", flush=True)
             time.sleep(2)
             sys.exit(2)
-
-def show_old_gui():
-    import tkinter as tk
-    from tkinter.filedialog import askopenfilename
-    from tkinter import messagebox
-
-    if len(sys.argv) == 1:
-        #no args passed at all. Show nooby gui
-        root = tk.Tk()
-        launchclicked = False
-
-        def guilaunch():
-            nonlocal launchclicked
-            launchclicked = True
-            root.destroy()
-            pass
-
-        # Adjust size
-        root.geometry("480x360")
-        root.title("KoboldCpp v"+KcppVersion)
-        root.grid_columnconfigure(0, weight=1)
-        tk.Label(root, text = "KoboldCpp Easy Launcher",
-                font = ("Arial", 12)).grid(row=0,column=0)
-        tk.Label(root, text = "(Note: KoboldCpp only works with GGML model formats!)",
-                font = ("Arial", 9)).grid(row=1,column=0)
-
-        blasbatchopts = ["Don't Batch BLAS","BLAS = 32","BLAS = 64","BLAS = 128","BLAS = 256","BLAS = 512","BLAS = 1024","BLAS = 2048"]
-        blaschoice = tk.StringVar()
-        blaschoice.set("BLAS = 512")
-
-        runopts = ["Use OpenBLAS","Use CLBLast GPU #1","Use CLBLast GPU #2","Use CLBLast GPU #3","Use CUDA GPU","Use No BLAS","NoAVX2 Mode (Old CPU)","Failsafe Mode (Old CPU)"]
-        runchoice = tk.StringVar()
-        runchoice.set("Use OpenBLAS")
-
-        def onDropdownChange(event):
-            sel = runchoice.get()
-            if sel==runopts[1] or sel==runopts[2] or sel==runopts[3] or sel==runopts[4]:
-                frameC.grid(row=4,column=0,pady=4)
-            else:
-                frameC.grid_forget()
-
-        frameA = tk.Frame(root)
-        tk.OptionMenu( frameA , runchoice , command = onDropdownChange ,*runopts ).grid(row=0,column=0)
-        tk.OptionMenu( frameA , blaschoice ,*blasbatchopts ).grid(row=0,column=1)
-        frameA.grid(row=2,column=0)
-
-        frameB = tk.Frame(root)
-        threads_var=tk.StringVar()
-        threads_var.set(str(default_threads))
-        threads_lbl = tk.Label(frameB, text = 'Threads: ', font=('calibre',10, 'bold'))
-        threads_input = tk.Entry(frameB,textvariable = threads_var, font=('calibre',10,'normal'))
-        threads_lbl.grid(row=0,column=0)
-        threads_input.grid(row=0,column=1)
-        frameB.grid(row=3,column=0,pady=4)
-
-        frameC = tk.Frame(root)
-        gpu_layers_var=tk.StringVar()
-        gpu_layers_var.set("0")
-        gpu_lbl = tk.Label(frameC, text = 'GPU Layers: ', font=('calibre',10, 'bold'))
-        gpu_layers_input = tk.Entry(frameC,textvariable = gpu_layers_var, font=('calibre',10,'normal'))
-        gpu_lbl.grid(row=0,column=0)
-        gpu_layers_input.grid(row=0,column=1)
-        frameC.grid(row=4,column=0,pady=4)
-        onDropdownChange(None)
-
-        stream = tk.IntVar()
-        smartcontext = tk.IntVar()
-        launchbrowser = tk.IntVar(value=1)
-        unbantokens = tk.IntVar()
-        highpriority = tk.IntVar()
-        disablemmap = tk.IntVar()
-        frameD = tk.Frame(root)
-        tk.Checkbutton(frameD, text='Streaming Mode',variable=stream, onvalue=1, offvalue=0).grid(row=0,column=0)
-        tk.Checkbutton(frameD, text='Use SmartContext',variable=smartcontext, onvalue=1, offvalue=0).grid(row=0,column=1)
-        tk.Checkbutton(frameD, text='High Priority',variable=highpriority, onvalue=1, offvalue=0).grid(row=1,column=0)
-        tk.Checkbutton(frameD, text='Disable MMAP',variable=disablemmap, onvalue=1, offvalue=0).grid(row=1,column=1)
-        tk.Checkbutton(frameD, text='Unban Tokens',variable=unbantokens, onvalue=1, offvalue=0).grid(row=2,column=0)
-        tk.Checkbutton(frameD, text='Launch Browser',variable=launchbrowser, onvalue=1, offvalue=0).grid(row=2,column=1)
-        frameD.grid(row=5,column=0,pady=4)
-
-        # Create button, it will change label text
-        tk.Button(root , text = "Launch", font = ("Impact", 18), bg='#54FA9B', command = guilaunch ).grid(row=6,column=0)
-        tk.Label(root, text = "(Please use the Command Line for more advanced options)\nThis GUI is deprecated. Please install customtkinter.",
-                font = ("Arial", 9)).grid(row=7,column=0)
-
-        root.mainloop()
-
-        if launchclicked==False:
-            print("Exiting by user request.")
-            time.sleep(3)
-            sys.exit()
-
-        #load all the vars
-        args.threads = int(threads_var.get())
-        args.gpulayers = int(gpu_layers_var.get())
-
-        args.stream = (stream.get()==1)
-        args.smartcontext = (smartcontext.get()==1)
-        args.launch = (launchbrowser.get()==1)
-        args.unbantokens = (unbantokens.get()==1)
-        args.highpriority = (highpriority.get()==1)
-        args.nommap = (disablemmap.get()==1)
-        selrunchoice = runchoice.get()
-        selblaschoice = blaschoice.get()
-
-        if selrunchoice==runopts[1]:
-            args.useclblast = [0,0]
-        if selrunchoice==runopts[2]:
-            args.useclblast = [1,0]
-        if selrunchoice==runopts[3]:
-            args.useclblast = [0,1]
-        if selrunchoice==runopts[4]:
-            args.usecublas = ["normal"]
-        if selrunchoice==runopts[5]:
-            args.noblas = True
-        if selrunchoice==runopts[6]:
-            args.noavx2 = True
-        if selrunchoice==runopts[7]:
-            args.noavx2 = True
-            args.noblas = True
-            args.nommap = True
-
-        if selblaschoice==blasbatchopts[0]:
-            args.blasbatchsize = -1
-        if selblaschoice==blasbatchopts[1]:
-            args.blasbatchsize = 32
-        if selblaschoice==blasbatchopts[2]:
-            args.blasbatchsize = 64
-        if selblaschoice==blasbatchopts[3]:
-            args.blasbatchsize = 128
-        if selblaschoice==blasbatchopts[4]:
-            args.blasbatchsize = 256
-        if selblaschoice==blasbatchopts[5]:
-            args.blasbatchsize = 512
-        if selblaschoice==blasbatchopts[6]:
-            args.blasbatchsize = 1024
-        if selblaschoice==blasbatchopts[7]:
-            args.blasbatchsize = 2048
 
 def show_gui_msgbox(title,message):
     print(title + ": " + message, flush=True)
@@ -9476,42 +9333,6 @@ def sanitize_string(input_string):
     sanitized_string = re.sub( r'[^\w\d\.\-_]', '', input_string)
     return sanitized_string
 
-def get_latest_release_tag():
-    import requests
-    try:
-        response = requests.get('https://api.github.com/repos/YellowRoseCx/koboldcpp-rocm/releases', verify=True)
-        data = response.json()
-        latest_release_tag = data[0]['tag_name']
-        return latest_release_tag
-    except Exception as e:
-        return KcppVersion
-def compare_versions(current_version, latest_version):
-    import re
-    current_version_parts = current_version.split('.yr') # Split the version into main version and YellowRose's patch
-    latest_version_parts = latest_version.split('.yr')
-    current_version_numbers = re.findall(r'\d+', current_version_parts[0]) # Compare the main version numbers
-    latest_version_numbers = re.findall(r'\d+', latest_version_parts[0])
-    for current, latest in zip(current_version_numbers, latest_version_numbers):
-        if int(latest) > int(current):
-            return latest_version
-    if current_version_parts[0] == latest_version_parts[0]: # If the main version numbers are equal, check YellowRose's patch
-        current_yr_number = current_version_parts[1].split('-')[0]
-        latest_yr_number = latest_version_parts[1].split('-')[0]
-        if int(latest_yr_number) > int(current_yr_number):
-            return latest_version
-    return current_version
-def check_latest_version():
-    from colorama import Fore, Style, init, deinit
-    if os.name == "nt":
-        init()
-    latest_version = get_latest_release_tag()
-    new_version = compare_versions(KcppVersion, latest_version)
-    if new_version != KcppVersion:
-        print(f"{Fore.CYAN}A new version of KoboldCpp-ROCm is available: {Fore.GREEN}**{new_version}**{Fore.CYAN}, current version is: {Fore.YELLOW}**{KcppVersion}**{Style.RESET_ALL}")
-    else:
-        print(f"{Fore.CYAN}You are using the latest version.{Style.RESET_ALL}")
-    if os.name == "nt":
-        deinit()
 def downloader_internal(input_url, output_filename, capture_output, min_file_size=64): # 64 bytes required by default
     download_dir_path = args.downloaddir
     if "https://huggingface.co/" in input_url and "/blob/main/" in input_url:
@@ -11127,8 +10948,6 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
                     time.sleep(1)
 
     if start_server:
-        if args.checkforupdates:
-            check_latest_version()
         if args.remotetunnel:
             if remote_url:
                 print(f"======\nYour remote tunnel is ready, please connect to {remote_url}", flush=True)
@@ -11173,7 +10992,6 @@ if __name__ == '__main__':
     parser.add_argument("--contextsize","--ctx-size", "-c", help="Controls the memory allocated for maximum context size, only change if you need more RAM for big contexts. (default 8192).",metavar=('[256 to 262144]'), type=check_range(int,256,262144), default=8192)
     parser.add_argument("--gpulayers","--gpu-layers","--n-gpu-layers","-ngl", help="Set number of layers to offload to GPU when using GPU. Requires GPU. Set to -1 to try autodetect, set to 0 to disable GPU offload.",metavar=('[GPU layers]'), nargs='?', const=1, type=int, default=-1)
     parser.add_argument("--tensor_split","--tensorsplit","--tensor-split","-ts", help="For CUDA and Vulkan only, ratio to split tensors across multiple GPUs, space-separated list of proportions, e.g. 7 3", metavar=('[Ratios]'), type=float, nargs='+')
-    parser.add_argument("--checkforupdates", help="Checks KoboldCpp-ROCm's release page on GitHub using HTTPS to see if there's a new update available.", action='store_true')
     parser.add_argument("--autofit","--fit","-fit", help="Automatically attempt to fit the model in the best possible way. Overrides everything else. Experimental.", action='store_true')
 
     #more advanced params
