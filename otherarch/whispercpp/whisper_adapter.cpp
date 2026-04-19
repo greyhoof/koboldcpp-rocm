@@ -27,20 +27,8 @@ static std::string whisper_output_text = "";
 
 int total_transcribe_gens = 0;
 
-static bool is_wav_buffer(const std::string buf) {
-    // RIFF ref: https://en.wikipedia.org/wiki/Resource_Interchange_File_Format
-    // WAV ref: https://www.mmsp.ece.mcgill.ca/Documents/AudioFormats/WAVE/WAVE.html
-    if (buf.size() < 12 || buf.substr(0, 4) != "RIFF" || buf.substr(8, 4) != "WAVE") {
-        return false;
-    }
-    uint32_t chunk_size = *reinterpret_cast<const uint32_t*>(buf.data() + 4);
-    if (chunk_size + 8 != buf.size()) {
-        return false;
-    }
-    return true;
-}
 
-static bool read_wav(const std::string & b64data, std::vector<float>& pcmf32)
+static bool read_audio(const std::string & b64data, std::vector<float>& pcmf32)
 {
     std::vector<uint8_t> media_data_buffer = kcpp_base64_decode(b64data);
 
@@ -52,7 +40,7 @@ static bool read_wav(const std::string & b64data, std::vector<float>& pcmf32)
 
     if(whisperdebugmode==1 && !whisper_is_quiet)
     {
-        printf("\nwav_data_size: %d",pcmf32.size());
+        printf("\nwav_data_size: %zu",pcmf32.size());
     }
 
     return true;
@@ -71,22 +59,12 @@ static std::string output_txt(struct whisper_context * ctx) {
 
 void cb_log_disable(enum ggml_log_level , const char * , void * ) { }
 
-static std::string whisperplatformenv, whisperdeviceenv, whispervulkandeviceenv;
+static std::string whispervulkandeviceenv;
 bool whispertype_load_model(const whisper_load_model_inputs inputs)
 {
     whisper_is_quiet = inputs.quiet;
 
     //duplicated from expose.cpp
-    int cl_parseinfo = inputs.clblast_info; //first digit is whether configured, second is platform, third is devices
-    std::string usingclblast = "GGML_OPENCL_CONFIGURED="+std::to_string(cl_parseinfo>0?1:0);
-    putenv((char*)usingclblast.c_str());
-    cl_parseinfo = cl_parseinfo%100; //keep last 2 digits
-    int platform = cl_parseinfo/10;
-    int devices = cl_parseinfo%10;
-    whisperplatformenv = "GGML_OPENCL_PLATFORM="+std::to_string(platform);
-    whisperdeviceenv = "GGML_OPENCL_DEVICE="+std::to_string(devices);
-    putenv((char*)whisperplatformenv.c_str());
-    putenv((char*)whisperdeviceenv.c_str());
     std::string vulkan_info_raw = inputs.vulkan_info;
     std::string vulkan_info_str = "";
     for (size_t i = 0; i < vulkan_info_raw.length(); ++i) {
@@ -95,7 +73,8 @@ bool whispertype_load_model(const whisper_load_model_inputs inputs)
             vulkan_info_str += ",";
         }
     }
-    if(vulkan_info_str!="")
+    const char* existingenv = getenv("GGML_VK_VISIBLE_DEVICES");
+    if(!existingenv && vulkan_info_str!="")
     {
         whispervulkandeviceenv = "GGML_VK_VISIBLE_DEVICES="+vulkan_info_str;
         putenv((char*)whispervulkandeviceenv.c_str());
@@ -150,7 +129,7 @@ whisper_generation_outputs whispertype_generate(const whisper_generation_inputs 
 
     std::vector<float> pcmf32;               // mono-channel F32 PCM
 
-    if (!::read_wav(b64data, pcmf32)) {
+    if (!::read_audio(b64data, pcmf32)) {
         printf("\nWhisper: Failed to read input wav data!\n");
         output.text = "";
         output.status = 0;

@@ -33,7 +33,7 @@ public:
         auto fc2 = std::dynamic_pointer_cast<Linear>(blocks["fc2"]);
 
         x = fc1->forward(ctx, x);
-        x = ggml_gelu_inplace(ctx->ggml_ctx, x);
+        x = ggml_ext_gelu(ctx->ggml_ctx, x, true);
         x = fc2->forward(ctx, x);
         return x;
     }
@@ -97,12 +97,12 @@ public:
 struct TimestepEmbedder : public GGMLBlock {
     // Embeds scalar timesteps into vector representations.
 protected:
-    int64_t frequency_embedding_size;
+    int frequency_embedding_size;
 
 public:
     TimestepEmbedder(int64_t hidden_size,
-                     int64_t frequency_embedding_size = 256,
-                     int64_t out_channels             = 0)
+                     int frequency_embedding_size = 256,
+                     int64_t out_channels         = 0)
         : frequency_embedding_size(frequency_embedding_size) {
         if (out_channels <= 0) {
             out_channels = hidden_size;
@@ -167,11 +167,11 @@ public:
             blocks["proj"] = std::shared_ptr<GGMLBlock>(new Linear(dim, dim));
         }
         if (qk_norm == "rms") {
-            blocks["ln_q"] = std::shared_ptr<GGMLBlock>(new RMSNorm(d_head, 1.0e-6));
-            blocks["ln_k"] = std::shared_ptr<GGMLBlock>(new RMSNorm(d_head, 1.0e-6));
+            blocks["ln_q"] = std::shared_ptr<GGMLBlock>(new RMSNorm(d_head, 1.0e-6f));
+            blocks["ln_k"] = std::shared_ptr<GGMLBlock>(new RMSNorm(d_head, 1.0e-6f));
         } else if (qk_norm == "ln") {
-            blocks["ln_q"] = std::shared_ptr<GGMLBlock>(new LayerNorm(d_head, 1.0e-6));
-            blocks["ln_k"] = std::shared_ptr<GGMLBlock>(new LayerNorm(d_head, 1.0e-6));
+            blocks["ln_q"] = std::shared_ptr<GGMLBlock>(new LayerNorm(d_head, 1.0e-6f));
+            blocks["ln_k"] = std::shared_ptr<GGMLBlock>(new LayerNorm(d_head, 1.0e-6f));
         }
     }
 
@@ -211,8 +211,8 @@ public:
     struct ggml_tensor* forward(GGMLRunnerContext* ctx,
                                 struct ggml_tensor* x) {
         auto qkv = pre_attention(ctx, x);
-        x        = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, qkv[0], qkv[1], qkv[2], num_heads, nullptr, false, false, ctx->flash_attn_enabled);  // [N, n_token, dim]
-        x        = post_attention(ctx, x);                                                                                                                  // [N, n_token, dim]
+        x        = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, qkv[0], qkv[1], qkv[2], num_heads, nullptr, false, ctx->flash_attn_enabled);  // [N, n_token, dim]
+        x        = post_attention(ctx, x);                                                                                                           // [N, n_token, dim]
         return x;
     }
 };
@@ -284,23 +284,19 @@ public:
         auto attn2              = std::dynamic_pointer_cast<SelfAttention>(blocks["attn2"]);
         auto adaLN_modulation_1 = std::dynamic_pointer_cast<Linear>(blocks["adaLN_modulation.1"]);
 
-        int64_t n_mods = 9;
-        auto m         = adaLN_modulation_1->forward(ctx, ggml_silu(ctx->ggml_ctx, c));         // [N, n_mods * hidden_size]
-        m              = ggml_reshape_3d(ctx->ggml_ctx, m, c->ne[0], n_mods, c->ne[1]);         // [N, n_mods, hidden_size]
-        m              = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, m, 0, 2, 1, 3));  // [n_mods, N, hidden_size]
+        int n_mods = 9;
+        auto m     = adaLN_modulation_1->forward(ctx, ggml_silu(ctx->ggml_ctx, c));  // [N, n_mods * hidden_size]
+        auto m_vec = ggml_ext_chunk(ctx->ggml_ctx, m, n_mods, 0);
 
-        int64_t offset = m->nb[1] * m->ne[1];
-        auto shift_msa = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 0);  // [N, hidden_size]
-        auto scale_msa = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 1);  // [N, hidden_size]
-        auto gate_msa  = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 2);  // [N, hidden_size]
-
-        auto shift_mlp = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 3);  // [N, hidden_size]
-        auto scale_mlp = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 4);  // [N, hidden_size]
-        auto gate_mlp  = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 5);  // [N, hidden_size]
-
-        auto shift_msa2 = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 6);  // [N, hidden_size]
-        auto scale_msa2 = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 7);  // [N, hidden_size]
-        auto gate_msa2  = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 8);  // [N, hidden_size]
+        auto shift_msa  = m_vec[0];  // [N, hidden_size]
+        auto scale_msa  = m_vec[1];  // [N, hidden_size]
+        auto gate_msa   = m_vec[2];  // [N, hidden_size]
+        auto shift_mlp  = m_vec[3];  // [N, hidden_size]
+        auto scale_mlp  = m_vec[4];  // [N, hidden_size]
+        auto gate_mlp   = m_vec[5];  // [N, hidden_size]
+        auto shift_msa2 = m_vec[6];  // [N, hidden_size]
+        auto scale_msa2 = m_vec[7];  // [N, hidden_size]
+        auto gate_msa2  = m_vec[8];  // [N, hidden_size]
 
         auto x_norm = norm1->forward(ctx, x);
 
@@ -322,22 +318,20 @@ public:
         auto attn               = std::dynamic_pointer_cast<SelfAttention>(blocks["attn"]);
         auto adaLN_modulation_1 = std::dynamic_pointer_cast<Linear>(blocks["adaLN_modulation.1"]);
 
-        int64_t n_mods = 6;
+        int n_mods = 6;
         if (pre_only) {
             n_mods = 2;
         }
-        auto m = adaLN_modulation_1->forward(ctx, ggml_silu(ctx->ggml_ctx, c));         // [N, n_mods * hidden_size]
-        m      = ggml_reshape_3d(ctx->ggml_ctx, m, c->ne[0], n_mods, c->ne[1]);         // [N, n_mods, hidden_size]
-        m      = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, m, 0, 2, 1, 3));  // [n_mods, N, hidden_size]
+        auto m     = adaLN_modulation_1->forward(ctx, ggml_silu(ctx->ggml_ctx, c));  // [N, n_mods * hidden_size]
+        auto m_vec = ggml_ext_chunk(ctx->ggml_ctx, m, n_mods, 0);
 
-        int64_t offset = m->nb[1] * m->ne[1];
-        auto shift_msa = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 0);  // [N, hidden_size]
-        auto scale_msa = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 1);  // [N, hidden_size]
+        auto shift_msa = m_vec[0];  // [N, hidden_size]
+        auto scale_msa = m_vec[1];  // [N, hidden_size]
         if (!pre_only) {
-            auto gate_msa  = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 2);  // [N, hidden_size]
-            auto shift_mlp = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 3);  // [N, hidden_size]
-            auto scale_mlp = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 4);  // [N, hidden_size]
-            auto gate_mlp  = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 5);  // [N, hidden_size]
+            auto gate_msa  = m_vec[2];  // [N, hidden_size]
+            auto shift_mlp = m_vec[3];  // [N, hidden_size]
+            auto scale_mlp = m_vec[4];  // [N, hidden_size]
+            auto gate_mlp  = m_vec[5];  // [N, hidden_size]
 
             auto attn_in = modulate(ctx->ggml_ctx, norm1->forward(ctx, x), shift_msa, scale_msa);
 
@@ -439,8 +433,8 @@ public:
             auto qkv2          = std::get<1>(qkv_intermediates);
             auto intermediates = std::get<2>(qkv_intermediates);
 
-            auto attn_out  = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, qkv[0], qkv[1], qkv[2], num_heads, nullptr, false, false, ctx->flash_attn_enabled);     // [N, n_token, dim]
-            auto attn2_out = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, qkv2[0], qkv2[1], qkv2[2], num_heads, nullptr, false, false, ctx->flash_attn_enabled);  // [N, n_token, dim]
+            auto attn_out  = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, qkv[0], qkv[1], qkv[2], num_heads, nullptr, false, ctx->flash_attn_enabled);     // [N, n_token, dim]
+            auto attn2_out = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, qkv2[0], qkv2[1], qkv2[2], num_heads, nullptr, false, ctx->flash_attn_enabled);  // [N, n_token, dim]
             x              = post_attention_x(ctx,
                                               attn_out,
                                               attn2_out,
@@ -456,7 +450,7 @@ public:
             auto qkv               = qkv_intermediates.first;
             auto intermediates     = qkv_intermediates.second;
 
-            auto attn_out = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, qkv[0], qkv[1], qkv[2], num_heads, nullptr, false, false, ctx->flash_attn_enabled);  // [N, n_token, dim]
+            auto attn_out = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, qkv[0], qkv[1], qkv[2], num_heads, nullptr, false, ctx->flash_attn_enabled);  // [N, n_token, dim]
             x             = post_attention(ctx,
                                            attn_out,
                                            intermediates[0],
@@ -500,26 +494,24 @@ block_mixing(GGMLRunnerContext* ctx,
         qkv.push_back(ggml_concat(ctx->ggml_ctx, context_qkv[i], x_qkv[i], 1));
     }
 
-    auto attn         = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, qkv[0], qkv[1], qkv[2], x_block->num_heads, nullptr, false, false, ctx->flash_attn_enabled);  // [N, n_context + n_token, hidden_size]
-    attn              = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, attn, 0, 2, 1, 3));                                                                          // [n_context + n_token, N, hidden_size]
+    auto attn = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, qkv[0], qkv[1], qkv[2], x_block->num_heads, nullptr, false, ctx->flash_attn_enabled);  // [N, n_context + n_token, hidden_size]
+
     auto context_attn = ggml_view_3d(ctx->ggml_ctx,
                                      attn,
                                      attn->ne[0],
-                                     attn->ne[1],
                                      context->ne[1],
+                                     attn->ne[2],
                                      attn->nb[1],
                                      attn->nb[2],
-                                     0);                                                                  // [n_context, N, hidden_size]
-    context_attn      = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, context_attn, 0, 2, 1, 3));  // [N, n_context, hidden_size]
+                                     0);  // [N, n_context, hidden_size]
     auto x_attn       = ggml_view_3d(ctx->ggml_ctx,
                                      attn,
                                      attn->ne[0],
-                                     attn->ne[1],
                                      x->ne[1],
+                                     attn->ne[2],
                                      attn->nb[1],
                                      attn->nb[2],
-                                     attn->nb[2] * context->ne[1]);                                 // [n_token, N, hidden_size]
-    x_attn            = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x_attn, 0, 2, 1, 3));  // [N, n_token, hidden_size]
+                                     context->ne[1] * attn->nb[1]);  // [N, n_token, hidden_size]
 
     if (!context_block->pre_only) {
         context = context_block->post_attention(ctx,
@@ -534,7 +526,7 @@ block_mixing(GGMLRunnerContext* ctx,
     }
 
     if (x_block->self_attn) {
-        auto attn2 = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, x_qkv2[0], x_qkv2[1], x_qkv2[2], x_block->num_heads, nullptr, false, false, ctx->flash_attn_enabled);  // [N, n_token, hidden_size]
+        auto attn2 = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, x_qkv2[0], x_qkv2[1], x_qkv2[2], x_block->num_heads, nullptr, false, ctx->flash_attn_enabled);  // [N, n_token, hidden_size]
 
         x = x_block->post_attention_x(ctx,
                                       x_attn,
@@ -604,13 +596,10 @@ public:
         auto linear             = std::dynamic_pointer_cast<Linear>(blocks["linear"]);
         auto adaLN_modulation_1 = std::dynamic_pointer_cast<Linear>(blocks["adaLN_modulation.1"]);
 
-        auto m = adaLN_modulation_1->forward(ctx, ggml_silu(ctx->ggml_ctx, c));         // [N, 2 * hidden_size]
-        m      = ggml_reshape_3d(ctx->ggml_ctx, m, c->ne[0], 2, c->ne[1]);              // [N, 2, hidden_size]
-        m      = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, m, 0, 2, 1, 3));  // [2, N, hidden_size]
-
-        int64_t offset = m->nb[1] * m->ne[1];
-        auto shift     = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 0);  // [N, hidden_size]
-        auto scale     = ggml_view_2d(ctx->ggml_ctx, m, m->ne[0], m->ne[1], m->nb[1], offset * 1);  // [N, hidden_size]
+        auto m     = adaLN_modulation_1->forward(ctx, ggml_silu(ctx->ggml_ctx, c));  // [N, 2 * hidden_size]
+        auto m_vec = ggml_ext_chunk(ctx->ggml_ctx, m, 2, 0);
+        auto shift = m_vec[0];  // [N, hidden_size]
+        auto scale = m_vec[1];  // [N, hidden_size]
 
         x = modulate(ctx->ggml_ctx, norm_final->forward(ctx, x), shift, scale);
         x = linear->forward(ctx, x);
@@ -623,7 +612,7 @@ struct MMDiT : public GGMLBlock {
     // Diffusion model with a Transformer backbone.
 protected:
     int64_t input_size               = -1;
-    int64_t patch_size               = 2;
+    int patch_size                   = 2;
     int64_t in_channels              = 16;
     int64_t d_self                   = -1;  // >=0 for MMdiT-X
     int64_t depth                    = 24;
@@ -756,28 +745,6 @@ public:
         return spatial_pos_embed;
     }
 
-    struct ggml_tensor* unpatchify(struct ggml_context* ctx,
-                                   struct ggml_tensor* x,
-                                   int64_t h,
-                                   int64_t w) {
-        // x: [N, H*W, patch_size * patch_size * C]
-        // return: [N, C, H, W]
-        int64_t n = x->ne[2];
-        int64_t c = out_channels;
-        int64_t p = patch_size;
-        h         = (h + 1) / p;
-        w         = (w + 1) / p;
-
-        GGML_ASSERT(h * w == x->ne[1]);
-
-        x = ggml_reshape_4d(ctx, x, c, p * p, w * h, n);       // [N, H*W, P*P, C]
-        x = ggml_cont(ctx, ggml_permute(ctx, x, 2, 0, 1, 3));  // [N, C, H*W, P*P]
-        x = ggml_reshape_4d(ctx, x, p, p, w, h * c * n);       // [N*C*H, W, P, P]
-        x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));  // [N*C*H, P, W, P]
-        x = ggml_reshape_4d(ctx, x, p * w, p * h, c, n);       // [N, C, H*P, W*P]
-        return x;
-    }
-
     struct ggml_tensor* forward_core_with_concat(GGMLRunnerContext* ctx,
                                                  struct ggml_tensor* x,
                                                  struct ggml_tensor* c_mod,
@@ -822,11 +789,11 @@ public:
         auto x_embedder = std::dynamic_pointer_cast<PatchEmbed>(blocks["x_embedder"]);
         auto t_embedder = std::dynamic_pointer_cast<TimestepEmbedder>(blocks["t_embedder"]);
 
-        int64_t w = x->ne[0];
-        int64_t h = x->ne[1];
+        int64_t W = x->ne[0];
+        int64_t H = x->ne[1];
 
         auto patch_embed = x_embedder->forward(ctx, x);                      // [N, H*W, hidden_size]
-        auto pos_embed   = cropped_pos_embed(ctx->ggml_ctx, h, w);           // [1, H*W, hidden_size]
+        auto pos_embed   = cropped_pos_embed(ctx->ggml_ctx, H, W);           // [1, H*W, hidden_size]
         x                = ggml_add(ctx->ggml_ctx, patch_embed, pos_embed);  // [N, H*W, hidden_size]
 
         auto c = t_embedder->forward(ctx, t);  // [N, hidden_size]
@@ -845,7 +812,7 @@ public:
 
         x = forward_core_with_concat(ctx, x, c, context, skip_layers);  // (N, H*W, patch_size ** 2 * out_channels)
 
-        x = unpatchify(ctx->ggml_ctx, x, h, w);  // [N, C, H, W]
+        x = DiT::unpatchify_and_crop(ctx->ggml_ctx, x, H, W, patch_size, patch_size, /*patch_last*/ false);  // [N, C, H, W]
 
         return x;
     }
@@ -943,12 +910,12 @@ struct MMDiTRunner : public GGMLRunner {
 
             struct ggml_tensor* out = nullptr;
 
-            int t0 = ggml_time_ms();
+            int64_t t0 = ggml_time_ms();
             compute(8, x, timesteps, context, y, &out, work_ctx);
-            int t1 = ggml_time_ms();
+            int64_t t1 = ggml_time_ms();
 
             print_ggml_tensor(out);
-            LOG_DEBUG("mmdit test done in %dms", t1 - t0);
+            LOG_DEBUG("mmdit test done in %lldms", t1 - t0);
         }
     }
 

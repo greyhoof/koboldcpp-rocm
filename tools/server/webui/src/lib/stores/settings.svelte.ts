@@ -32,8 +32,12 @@
  */
 
 import { browser } from '$app/environment';
-import { SETTING_CONFIG_DEFAULT } from '$lib/constants/settings-config';
-import { ParameterSyncService } from '$lib/services/parameter-sync';
+import {
+	CONFIG_LOCALSTORAGE_KEY,
+	SETTING_CONFIG_DEFAULT,
+	USER_OVERRIDES_LOCALSTORAGE_KEY
+} from '$lib/constants';
+import { ParameterSyncService } from '$lib/services/parameter-sync.service';
 import { serverStore } from '$lib/stores/server.svelte';
 import {
 	configToParameterRecord,
@@ -41,24 +45,28 @@ import {
 	getConfigValue,
 	setConfigValue
 } from '$lib/utils';
-import {
-	CONFIG_LOCALSTORAGE_KEY,
-	USER_OVERRIDES_LOCALSTORAGE_KEY
-} from '$lib/constants/localstorage-keys';
 
 class SettingsStore {
-	// ─────────────────────────────────────────────────────────────────────────────
-	// State
-	// ─────────────────────────────────────────────────────────────────────────────
+	/**
+	 *
+	 *
+	 * State
+	 *
+	 *
+	 */
 
 	config = $state<SettingsConfigType>({ ...SETTING_CONFIG_DEFAULT });
 	theme = $state<string>('auto');
 	isInitialized = $state(false);
 	userOverrides = $state<Set<string>>(new Set());
 
-	// ─────────────────────────────────────────────────────────────────────────────
-	// Utilities (private helpers)
-	// ─────────────────────────────────────────────────────────────────────────────
+	/**
+	 *
+	 *
+	 * Utilities (private helpers)
+	 *
+	 *
+	 */
 
 	/**
 	 * Helper method to get server defaults with null safety
@@ -76,9 +84,13 @@ class SettingsStore {
 		}
 	}
 
-	// ─────────────────────────────────────────────────────────────────────────────
-	// Lifecycle
-	// ─────────────────────────────────────────────────────────────────────────────
+	/**
+	 *
+	 *
+	 * Lifecycle
+	 *
+	 *
+	 */
 
 	/**
 	 * Initialize the settings store by loading from localStorage
@@ -130,9 +142,13 @@ class SettingsStore {
 
 		this.theme = localStorage.getItem('theme') || 'auto';
 	}
-	// ─────────────────────────────────────────────────────────────────────────────
-	// Config Updates
-	// ─────────────────────────────────────────────────────────────────────────────
+	/**
+	 *
+	 *
+	 * Config Updates
+	 *
+	 *
+	 */
 
 	/**
 	 * Update a specific configuration setting
@@ -234,9 +250,13 @@ class SettingsStore {
 		}
 	}
 
-	// ─────────────────────────────────────────────────────────────────────────────
-	// Reset
-	// ─────────────────────────────────────────────────────────────────────────────
+	/**
+	 *
+	 *
+	 * Reset
+	 *
+	 *
+	 */
 
 	/**
 	 * Reset configuration to defaults
@@ -267,41 +287,37 @@ class SettingsStore {
 	 */
 	resetParameterToServerDefault(key: string): void {
 		const serverDefaults = this.getServerDefaults();
+		const webuiSettings = serverStore.webuiSettings;
 
-		if (serverDefaults[key] !== undefined) {
-			const value = normalizeFloatingPoint(serverDefaults[key]);
-
-			this.config[key as keyof SettingsConfigType] =
-				value as SettingsConfigType[keyof SettingsConfigType];
-		} else {
-			if (key in SETTING_CONFIG_DEFAULT) {
-				const defaultValue = getConfigValue(SETTING_CONFIG_DEFAULT, key);
-
-				setConfigValue(this.config, key, defaultValue);
-			}
+		if (webuiSettings && key in webuiSettings) {
+			// UI setting from admin config: write actual value
+			setConfigValue(this.config, key, webuiSettings[key]);
+		} else if (serverDefaults[key] !== undefined) {
+			// sampling param known by server: clear it, let server decide
+			setConfigValue(this.config, key, '');
+		} else if (key in SETTING_CONFIG_DEFAULT) {
+			setConfigValue(this.config, key, getConfigValue(SETTING_CONFIG_DEFAULT, key));
 		}
 
 		this.userOverrides.delete(key);
 		this.saveConfig();
 	}
 
-	// ─────────────────────────────────────────────────────────────────────────────
-	// Server Sync
-	// ─────────────────────────────────────────────────────────────────────────────
+	/**
+	 *
+	 *
+	 * Server Sync
+	 *
+	 *
+	 */
 
 	/**
 	 * Initialize settings with props defaults when server properties are first loaded
 	 * This sets up the default values from /props endpoint
 	 */
 	syncWithServerDefaults(): void {
-		const serverParams = serverStore.defaultParams;
-		if (!serverParams) {
-			console.warn('No server parameters available for initialization');
-
-			return;
-		}
-
 		const propsDefaults = this.getServerDefaults();
+		if (Object.keys(propsDefaults).length === 0) return;
 
 		for (const [key, propsValue] of Object.entries(propsDefaults)) {
 			const currentValue = getConfigValue(this.config, key);
@@ -309,17 +325,25 @@ class SettingsStore {
 			const normalizedCurrent = normalizeFloatingPoint(currentValue);
 			const normalizedDefault = normalizeFloatingPoint(propsValue);
 
+			// if user value matches server, it's not a real override
 			if (normalizedCurrent === normalizedDefault) {
 				this.userOverrides.delete(key);
-				setConfigValue(this.config, key, propsValue);
-			} else if (!this.userOverrides.has(key)) {
-				setConfigValue(this.config, key, propsValue);
+			}
+		}
+
+		// webui settings need actual values in config (no placeholder mechanism),
+		// so write them for non-overridden keys
+		const webuiSettings = serverStore.webuiSettings;
+		if (webuiSettings) {
+			for (const [key, value] of Object.entries(webuiSettings)) {
+				if (!this.userOverrides.has(key) && value !== undefined) {
+					setConfigValue(this.config, key, value);
+				}
 			}
 		}
 
 		this.saveConfig();
-		console.log('Settings initialized with props defaults:', propsDefaults);
-		console.log('Current user overrides after sync:', Array.from(this.userOverrides));
+		console.log('User overrides after sync:', Array.from(this.userOverrides));
 	}
 
 	/**
@@ -329,19 +353,17 @@ class SettingsStore {
 	 */
 	forceSyncWithServerDefaults(): void {
 		const propsDefaults = this.getServerDefaults();
-		const syncableKeys = ParameterSyncService.getSyncableParameterKeys();
+		const webuiSettings = serverStore.webuiSettings;
 
-		for (const key of syncableKeys) {
-			if (propsDefaults[key] !== undefined) {
-				const normalizedValue = normalizeFloatingPoint(propsDefaults[key]);
-
-				setConfigValue(this.config, key, normalizedValue);
-			} else {
-				if (key in SETTING_CONFIG_DEFAULT) {
-					const defaultValue = getConfigValue(SETTING_CONFIG_DEFAULT, key);
-
-					setConfigValue(this.config, key, defaultValue);
-				}
+		for (const key of ParameterSyncService.getSyncableParameterKeys()) {
+			if (webuiSettings && key in webuiSettings) {
+				// UI setting from admin config: write actual value
+				setConfigValue(this.config, key, webuiSettings[key]);
+			} else if (propsDefaults[key] !== undefined) {
+				// sampling param: clear it, let server decide
+				setConfigValue(this.config, key, '');
+			} else if (key in SETTING_CONFIG_DEFAULT) {
+				setConfigValue(this.config, key, getConfigValue(SETTING_CONFIG_DEFAULT, key));
 			}
 
 			this.userOverrides.delete(key);
@@ -350,9 +372,13 @@ class SettingsStore {
 		this.saveConfig();
 	}
 
-	// ─────────────────────────────────────────────────────────────────────────────
-	// Utilities
-	// ─────────────────────────────────────────────────────────────────────────────
+	/**
+	 *
+	 *
+	 * Utilities
+	 *
+	 *
+	 */
 
 	/**
 	 * Get a specific configuration value

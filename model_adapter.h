@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "expose.h"
+#include "src/llama-arch.h"
 
 enum FileFormat
 {
@@ -50,27 +51,11 @@ enum FileFormat
 
 };
 
-enum GGUFArch
-{
-    ARCH_DEFAULT = 0, //used for llama3 and other generic gguf
-    ARCH_FALCON = 1,
-    ARCH_PHI = 2,
-    ARCH_MAMBALIKE = 3,
-    ARCH_SOLAR = 4,
-    ARCH_QWEN2 = 5,
-    ARCH_RWKV = 6,
-    ARCH_QWEN2VL = 7,
-    ARCH_GEMMA3 = 8,
-    ARCH_GLM4 = 9,
-    ARCH_GEMMA3N = 10,
-    ARCH_GPTOSS = 11,
-};
-
 struct FileFormatExtraMeta
 {
     int n_ctx_train = 2048;
     int fileversion = 0;
-    GGUFArch model_architecture = GGUFArch::ARCH_DEFAULT;
+    llm_arch model_architecture = llm_arch::LLM_ARCH_UNKNOWN;
     int n_expert_count = 0;
     std::string model_architecture_str = "";
     bool explicitly_no_bos = false; //only true if key exists AND is false
@@ -107,6 +92,8 @@ const std::vector<TopPicksData> gpttype_get_top_picks_data();
 
 bool sdtype_load_model(const sd_load_model_inputs inputs);
 sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs);
+sd_generation_outputs sdtype_upscale(const sd_upscale_inputs inputs);
+sd_info_outputs sdtype_get_info();
 
 bool whispertype_load_model(const whisper_load_model_inputs inputs);
 whisper_generation_outputs whispertype_generate(const whisper_generation_inputs inputs);
@@ -116,6 +103,9 @@ tts_generation_outputs ttstype_generate(const tts_generation_inputs inputs);
 
 bool embeddingstype_load_model(const embeddings_load_model_inputs inputs);
 embeddings_generation_outputs embeddingstype_generate(const embeddings_generation_inputs inputs);
+
+bool musictype_load_model(const music_load_model_inputs inputs);
+music_generation_outputs musictype_generate(const music_generation_inputs inputs);
 
 void timer_start();
 double timer_check();
@@ -127,9 +117,7 @@ bool ArrStartWith(const std::vector<int> targetArray, const std::vector<int> sea
 int ArrFindIndexOf(const std::vector<int> targetArray, const std::vector<int> searchSeq);
 
 FileFormat check_file_format(const std::string & fname, FileFormatExtraMeta * fileformatmeta);
-void ContextFastForward(std::vector<int> &current_context_tokens, std::vector<int> &embd_inp,
- int &n_past, std::vector<int> &last_n_tokens, const int nctx, std::vector<int> &smartcontext,
- const bool useSmartContext, const bool requireFullSubset, const int minimum_to_proceed);
+void ContextFastForward(std::vector<int> &current_context_tokens, std::vector<int> &embd_inp, int &n_past, std::vector<int> &last_n_tokens, const int nctx, std::vector<int> &smartcontext, const bool useSmartContext, const bool requireFullSubset, const int minimum_to_proceed);
 bool gguf_tensor_exists(const std::string & filename, std::string tensor_name, bool exactmatch);
 std::string gguf_get_model_arch(const std::string & filename);
 
