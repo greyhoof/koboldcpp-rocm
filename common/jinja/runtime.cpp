@@ -251,6 +251,23 @@ value binary_expression::execute_impl(context & ctx) {
         return res;
     }
 
+    // Python-style string repetition
+    // TODO: support array/tuple repetition (e.g., [1, 2] * 3 → [1, 2, 1, 2, 1, 2])
+    if (op.value == "*" &&
+            ((is_val<value_string>(left_val) && is_val<value_int>(right_val)) ||
+             (is_val<value_int>(left_val) && is_val<value_string>(right_val)))) {
+        const auto & str = is_val<value_string>(left_val) ? left_val->as_string() : right_val->as_string();
+        const int64_t repeat = is_val<value_int>(right_val) ? right_val->as_int() : left_val->as_int();
+        auto res = mk_val<value_string>();
+        if (repeat <= 0) {
+            return res;
+        }
+        for (int64_t i = 0; i < repeat; ++i) {
+            res->val_str = res->val_str.append(str);
+        }
+        return res;
+    }
+
     // String membership
     if (is_val<value_string>(left_val) && is_val<value_string>(right_val)) {
         // case: "a" in "abc"
@@ -299,12 +316,22 @@ value filter_expression::execute_impl(context & ctx) {
 
     JJ_DEBUG("Applying filter to %s", input->type().c_str());
 
+    auto set_filter_alias = [](auto & filter_id) {
+        if (filter_id == "count") {
+            filter_id = "length";
+        } else if (filter_id == "d") {
+            filter_id = "default";
+        } else if (filter_id == "e") {
+            filter_id = "escape";
+        } else if (filter_id == "trim") {
+            filter_id = "strip";
+        }
+    };
+
     if (is_stmt<identifier>(filter)) {
         auto filter_id = cast_stmt<identifier>(filter)->val;
 
-        if (filter_id == "trim") {
-            filter_id = "strip"; // alias
-        }
+        set_filter_alias(filter_id);
         JJ_DEBUG("Applying filter '%s' to %s", filter_id.c_str(), input->type().c_str());
         // TODO: Refactor filters so this coercion can be done automatically
         if (!input->is_undefined() && !is_val<value_string>(input) && (
@@ -328,9 +355,7 @@ value filter_expression::execute_impl(context & ctx) {
         }
         auto filter_id = cast_stmt<identifier>(call->callee)->val;
 
-        if (filter_id == "trim") {
-            filter_id = "strip"; // alias
-        }
+        set_filter_alias(filter_id);
         JJ_DEBUG("Applying filter '%s' with arguments to %s", filter_id.c_str(), input->type().c_str());
         func_args args(ctx);
         for (const auto & arg_expr : call->args) {
@@ -744,9 +769,9 @@ value member_expression::execute_impl(context & ctx) {
 
         if (is_stmt<slice_expression>(this->property)) {
             auto s = cast_stmt<slice_expression>(this->property);
-            value start_val = s->start_expr ? s->start_expr->execute(ctx) : mk_val<value_int>(0);
-            value stop_val  = s->stop_expr  ? s->stop_expr->execute(ctx)  : mk_val<value_int>(arr_size);
             value step_val  = s->step_expr  ? s->step_expr->execute(ctx)  : mk_val<value_int>(1);
+            value start_val = s->start_expr ? s->start_expr->execute(ctx) : (step_val->as_int() < 0 ? mk_val<value_int>(arr_size - 1) : mk_val<value_int>(0));
+            value stop_val  = s->stop_expr  ? s->stop_expr->execute(ctx)  : (step_val->as_int() < 0 ? mk_val<value_int>(-1) : mk_val<value_int>(arr_size));
 
             // translate to function call: obj.slice(start, stop, step)
             JJ_DEBUG("Member expression is a slice: start %s, stop %s, step %s",

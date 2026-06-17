@@ -1529,7 +1529,7 @@
                                "example": {
                                   "input": "hello world, how are you today?",
                                   "voice": "kobo",
-                                  "speaker_json":"",
+                                  "instruction":"",
                                },
                                "schema": {
                                   "properties": {
@@ -1539,11 +1539,15 @@
                                      },
                                      "voice": {
                                         "type": "string",
-                                        "description": "The voice to use when generating the audio. You can enter anything you like, a unique speaker will be generated. There are a few preset voices you can use: kobo,cheery,sleepy,shouty,chatty"
+                                        "description": "The voice to use when generating the audio. You can enter anything you like, a unique speaker will be generated. If using Qwen3TTS, voice cloning is supported, load the wav samples directory with --ttsdir. There are a few preset voices you can use: kobo,cheery,sleepy,shouty,chatty"
                                      },
                                      "speaker_json": {
                                         "type": "string",
                                         "description": "Custom speaker JSON. More info at https://github.com/LostRuins/koboldcpp/tree/concedo/examples/outetts"
+                                     },
+                                     "instruction": {
+                                        "type": "string",
+                                        "description": "Qwen3TTS VoiceDesign and CustomVoice only. Provide an instruction on how the narration should sound e.g. Angry man shouting with posh british accent"
                                      }
                                   },
                                   "type": "object"
@@ -1571,10 +1575,35 @@
                       ]
                    }
                 },
+                "/api/extra/speakers_list": {
+                   "get": {
+                      "responses": {
+                         "200": {
+                            "content": {
+                               "application/json": {
+                                  "example": {
+                                     "results": ["kobo", "cheery", "sleepy", "shouty", "chatty", "random", "instruct"]
+                                  },
+                                  "schema": {
+                                    "properties": {},
+                                    "type": "object"
+                                 }
+                               }
+                            },
+                            "description": "Successful request"
+                         }
+                      },
+                      "summary": "Get a list of available TTS speakers.",
+                      "description": "Get a list of available TTS speakers.",
+                      "tags": [
+                         "api/extra"
+                      ]
+                   }
+                },
                 "/api/extra/embeddings": {
                    "post": {
                       "summary": "Creates an embedding vector representing the input text. Please refer to OpenAI documentation",
-                      "description": "Creates an embedding vector representing the input text.\n\nThis is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://platform.openai.com/docs/api-reference/embeddings/create](https://platform.openai.com/docs/api-reference/embeddings/create)",
+                      "description": "Creates an embedding vector representing the input text.\n\nThis is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://developers.openai.com/docs/api-reference/embeddings/create](https://developers.openai.com/docs/api-reference/embeddings/create)",
                       "requestBody": {
                          "content": {
                             "application/json": {
@@ -1786,7 +1815,7 @@
                 "/api/extra/json_to_grammar": {
                    "post": {
                       "summary": "Converts a provided JSON schema into GBNF grammar.",
-                      "description": "Converts a provided JSON schema into GBNF grammar. Example schema at [https://platform.openai.com/docs/guides/structured-outputs](https://platform.openai.com/docs/guides/structured-outputs)",
+                      "description": "Converts a provided JSON schema into GBNF grammar. Example schema at [https://developers.openai.com/docs/guides/structured-outputs](https://developers.openai.com/docs/guides/structured-outputs)",
                       "requestBody": {
                          "content": {
                             "application/json": {
@@ -2034,7 +2063,7 @@
                             "application/json": {
                                "example": {
                                   "filename": "file1.kcpps",
-                                  "overrideconfig":"",
+                                  "baseconfig":"",
                                },
                                "schema": {
                                   "properties": {
@@ -2042,7 +2071,7 @@
                                         "type": "string",
                                         "description": "Filename of the .kcpps config to be loaded. Any associated files and models will be automatically swapped in."
                                      },
-                                     "overrideconfig": {
+                                     "baseconfig": {
                                         "type": "string",
                                         "description": "If filename is a gguf, this allows other kcpps settings to be overlaid on top of that gguf."
                                      },
@@ -2757,7 +2786,7 @@
                 "/v1/completions": {
                    "post": {
                       "summary": "Generates text continuations given a prompt. Please refer to OpenAI documentation",
-                      "description": "Generates text continuations given a prompt.\n\nThis is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://platform.openai.com/docs/api-reference/completions](https://platform.openai.com/docs/api-reference/completions). All KoboldCpp samplers are supported, please refer to /api/v1/generate for more details.",
+                      "description": "Generates text continuations given a prompt.\n\nThis is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://developers.openai.com/api/reference/resources/completions/methods/create](https://developers.openai.com/api/reference/resources/completions/methods/create). All KoboldCpp samplers are supported, please refer to /api/v1/generate for more details.",
                       "requestBody": {
                          "content": {
                             "application/json": {
@@ -2779,7 +2808,7 @@
                 "/v1/chat/completions": {
                    "post": {
                       "summary": "Generates a response from a list of messages. Please refer to OpenAI documentation",
-                      "description": "Given a list of messages comprising a conversation, the model will return a response.\n\n This is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://platform.openai.com/docs/api-reference/chat](https://platform.openai.com/docs/api-reference/chat). All KoboldCpp samplers are supported, please refer to /api/v1/generate for more details.",
+                      "description": "Given a list of messages comprising a conversation, the model will return a response.\n\n This is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create). All KoboldCpp samplers are supported, please refer to /api/v1/generate for more details.",
                       "requestBody": {
                          "content": {
                             "application/json": {
@@ -2823,7 +2852,7 @@
                 "/v1/models": {
                    "get": {
                       "summary": "List and describe the various models available in the API. Please refer to OpenAI documentation",
-                      "description": "List and describe the various models available in the API.\n\n This is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://platform.openai.com/docs/api-reference/models](https://platform.openai.com/docs/api-reference/models)",
+                      "description": "List and describe the various models available in the API.\n\n This is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://developers.openai.com/docs/api-reference/models](https://developers.openai.com/docs/api-reference/models)",
                       "tags": [
                          "v1"
                       ],
@@ -2833,7 +2862,7 @@
                 "/v1/audio/transcriptions": {
                    "post": {
                       "summary": "Transcribes a wav file with speech to text using loaded Whisper model. Please refer to OpenAI documentation",
-                      "description": "Transcribes a wav file with speech to text using loaded Whisper model.\n\n This is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://platform.openai.com/docs/api-reference/audio/createTranscription](https://platform.openai.com/docs/api-reference/audio/createTranscription)",
+                      "description": "Transcribes a wav file with speech to text using loaded Whisper model.\n\n This is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://developers.openai.com/docs/api-reference/audio/createTranscription](https://developers.openai.com/docs/api-reference/audio/createTranscription)",
                       "tags": [
                          "v1"
                       ],
@@ -2843,7 +2872,7 @@
                 "/v1/audio/speech": {
                    "post": {
                       "summary": "Generates Text-To-Speech audio from input text. Please refer to OpenAI documentation",
-                      "description": "Generates Text-To-Speech audio from input text.\n\n This is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://platform.openai.com/docs/api-reference/audio/createSpeech](https://platform.openai.com/docs/api-reference/audio/createSpeech)",
+                      "description": "Generates Text-To-Speech audio from input text.\n\n This is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://developers.openai.com/docs/api-reference/audio/createSpeech](https://developers.openai.com/docs/api-reference/audio/createSpeech)",
                       "requestBody": {
                          "content": {
                             "application/json": {
@@ -2865,7 +2894,7 @@
                 "/v1/embeddings": {
                    "post": {
                       "summary": "Creates an embedding vector representing the input text. Please refer to OpenAI documentation",
-                      "description": "Creates an embedding vector representing the input text.\n\nThis is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://platform.openai.com/docs/api-reference/embeddings/create](https://platform.openai.com/docs/api-reference/embeddings/create)",
+                      "description": "Creates an embedding vector representing the input text.\n\nThis is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://developers.openai.com/docs/api-reference/embeddings/create](https://developers.openai.com/docs/api-reference/embeddings/create)",
                       "requestBody": {
                          "content": {
                             "application/json": {
@@ -2888,6 +2917,125 @@
                       "responses": {"default": {"description": ""}}
                    }
                 },
+                "/v1/messages": {
+                  "post": {
+                     "summary": "Creates a message using the Anthropic Messages API format",
+                     "description": "Given a structured list of input messages, a system prompt, and required tokens parameter, the model will return a response. This follows the native Anthropic Messages payload style.",
+                     "tags": [
+                        "v1"
+                     ],
+                     "parameters": [
+                        {
+                           "name": "x-api-key",
+                           "in": "header",
+                           "required": false,
+                           "description": "Anthropic API Key used for authentication.",
+                           "schema": {
+                              "type": "string"
+                           }
+                        },
+                        {
+                           "name": "anthropic-version",
+                           "in": "header",
+                           "required": false,
+                           "description": "Anthropic API version. Currently, '2023-06-01' is expected.",
+                           "schema": {
+                              "type": "string",
+                              "default": "2023-06-01"
+                           }
+                        }
+                     ],
+                     "requestBody": {
+                        "required": false,
+                        "content": {
+                           "application/json": {
+                              "example": {
+                                 "model": "claude-3-5-sonnet-20241022",
+                                 "max_tokens": 1024,
+                                 "system": "You are a helpful assistant.",
+                                 "messages": [
+                                    {
+                                       "role": "user",
+                                       "content": "Tell me a joke about Kobolds."
+                                    }
+                                 ],
+                                 "temperature": 0.7
+                              },
+                              "schema": {
+                                 "type": "object",
+                                 "required": [
+                                    "model",
+                                    "messages",
+                                    "max_tokens"
+                                 ],
+                                 "properties": {
+                                    "model": {
+                                       "type": "string",
+                                       "description": "The model that will handle the request."
+                                    },
+                                    "messages": {
+                                       "type": "array",
+                                       "description": "Input messages. Roles must alternate between user and assistant.",
+                                       "items": {
+                                          "type": "object",
+                                          "required": [
+                                             "role",
+                                             "content"
+                                          ],
+                                          "properties": {
+                                             "role": {
+                                                "type": "string",
+                                                "enum": ["user", "assistant"]
+                                             },
+                                             "content": {
+                                                "oneOf": [
+                                                   { "type": "string" },
+                                                   {
+                                                      "type": "array",
+                                                      "items": {
+                                                         "type": "object",
+                                                         "properties": {
+                                                            "type": {
+                                                               "type": "string",
+                                                               "enum": ["text", "image"]
+                                                            },
+                                                            "text": { "type": "string" }
+                                                         }
+                                                      }
+                                                   }
+                                                ]
+                                             }
+                                          }
+                                       }
+                                    },
+                                    "system": {
+                                       "type": "string",
+                                       "description": "System prompt to define the behavior and tone of the model."
+                                    },
+                                    "max_tokens": {
+                                       "type": "integer",
+                                       "description": "The maximum number of tokens to generate."
+                                    },
+                                    "temperature": {
+                                       "type": "number",
+                                       "minimum": 0.0,
+                                       "maximum": 1.0
+                                    },
+                                    "stream": {
+                                       "type": "boolean"
+                                    }
+                                 }
+                              }
+                           }
+                        }
+                     },
+                     "responses": {
+                        "default": {
+                           "description": ""
+                        }
+                     }
+                  }
+               }
              },
              "servers": [
                 {
@@ -2918,6 +3066,7 @@
              ]
           };
    </script>
+
 
    <script>
       //self destruct into json if requested
