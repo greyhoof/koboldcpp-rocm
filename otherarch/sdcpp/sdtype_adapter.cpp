@@ -14,21 +14,14 @@
 #include <algorithm>
 #include <filesystem>
 
-#include "model_adapter.h"
-#include "vocab/vocab.h"
-#include "flux.hpp"
-#include "stable-diffusion.cpp"
-#include "util.cpp"
-#include "name_conversion.cpp"
-#include "upscaler.cpp"
-#include "model.cpp"
-#include "tokenize_util.cpp"
-#include "zip.c"
-
 #include "otherarch/utils.h"
+#include "model_adapter.h"
 
-// #include "preprocessing.hpp"
 #include "stable-diffusion.h"
+#include "src/kcpp_sd_extensions.h"
+#include "ggml-backend.h"
+
+using namespace kcpp_sd;
 
 //#define STB_IMAGE_IMPLEMENTATION //already defined in llava
 #include "stb_image.h"
@@ -41,9 +34,6 @@
 #include "stb_image_resize.h"
 
 #include "avi_writer.h"
-
-static_assert((int)SD_TYPE_COUNT == (int)GGML_TYPE_COUNT,
-              "inconsistency between SD_TYPE_COUNT and GGML_TYPE_COUNT");
 
 struct LoraMap {
     std::vector<std::pair<std::string, float>> items;
@@ -109,6 +99,7 @@ struct SDParams {
     std::string t5xxl_path;
     std::string diffusion_model_path;
     std::string vae_path;
+    std::string audio_vae_path;
     std::string taesd_path;
     std::string stacked_id_embeddings_path;
     sd_type_t wtype = SD_TYPE_COUNT;
@@ -126,14 +117,12 @@ struct SDParams {
     float distilled_guidance      = -1.0f;
     float shifted_timestep        = 0;
     float flow_shift              = -1.0f;
+    float eta                     = -1.0f;
     float strength                = 0.75f;
     int64_t seed                  = 42;
-    bool clip_on_cpu              = false;
     bool diffusion_flash_attn     = false;
     bool diffusion_conv_direct    = false;
     bool vae_conv_direct          = false;
-
-    bool chroma_use_dit_mask     = true;
 
     LoraMap lora_map;
     bool lora_dynamic = false;
@@ -156,7 +145,6 @@ static uint8_t * upscale_src_buffer = NULL;
 static std::vector<uint8_t *> input_extraimage_buffers;
 const int max_extra_images = 4;
 
-static std::string sdvulkandeviceenv;
 static std::string sdmaingpuenv;
 static int cfg_tiled_vae_threshold = 0;
 static int cfg_square_limit = 0;
@@ -170,11 +158,13 @@ static bool remove_limits = false;
 static struct {
     std::string data;
     std::string data_extra;
+    std::string final_frame;
     std::string info;
     bool animated;
     void reset() {
         data = "";
         data_extra = "";
+        final_frame = "";
         info = "{}";
         animated = false;
     }
@@ -183,6 +173,7 @@ static struct {
         output.status = status;
         output.data = data.c_str();
         output.data_extra = data_extra.c_str();
+        output.final_frame = final_frame.c_str();
         output.info = info.c_str();
         output.animated = animated;
         return output;
@@ -193,22 +184,6 @@ static struct {
         return outputs(0);
     }
 } sd_generation;
-
-static int get_loaded_sd_version(sd_ctx_t* ctx)
-{
-    return ctx->sd->version;
-}
-
-static bool loaded_model_is_chroma(sd_ctx_t* ctx)
-{
-    if (ctx != nullptr && ctx->sd != nullptr) {
-        auto maybe_flux = std::dynamic_pointer_cast<FluxModel>(ctx->sd->diffusion_model);
-        if (maybe_flux != nullptr) {
-            return maybe_flux->flux.flux_params.is_chroma;
-        }
-    }
-    return false;
-}
 
 static std::string read_str_from_disk(std::string filepath)
 {
@@ -225,65 +200,103 @@ static std::string read_str_from_disk(std::string filepath)
     return output;
 }
 
+static std::string load_embd_file(std::string& cache, const char* filename)
+{
+    if (cache.empty()) {
+        std::string filepath = executable_path + filename;
+        cache = read_str_from_disk(filepath);
+    }
+    return cache;
+}
+
 std::string load_clip_merges()
 {
-    static std::string mergesstr;  // cached string
-    if (!mergesstr.empty()) {
-        return mergesstr;  // already loaded
-    }
-    std::string filepath = executable_path + "embd_res/merges_utf8_c_str.embd";
-    mergesstr = read_str_from_disk(filepath);
-    return mergesstr;
+    static std::string cache;
+    return load_embd_file(cache, "embd_res/merges_utf8_c_str.embd");
 }
 std::string load_qwen2_merges()
 {
-    static std::string qwenmergesstr;  // cached string
-    if (!qwenmergesstr.empty()) {
-        return qwenmergesstr;  // already loaded
-    }
-    std::string filepath = executable_path + "embd_res/qwen2_merges_utf8_c_str.embd";
-    qwenmergesstr = read_str_from_disk(filepath);
-    return qwenmergesstr;
+    static std::string cache;
+    return load_embd_file(cache, "embd_res/qwen2_merges_utf8_c_str.embd");
+}
+std::string load_gemma_merges()
+{
+    static std::string cache;
+    return load_embd_file(cache, "embd_res/gemma_merges_utf8_c_str.embd");
+}
+std::string load_gemma_vocab_json()
+{
+    static std::string cache;
+    return load_embd_file(cache, "embd_res/gemma_vocab_json.embd");
+}
+std::string load_gemma2_merges()
+{
+    static std::string cache;
+    return load_embd_file(cache, "embd_res/gemma2_merges_utf8_c_str.embd");
+}
+std::string load_gemma2_vocab_json()
+{
+    static std::string cache;
+    return load_embd_file(cache, "embd_res/gemma2_vocab_json.embd");
 }
 std::string load_mistral_merges()
 {
-    static std::string mistralmergesstr;  // cached string
-    if (!mistralmergesstr.empty()) {
-        return mistralmergesstr;  // already loaded
-    }
-    std::string filepath = executable_path + "embd_res/mistral2_merges_utf8_c_str.embd";
-    mistralmergesstr = read_str_from_disk(filepath);
-    return mistralmergesstr;
+    static std::string cache;
+    return load_embd_file(cache, "embd_res/mistral2_merges_utf8_c_str.embd");
 }
 std::string load_mistral_vocab_json()
 {
-    static std::string mistralvocabstr;  // cached string
-    if (!mistralvocabstr.empty()) {
-        return mistralvocabstr;  // already loaded
-    }
-    std::string filepath = executable_path + "embd_res/mistral2_vocab_json.embd";
-    mistralvocabstr = read_str_from_disk(filepath);
-    return mistralvocabstr;
+    static std::string cache;
+    return load_embd_file(cache, "embd_res/mistral2_vocab_json.embd");
 }
 std::string load_t5_tokenizer_json()
 {
-    static std::string t5str = "";
-    if (!t5str.empty()) {
-        return t5str;  // already loaded
-    }
-    std::string filepath = executable_path + "embd_res/t5_tokenizer_json.embd";
-    t5str = read_str_from_disk(filepath);
-    return t5str;
+    static std::string cache;
+    return load_embd_file(cache, "embd_res/t5_tokenizer_json.embd");
 }
 std::string load_umt5_tokenizer_json()
 {
-    static std::string umt5str = "";
-    if (!umt5str.empty()) {
-        return umt5str;  // already loaded
+    static std::string cache;
+    return load_embd_file(cache, "embd_res/umt5_tokenizer_json.embd");
+}
+std::string load_gpt_oss_merges()
+{
+    static std::string cache;
+    return load_embd_file(cache, "embd_res/gpt_oss_merges_utf8_c_str.embd");
+}
+std::string load_gpt_oss_vocab_json()
+{
+    static std::string cache;
+    return load_embd_file(cache, "embd_res/gpt_oss_vocab_json.embd");
+}
+
+static std::string get_device_override(int value, const char * module = nullptr)
+{
+    std::string device_name;
+    if (value <= -2) {
+        device_name = "CPU";
+    } else if (value >= 0) {
+        size_t gpu_index = static_cast<size_t>(value);
+        if (gpu_index >= ggml_backend_dev_count()) {
+            printf("\nWARNING: device %zu doesn't exist, falling back to default for %s\n",
+                   gpu_index,
+                   module ? module : "the main device");
+        } else {
+            auto dev = ggml_backend_dev_get(gpu_index);
+            device_name = ggml_backend_dev_name(dev);
+        }
     }
-    std::string filepath = executable_path + "embd_res/umt5_tokenizer_json.embd";
-    umt5str = read_str_from_disk(filepath);
-    return umt5str;
+    std::string result;
+    if (device_name == "") {
+        result = ""; // no override: sdcpp will use the main device
+    } else if (module) {
+        printf("Selecting %s as %s image generation device\n", device_name.c_str(), module);
+        result = std::string{","} + module + "=" + device_name;
+    } else {
+        printf("Selecting %s as the main image generation device\n", device_name.c_str());
+        result = device_name;
+    }
+    return result;
 }
 
 bool sdtype_load_model(const sd_load_model_inputs inputs) {
@@ -297,6 +310,7 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
         lora_map.add_lora(inputs.lora_filenames[i], inputs.lora_multipliers[i]);
     }
     std::string vaefilename = inputs.vae_filename;
+    std::string audiovaefilename = inputs.audio_vae_filename;
     std::string t5xxl_filename = inputs.t5xxl_filename;
     std::string clip1_filename = inputs.clip1_filename;
     std::string clip2_filename = inputs.clip2_filename;
@@ -309,17 +323,7 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     cfg_square_limit = inputs.img_soft_limit;
     printf("\nImageGen Init - Load Model: %s\n",inputs.model_filename);
 
-    {
-        //kcpp allow gpu id override
-        std::string sdmaingpu = std::to_string(inputs.kcpp_main_gpu);
-        const char* existingenv = getenv("SD_VK_DEVICE");
-        int kcpp_parseinfo_maindevice = inputs.kcpp_main_gpu<=0?0:inputs.kcpp_main_gpu;
-        if(kcpp_parseinfo_maindevice>0 && !existingenv && sdmaingpu!="")
-        {
-            sdmaingpuenv = "SD_VK_DEVICE="+sdmaingpu;
-            putenv((char*)sdmaingpuenv.c_str());
-        }
-    }
+    std::string backends = get_device_override(inputs.kcpp_main_device);
 
     int lora_apply_mode = LORA_APPLY_AT_RUNTIME;
     bool lora_dynamic = false;
@@ -361,6 +365,10 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     {
         printf("With Custom VAE: %s\n",vaefilename.c_str());
     }
+    if(audiovaefilename!="")
+    {
+        printf("With Audio VAE: %s\n",audiovaefilename.c_str());
+    }
     if(t5xxl_filename!="")
     {
         printf("With Custom T5-XXL Model: %s\n",t5xxl_filename.c_str());
@@ -394,25 +402,22 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     {
         printf("Conv2D Direct for VAE model is enabled\n");
     }
+    if (inputs.use_mmap && inputs.offload_cpu) {
+        printf("Offloading weights to system RAM with mmap\n");
+        if (!lora_dynamic && inputs.lora_len > 0) {
+            printf("Note: static LoRAs can reduce mmap memory savings!\n");
+        }
+    } else if (inputs.offload_cpu) {
+        printf("Offloading weights to system RAM\n");
+    } else if (inputs.use_mmap) {
+        printf("Using mmap for I/O\n");
+    }
+    if(inputs.max_vram != 0.f) {
+        printf("Using max VRAM = %0.2f GB\n", inputs.max_vram);
+    }
     if(inputs.quant > 0)
     {
         printf("Note: Loading a pre-quantized model is always faster than using compress weights!\n");
-    }
-
-    //duplicated from expose.cpp
-    std::string vulkan_info_raw = inputs.vulkan_info;
-    std::string vulkan_info_str = "";
-    for (size_t i = 0; i < vulkan_info_raw.length(); ++i) {
-        vulkan_info_str += vulkan_info_raw[i];
-        if (i < vulkan_info_raw.length() - 1) {
-            vulkan_info_str += ",";
-        }
-    }
-    const char* existingenv = getenv("GGML_VK_VISIBLE_DEVICES");
-    if(!existingenv && vulkan_info_str!="")
-    {
-        sdvulkandeviceenv = "GGML_VK_VISIBLE_DEVICES="+vulkan_info_str;
-        putenv((char*)sdvulkandeviceenv.c_str());
     }
 
     sd_params = new SDParams();
@@ -427,6 +432,7 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     sd_params->diffusion_conv_direct = inputs.diffusion_conv_direct;
     sd_params->vae_conv_direct = inputs.vae_conv_direct;
     sd_params->vae_path = vaefilename;
+    sd_params->audio_vae_path = audiovaefilename;
     sd_params->taesd_path = taesdpath;
     sd_params->t5xxl_path = t5xxl_filename;
     sd_params->clip_l_path = clip1_filename;
@@ -460,6 +466,7 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     params.t5xxl_path = sd_params->t5xxl_path.c_str();
     params.diffusion_model_path = sd_params->diffusion_model_path.c_str();
     params.vae_path = sd_params->vae_path.c_str();
+    params.audio_vae_path = sd_params->audio_vae_path.c_str();
     params.taesd_path = sd_params->taesd_path.c_str();
     params.photo_maker_path = sd_params->stacked_id_embeddings_path.c_str();
 
@@ -472,19 +479,24 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     params.diffusion_flash_attn = sd_params->diffusion_flash_attn;
     params.diffusion_conv_direct = sd_params->diffusion_conv_direct;
     params.vae_conv_direct = sd_params->vae_conv_direct;
-    params.chroma_use_dit_mask = sd_params->chroma_use_dit_mask;
-    params.offload_params_to_cpu = inputs.offload_cpu;
-    params.keep_vae_on_cpu = inputs.vae_cpu;
-    params.keep_clip_on_cpu = inputs.clip_cpu;
+    params.chroma_use_dit_mask = true;
+    params.max_vram = inputs.max_vram;
+    params.stream_layers = inputs.stream_layers;
+    params.enable_mmap = inputs.use_mmap;
+    params.params_backend = inputs.offload_cpu ? "CPU" : "";
+    backends += get_device_override(inputs.kcpp_vae_device, "VAE");
+    backends += get_device_override(inputs.kcpp_clip_device, "CLIP");
+    if (backends.rfind(",", 0) == 0) {
+        backends = "auto" + backends;
+    }
+    params.backend = backends.c_str();
+    if (inputs.debugmode==1) {
+        printf("\nSetting sd backend list to \"%s\", params backend list to \"%s\"", params.backend, params.params_backend);
+    }
     params.lora_apply_mode = (lora_apply_mode_t)lora_apply_mode;
 
     // also switches flash attn for the vae and conditioner
     params.flash_attn = params.diffusion_flash_attn;
-
-    if (params.chroma_use_dit_mask && params.diffusion_flash_attn) {
-        // note we don't know yet if it's a Chroma model
-        params.chroma_use_dit_mask = false;
-    }
 
     if(inputs.debugmode==1)
     {
@@ -499,23 +511,15 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     sd_ctx = new_sd_ctx(&params);
 
     if (sd_ctx == NULL) {
-        printf("\nError: KCPP SD Failed to create context!\nIf using Flux/SD3.5, make sure you have ALL files required (e.g. VAE, T5, Clip...) or baked in!\n");
-        printf("Otherwise, if you are using GGUF format, you can try the original .safetensors instead (Comfy GGUF not supported)\n");
+        printf("\nError: Image generation failed to setup!\nMake sure you have ALL files required (e.g. VAE, T5, Clip...) or baked into the model!\n");
         return false;
     }
 
-    if (!sd_is_quiet) {
-        if (loaded_model_is_chroma(sd_ctx) && sd_params->diffusion_flash_attn && sd_params->chroma_use_dit_mask)
-        {
-            printf("Chroma: flash attention is on, disabling DiT mask (this will lower image quality)\n");
-            // disabled before loading
-        }
-    }
+    auto info = get_model_info(sd_ctx);
 
-    auto loadedsdver = get_loaded_sd_version(sd_ctx);
-    if (loadedsdver == SDVersion::VERSION_WAN2 || loadedsdver == SDVersion::VERSION_WAN2_2_I2V || loadedsdver == SDVersion::VERSION_WAN2_2_TI2V)
+    if (info.is_wan || info.is_ltx)
     {
-        printf("\nVer %d, Setting to Video Generation Mode!\n",loadedsdver);
+        printf("\nSetting to Video Generation Mode!\n");
         is_vid_model = true;
     }
 
@@ -524,9 +528,9 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     if(lora_specs.size()>0)
     {
         printf("  applying %zu LoRAs...\n", lora_specs.size());
-        sd_ctx->sd->kcpp_lora_cache_populate = lora_cache;
-        sd_ctx->sd->apply_loras(lora_specs.data(), lora_specs.size());
-        sd_ctx->sd->kcpp_lora_cache_populate = false;
+        set_lora_cache(sd_ctx, lora_cache);
+        apply_loras(sd_ctx, lora_specs);
+        set_lora_cache(sd_ctx, false);
     }
 
     input_extraimage_buffers.reserve(max_extra_images);
@@ -535,10 +539,12 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     if (upscaler_filename!="") {
         const int upscale_tile_size = 128;
         upscaler_ctx = new_upscaler_ctx(upscaler_filename.c_str(),
-                                        params.offload_params_to_cpu,
+                                        inputs.offload_cpu,
                                         params.diffusion_conv_direct,
                                         params.n_threads,
-                                        upscale_tile_size);
+                                        upscale_tile_size,
+                                        params.backend,
+                                        params.params_backend);
 
         if (upscaler_ctx == nullptr) {
              printf("\nError: KCPP failed to load upscaler!\n");
@@ -552,20 +558,6 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
 
 static std::string friendly_model_name(std::filesystem::path model_path) {
     return model_path.filename().string();
-}
-
-std::string clean_input_prompt(const std::string& input) {
-    std::string result;
-    result.reserve(input.size());
-    for (char ch : input) {
-        // Check if the character is an ASCII or extended ASCII character
-        if (static_cast<unsigned char>(ch) <= 0x7F || (ch >= 0xC2 && ch <= 0xF4)) {
-            result.push_back(ch);
-        }
-    }
-    //limit to max 800 chars
-    result = result.substr(0, 800);
-    return result;
 }
 
 static std::string get_scheduler_name(scheduler_t scheduler, bool as_sampler_suffix = false)
@@ -594,6 +586,8 @@ static std::string get_image_params(const sd_img_gen_params_t & params, const st
         << " | Size: " << params.width << "x" << params.height
         << " | Sampler: " << sd_sample_method_name(params.sample_params.sample_method)
         << get_scheduler_name(params.sample_params.scheduler, true);
+    if (params.sample_params.eta != -1.0f)
+        ss << "| Eta: " << params.sample_params.eta;
     if (params.sample_params.shifted_timestep != 0)
         ss << "| Timestep Shift: " << params.sample_params.shifted_timestep;
     if (params.sample_params.flow_shift > 0.f && params.sample_params.flow_shift != INFINITY)
@@ -705,48 +699,9 @@ static enum sample_method_t sampler_from_name(const std::string& sampler)
 {
     // all lowercase
     enum sample_method_t result = str_to_sample_method(sampler.c_str());
-    if (result != sample_method_t::SAMPLE_METHOD_COUNT)
-    {
+    if (result != sample_method_t::SAMPLE_METHOD_COUNT) {
         return result;
-    }
-    else if(sampler=="euler a"||sampler=="k_euler_a")
-    {
-        return sample_method_t::EULER_A_SAMPLE_METHOD;
-    }
-    else if(sampler=="k_euler")
-    {
-        return sample_method_t::EULER_SAMPLE_METHOD;
-    }
-    else if(sampler=="k_heun")
-    {
-        return sample_method_t::HEUN_SAMPLE_METHOD;
-    }
-    else if(sampler=="k_dpm_2")
-    {
-        return sample_method_t::DPM2_SAMPLE_METHOD;
-    }
-    else if(sampler=="k_lcm")
-    {
-        return sample_method_t::LCM_SAMPLE_METHOD;
-    }
-    else if(sampler=="ddim")
-    {
-        return sample_method_t::DDIM_TRAILING_SAMPLE_METHOD;
-    }
-    else if(sampler=="dpm++ 2m karras" || sampler=="dpm++ 2m" || sampler=="k_dpmpp_2m")
-    {
-        return sample_method_t::DPMPP2M_SAMPLE_METHOD;
-    }
-    else if(sampler=="res multistep" || sampler=="k_res_multistep")
-    {
-        return sample_method_t::RES_MULTISTEP_SAMPLE_METHOD;
-    }
-    else if(sampler=="res 2s" || sampler=="k_res_2s")
-    {
-        return sample_method_t::RES_2S_SAMPLE_METHOD;
-    }
-    else
-    {
+    } else {
         return sample_method_t::SAMPLE_METHOD_COUNT;
     }
 }
@@ -985,6 +940,12 @@ static std::string raw_image_to_png_base64(const sd_image_t& img, std::string pa
     return result;
 }
 
+bool supports_reference_images(kcpp_sd::model_info info)
+{
+    bool supported = (info.is_wan || info.is_ltx || info.is_qwenimg || info.is_flux2 || info.is_kontext || photomaker_enabled);
+    return supported;
+}
+
 sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
 {
     if(sd_ctx == nullptr || sd_params == nullptr)
@@ -993,9 +954,6 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
     }
     sd_image_t * results = nullptr;
 
-    //sanitize prompts, remove quotes and limit lengths
-    std::string cleanprompt = clean_input_prompt(inputs.prompt);
-    std::string cleannegprompt = clean_input_prompt(inputs.negative_prompt);
     std::string img2img_data = std::string(inputs.init_images);
     std::string img2img_mask = std::string(inputs.mask);
     std::vector<std::string> extra_image_data;
@@ -1004,13 +962,14 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         extra_image_data.push_back(std::string(inputs.extra_images[i]));
     }
 
-    sd_params->prompt = cleanprompt;
-    sd_params->negative_prompt = cleannegprompt;
+    sd_params->prompt = inputs.prompt;
+    sd_params->negative_prompt = inputs.negative_prompt;
     sd_params->cfg_scale = inputs.cfg_scale;
     sd_params->distilled_guidance = inputs.distilled_guidance;
     sd_params->sample_steps = inputs.sample_steps;
     sd_params->shifted_timestep = inputs.shifted_timestep;
     sd_params->flow_shift = inputs.flow_shift;
+    sd_params->eta = inputs.eta;
     sd_params->seed = inputs.seed;
     sd_params->width = inputs.width;
     sd_params->height = inputs.height;
@@ -1023,37 +982,26 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         sd_params->sample_method = sd_get_default_sample_method(sd_ctx);
     }
 
-    sd_ctx->sd->SetCircularAxesAll(inputs.circular_x, inputs.circular_y);
+    SetCircularAxesAll(sd_ctx, inputs.circular_x, inputs.circular_y);
 
     sd_params->cache_mode    = inputs.cache_mode ? inputs.cache_mode : "";
     sd_params->cache_options = inputs.cache_options ? inputs.cache_options : "";
 
-    auto loadedsdver = get_loaded_sd_version(sd_ctx);
+    auto info = get_model_info(sd_ctx);
     bool is_img2img = img2img_data != "";
-    bool is_wan = (loadedsdver == SDVersion::VERSION_WAN2 || loadedsdver == SDVersion::VERSION_WAN2_2_I2V || loadedsdver == SDVersion::VERSION_WAN2_2_TI2V);
-    bool is_qwenimg = (loadedsdver == SDVersion::VERSION_QWEN_IMAGE);
-    bool is_kontext = (loadedsdver==SDVersion::VERSION_FLUX && !loaded_model_is_chroma(sd_ctx));
-    bool is_flux2 = (loadedsdver == SDVersion::VERSION_FLUX2 || loadedsdver == SDVersion::VERSION_FLUX2_KLEIN);
 
-    if (loadedsdver == SDVersion::VERSION_FLUX)
+    if (info.is_flux1)
     {
-        if (!loaded_model_is_chroma(sd_ctx) && sd_params->cfg_scale != 1.0f) {
+        if (!info.is_chroma && sd_params->cfg_scale != 1.0f) {
             //non chroma clamp cfg scale
             if (!sd_is_quiet && sddebugmode) {
                 printf("Flux: clamping CFG Scale to 1\n");
             }
             sd_params->cfg_scale = 1.0f;
         }
-        if (sd_params->sample_method == sample_method_t::EULER_A_SAMPLE_METHOD) {
-            //euler a broken on flux
-            if (!sd_is_quiet && sddebugmode) {
-                printf("%s: switching Euler A to Euler\n", loaded_model_is_chroma(sd_ctx) ? "Chroma" : "Flux");
-            }
-            sd_params->sample_method = sample_method_t::EULER_SAMPLE_METHOD;
-        }
     }
 
-    if(!remove_limits && loadedsdver == SDVersion::VERSION_Z_IMAGE)
+    if(!remove_limits && info.is_zimage)
     {
         if(sd_params->cfg_scale > 4.0f)
         {
@@ -1064,7 +1012,7 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         }
     }
 
-    if(loadedsdver == SDVersion::VERSION_SDXS)
+    if(info.is_sdxs)
     {
         if(sd_params->cfg_scale > 1.0f || sd_params->sample_steps > 1)
         {
@@ -1076,7 +1024,17 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         }
     }
 
-    if(is_wan && extra_image_data.size()==0 && is_img2img)
+    //if a single extra image is provided, mask is NOT provided, and img2img image is NOT provided
+    //and it's a (SD1.5, SDXL) model that doesn't support extra images (see extra_image_data later)
+    //swap extra image data into img2img instead (graceful fallback)
+    if(!supports_reference_images(info) && extra_image_data.size()==1 && !is_img2img && img2img_mask=="")
+    {
+        is_img2img = true;
+        img2img_data = extra_image_data[0];
+        extra_image_data.clear();
+    }
+
+    if ((info.is_wan || info.is_ltx) && extra_image_data.size() == 0 && is_img2img)
     {
         extra_image_data.push_back(img2img_data);
     }
@@ -1093,14 +1051,14 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
     int hard_megapixel_res_limit = 2048; // hard area limit, no matter the config
     if (cfg_square_limit <= 0) {
         // default limit is model dependent: ~0.66 megapixel for SD1.5/SD2, 1 megapixel for most models
-        img_soft_limit = ((loadedsdver==SDVersion::VERSION_SD1 || loadedsdver==SDVersion::VERSION_SD2)?832:1024);
+        img_soft_limit = (info.is_sd1 || info.is_sd2)?832:1024;
     } else {
         // force img_side_min <= limit <= hard_megapixel_res_limit
         img_soft_limit = std::max(std::min(cfg_square_limit, hard_megapixel_res_limit), img_side_min);
     }
 
     // unet is limited to multiples of 64; dit models vary
-    int spatial_multiple = sd_ctx->sd->get_vae_scale_factor() * sd_ctx->sd->get_diffusion_model_down_factor();
+    int spatial_multiple = info.spatial_multiple;
 
     sd_fix_resolution(sd_params->width, sd_params->height, img_hard_limit, img_soft_limit, spatial_multiple);
     if (inputs.width != sd_params->width || inputs.height != sd_params->height) {
@@ -1110,6 +1068,16 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
 
     // trigger tiling by image area, the memory used for the VAE buffer is 6656 bytes per image pixel, default 768x768
     bool dotile = (sd_params->width*sd_params->height > cfg_tiled_vae_threshold*cfg_tiled_vae_threshold);
+
+    int vae_tile_size = -1;
+    if (dotile) {
+        int new_vae_tile_size = cfg_tiled_vae_threshold / info.vae_scale_factor;
+        new_vae_tile_size = new_vae_tile_size / 2;
+        new_vae_tile_size -= new_vae_tile_size % 2;
+        if (new_vae_tile_size > vae_tile_size) {
+            vae_tile_size = new_vae_tile_size;
+        }
+    }
 
     //for img2img
     sd_image_t input_image = {0,0,0,nullptr};
@@ -1146,42 +1114,11 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         {
             int nx2, ny2, nc2;
             int desiredchannels = 3;
-            if(is_wan)
+            if(supports_reference_images(info))
             {
-                uint8_t * loaded = load_image_from_b64(extra_image_data[i],nx2,ny2,img2imgW,img2imgH,3);
-                if(loaded)
+                if(info.is_wan || info.is_ltx)
                 {
-                    input_extraimage_buffers.push_back(loaded);
-                    sd_image_t extraimage_reference;
-                    extraimage_reference.width = nx2;
-                    extraimage_reference.height = ny2;
-                    extraimage_reference.channel = desiredchannels;
-                    extraimage_reference.data = loaded;
-                    wan_imgs.push_back(extraimage_reference);
-                }
-            }
-            else if(is_qwenimg || is_flux2)
-            {
-                uint8_t * loaded = load_image_from_b64(extra_image_data[i],nx2,ny2);
-                if(loaded)
-                {
-                    //kcpp fix: qwen image can stack overflow and crash when ref images exceed
-                    // a total res of 512x512 = 262144, so we downscale if that's the case
-                    // kcpp edit 2mar2026: this seems to be better now, so limit to 1024x1024 instead
-                    int tgtx = nx2;
-                    int tgty = ny2;
-                    int res_lim_crash = 1024 * 1024;
-                    if (nx2 * ny2 > res_lim_crash)
-                    {
-                        float factor = sqrtf((float)res_lim_crash / ((float)nx2 * (float)ny2));
-                        tgtx = (int)(nx2 * factor);
-                        tgty = (int)(ny2 * factor);
-                        if (!sd_is_quiet && sddebugmode == 1)
-                        {
-                            printf("\nResized RefImg %dx%d to %dx%d", nx2, ny2, tgtx, tgty);
-                        }
-                        loaded = resize_image(loaded, nx2, ny2, tgtx, tgty);
-                    }
+                    uint8_t * loaded = load_image_from_b64(extra_image_data[i],nx2,ny2,img2imgW,img2imgH,3);
                     if(loaded)
                     {
                         input_extraimage_buffers.push_back(loaded);
@@ -1190,28 +1127,62 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
                         extraimage_reference.height = ny2;
                         extraimage_reference.channel = desiredchannels;
                         extraimage_reference.data = loaded;
-                        reference_imgs.push_back(extraimage_reference);
+                        wan_imgs.push_back(extraimage_reference);
                     }
                 }
-            }
-            else if (is_kontext || photomaker_enabled)
-            {
-                uint8_t * loaded = load_image_from_b64(extra_image_data[i],nx2,ny2);
-                if(loaded)
+                else if(info.is_qwenimg || info.is_flux2)
                 {
-                    input_extraimage_buffers.push_back(loaded);
-                    sd_image_t extraimage_reference;
-                    extraimage_reference.width = nx2;
-                    extraimage_reference.height = ny2;
-                    extraimage_reference.channel = desiredchannels;
-                    extraimage_reference.data = loaded;
-                    if(is_kontext)
+                    uint8_t * loaded = load_image_from_b64(extra_image_data[i],nx2,ny2);
+                    if(loaded)
                     {
-                        reference_imgs.push_back(extraimage_reference);
+                        //kcpp fix: qwen image can stack overflow and crash when ref images exceed
+                        // a total res of 512x512 = 262144, so we downscale if that's the case
+                        // kcpp edit 2mar2026: this seems to be better now, so limit to 1024x1024 instead
+                        int tgtx = nx2;
+                        int tgty = ny2;
+                        int res_lim_crash = 1024 * 1024;
+                        if (nx2 * ny2 > res_lim_crash)
+                        {
+                            float factor = sqrtf((float)res_lim_crash / ((float)nx2 * (float)ny2));
+                            tgtx = (int)(nx2 * factor);
+                            tgty = (int)(ny2 * factor);
+                            if (!sd_is_quiet && sddebugmode == 1)
+                            {
+                                printf("\nResized RefImg %dx%d to %dx%d", nx2, ny2, tgtx, tgty);
+                            }
+                            loaded = resize_image(loaded, nx2, ny2, tgtx, tgty);
+                        }
+                        if(loaded)
+                        {
+                            input_extraimage_buffers.push_back(loaded);
+                            sd_image_t extraimage_reference;
+                            extraimage_reference.width = nx2;
+                            extraimage_reference.height = ny2;
+                            extraimage_reference.channel = desiredchannels;
+                            extraimage_reference.data = loaded;
+                            reference_imgs.push_back(extraimage_reference);
+                        }
                     }
-                    else
+                }
+                else if (info.is_kontext || photomaker_enabled)
+                {
+                    uint8_t * loaded = load_image_from_b64(extra_image_data[i],nx2,ny2);
+                    if(loaded)
                     {
-                        photomaker_imgs.push_back(extraimage_reference);
+                        input_extraimage_buffers.push_back(loaded);
+                        sd_image_t extraimage_reference;
+                        extraimage_reference.width = nx2;
+                        extraimage_reference.height = ny2;
+                        extraimage_reference.channel = desiredchannels;
+                        extraimage_reference.data = loaded;
+                        if(info.is_kontext)
+                        {
+                            reference_imgs.push_back(extraimage_reference);
+                        }
+                        else
+                        {
+                            photomaker_imgs.push_back(extraimage_reference);
+                        }
                     }
                 }
             }
@@ -1252,12 +1223,23 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
     params.sample_params.scheduler = sd_params->scheduler;
     params.sample_params.sample_steps = sd_params->sample_steps;
     params.sample_params.shifted_timestep = sd_params->shifted_timestep;
+    if (sd_params->eta >= 0.f && sd_params->eta <= 1.f) {
+        params.sample_params.eta = sd_params->eta;
+    }
     if (sd_params->flow_shift > 0.f && sd_params->flow_shift != INFINITY) {
         params.sample_params.flow_shift = sd_params->flow_shift;
     }
     params.seed = sd_params->seed;
     params.strength = sd_params->strength;
     params.vae_tiling_params.enabled = dotile;
+    if (vae_tile_size > 0) {
+        params.vae_tiling_params.tile_size_x = vae_tile_size;
+        params.vae_tiling_params.tile_size_y = vae_tile_size;
+    }
+    if(dotile)
+    {
+        params.vae_tiling_params.temporal_tiling = true;
+    }
     parse_cache_options(params.cache, sd_params->cache_mode, sd_params->cache_options);
 
     LoraMap lora_map = sd_params->lora_map;
@@ -1296,10 +1278,12 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
     int vid_req_frames = inputs.vid_req_frames;
     int video_output_type = inputs.video_output_type;
     int generated_num_results = 1;
+    int vid_fps = inputs.vid_fps;
     remove_limits = inputs.remove_limits;
 
      //special case, is img2img and denoise strength is 0 and steps is 1, do a passthru
     bool is_passthrough = (sd_params->sample_steps<=1 && sd_params->strength<=0 && is_img2img && vid_req_frames<=1 && extra_image_data.size()==0);
+    sd_audio_t* generated_audio = nullptr;
 
     if(is_vid_model)
     {
@@ -1317,15 +1301,18 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         vid_gen_params.strength = params.strength;
         vid_gen_params.seed = params.seed;
         vid_gen_params.video_frames = vid_req_frames;
-        if(wan_imgs.size()>0)
-        {
-            if(wan_imgs.size()>=1)
-            {
+        vid_gen_params.fps = vid_fps;
+        vid_gen_params.vae_tiling_params = params.vae_tiling_params;
+        if (wan_imgs.size() > 0) {
+            if (wan_imgs.size() >= 2) {
                 vid_gen_params.init_image = wan_imgs[0];
-            }
-            if(wan_imgs.size()>=2)
-            {
-                vid_gen_params.end_image = wan_imgs[1];
+                vid_gen_params.end_image  = wan_imgs[1];
+            } else if (wan_imgs.size() == 1) {
+                if (inputs.reverse_refimg) {
+                    vid_gen_params.end_image = wan_imgs[0];
+                } else {
+                    vid_gen_params.init_image = wan_imgs[0];
+                }
             }
         }
         if(!sd_is_quiet && sddebugmode==1)
@@ -1346,7 +1333,12 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         }
 
         fflush(stdout);
-        results = generate_video(sd_ctx, &vid_gen_params, &generated_num_results);
+
+        results = nullptr;
+        if (!generate_video(sd_ctx, &vid_gen_params, &results, &generated_num_results, &generated_audio)) {
+            results = nullptr;
+            generated_audio = nullptr;
+        }
         if(!sd_is_quiet && sddebugmode==1)
         {
             printf("\nRequested Vid Frames: %d, Generated Vid Frames: %d\n",vid_req_frames, generated_num_results);
@@ -1458,6 +1450,8 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         jsoninfo["extra_generation_params"] = nlohmann::json::object();
         if (params.sample_params.scheduler != scheduler_t::SCHEDULER_COUNT)
             jsoninfo["extra_generation_params"]["Schedule type"] = get_scheduler_name(params.sample_params.scheduler);
+        if (params.sample_params.eta >= 0 && params.sample_params.eta <= 1)
+            jsoninfo["eta"] = params.sample_params.eta;
         if (is_img2img)
             jsoninfo["denoising_strength"] = params.strength;
         if (sd_params->model_path.empty())
@@ -1476,6 +1470,7 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
     upscaled_image.data = nullptr;
     std::string gen_data;
     std::string gen_data2;
+    std::string final_frame_data;
 
     if (is_passthrough)
     {
@@ -1513,11 +1508,17 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
 
                 if(video_output_type==0 || video_output_type==2)
                 {
-                    status = create_gif_buf_from_sd_images_msf(results, generated_num_results, 16, &out_data,&out_len);
+                    status = create_gif_buf_from_sd_images_msf(results, generated_num_results, vid_fps, &out_data,&out_len);
                 }
                 if(video_output_type==1 || video_output_type==2)
                 {
-                    status2 = create_mjpg_avi_membuf_from_sd_images(results, generated_num_results, 16, 40, &out_data2,&out_len2);
+                    status2 = create_mjpg_avi_membuf_from_sd_images(results, generated_num_results, vid_fps, 40, &out_data2,&out_len2, generated_audio);
+                }
+
+                if(generated_num_results>1)
+                {
+                    sd_image_t *final_frame_image = &results[generated_num_results-1];
+                    final_frame_data = raw_image_to_png_base64(*final_frame_image);
                 }
 
                 if(!sd_is_quiet && sddebugmode==1)
@@ -1572,6 +1573,11 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         upscaled_image.data = nullptr;
     }
 
+    if (generated_audio) {
+        free_sd_audio(generated_audio);
+        generated_audio = nullptr;
+    }
+
     free(results);
 
     total_img_gens += 1;
@@ -1583,6 +1589,7 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
 
     sd_generation.data = gen_data;
     sd_generation.data_extra = gen_data2;
+    sd_generation.final_frame = final_frame_data;
     sd_generation.animated = isanim;
     sd_generation.info = jsoninfo.dump();
     return sd_generation.outputs(1);
@@ -1645,6 +1652,38 @@ sd_info_outputs sdtype_get_info()
         }
     }
     j["available_schedulers"] = available_schedulers;
+
+    auto available_samplers = json::array();
+    available_samplers.push_back("default");
+    for (int i = 0; i < sample_method_t::SAMPLE_METHOD_COUNT; i++) {
+        std::string name = sd_sample_method_name((sample_method_t)i);
+        if (name != "NONE") {
+            available_samplers.push_back(name);
+        }
+    }
+    j["available_samplers"] = available_samplers;
+
+    auto get_dev_type_name = [](auto dev_type) -> std::string {
+        if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU)
+            return "CPU";
+        else if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU)
+            return "GPU";
+        else if (dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU)
+            return "IGPU";
+        return "TYPE_" + std::to_string(dev_type);
+    };
+
+    auto devices = json::array();
+    size_t dev_count = ggml_backend_dev_count();
+    for (size_t i = 0; i < dev_count; ++i) {
+        auto dev = ggml_backend_dev_get(i);
+        json jdev;
+        jdev["name"]        = ggml_backend_dev_name(dev);
+        jdev["description"] = ggml_backend_dev_description(dev);
+        jdev["type"]        = get_dev_type_name(ggml_backend_dev_type(dev));
+        devices.push_back(jdev);
+    }
+    j["devices"] = devices;
 
     static std::string recent_info = j.dump();
     sd_info_outputs output;

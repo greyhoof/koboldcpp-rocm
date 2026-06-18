@@ -10,6 +10,9 @@
 #include <codecvt>
 #include <sstream>
 #include <ctime>
+#include <thread>
+#include <atomic>
+#include <algorithm>
 
 #define MINIAUDIO_IMPLEMENTATION
 #ifndef MTMD_AUDIO_DEBUG
@@ -635,40 +638,153 @@ std::string save_stereo_mp3_base64(const std::vector<float> & raw_audio,int T_au
         resampled = resample_wav(2,raw_audio,sample_rate,44100);
         enc_audio = resampled.data();
         enc_sr    = 44100;
+        enc_T     = (int)resampled.size() / 2;
     }
 
-    const int kbps = 128;
-    mp3enc_t * enc = mp3enc_init(enc_sr, 2, kbps);
-    if (!enc) {
-        fprintf(stderr, "[Audio] mp3enc_init failed\n");
+    const int kbps = 192;
+
+    // Encode PCM [offset, offset+len) with optional warm-up.
+    // warmup=true primes filterbank/MDCT/psy with the 1152 PCM samples
+    // immediately preceding offset (caller guarantees offset >= 1152).
+    // Returns raw MP3 bytes, or empty string on init failure.
+    auto encode_chunk = [&](int offset, int len, bool warmup) -> std::string {
+        mp3enc_t * enc = mp3enc_init(enc_sr, 2, kbps);
+        if (!enc) return "";
+
+        if (warmup) {
+            int wo = offset - 1152;
+            float wb[1152 * 2];
+            memcpy(wb,          enc_audio + wo,        1152 * sizeof(float));
+            memcpy(wb + 1152,   enc_audio + enc_T + wo, 1152 * sizeof(float));
+            int dummy = 0;
+            mp3enc_encode(enc, wb, 1152, &dummy);
+            mp3enc_flush(enc, &dummy);
+        }
+
+        std::string result;
+        result.reserve(len / 4);
+
+        int chunk_size = enc_sr;
+        std::vector<float> buf((size_t)chunk_size * 2);
+
+        for (int pos = 0; pos < len; pos += chunk_size) {
+            int n = (pos + chunk_size <= len) ? chunk_size : (len - pos);
+            memcpy(buf.data(),     enc_audio + offset + pos,          (size_t)n * sizeof(float));
+            memcpy(buf.data() + n, enc_audio + enc_T + offset + pos,  (size_t)n * sizeof(float));
+            int out_size = 0;
+            const uint8_t * mp3 = mp3enc_encode(enc, buf.data(), n, &out_size);
+            if (out_size > 0) {
+                result.append((const char *) mp3, out_size);
+            }
+        }
+
+        int flush_size = 0;
+        const uint8_t * flush_data = mp3enc_flush(enc, &flush_size);
+        if (flush_size > 0) {
+            result.append((const char *) flush_data, flush_size);
+        }
+        mp3enc_free(enc);
+        return result;
+    };
+
+    // Determine thread count: at most 1 thread per ~0.5s of audio
+    int n_threads = std::max(1, (int)std::thread::hardware_concurrency());
+    int min_chunk = enc_sr / 2;
+    if (n_threads * min_chunk > enc_T) {
+        n_threads = std::max(1, enc_T / min_chunk);
+    }
+
+    // Single-threaded path — call encode_chunk directly
+    if (n_threads <= 1) {
+        std::string mp3_data = encode_chunk(0, enc_T, false);
+        if (mp3_data.empty()) {
+            fprintf(stderr, "[Audio] mp3enc_init failed\n");
+            return "";
+        }
+        return kcpp_base64_encode(mp3_data);
+    }
+
+    // Multi-threaded path: partition audio, encode chunks in parallel
+    struct Chunk { int offset; int n_samples; };
+    std::vector<Chunk> chunks(n_threads);
+    {
+        constexpr int FRAME = 1152;
+
+        int pos = 0;
+
+        for (int i = 0; i < n_threads; i++) {
+            // Compute ideal boundaries
+            int start = (int)(((int64_t)enc_T * i) / n_threads);
+            int end   = (int)(((int64_t)enc_T * (i + 1)) / n_threads);
+
+            // Align internal boundaries down to frame boundaries
+            if (i != 0) {
+                start = (start / FRAME) * FRAME;
+            }
+            if (i != n_threads - 1) {
+                end = (end / FRAME) * FRAME;
+            }
+
+            // Enforce monotonicity
+            if (start < pos) {
+                start = pos;
+            }
+            if (end < start) {
+                end = start;
+            }
+
+            chunks[i].offset    = start;
+            chunks[i].n_samples = end - start;
+
+            pos = end;
+        }
+
+        // Ensure final chunk reaches exact end
+        if (!chunks.empty()) {
+            chunks.back().n_samples = enc_T - chunks.back().offset;
+        }
+    }
+
+    std::vector<std::string> results(n_threads);
+    std::vector<std::thread> threads;
+    std::atomic<int> init_failures{0};
+
+    // RAII guard: join all threads on any exception
+    struct ThreadGuard {
+        std::vector<std::thread> & t;
+        ~ThreadGuard() { for (auto & th : t) if (th.joinable()) th.join(); }
+    } guard{threads};
+
+    for (int i = 0; i < n_threads; i++) {
+        threads.emplace_back([&, i]() {
+            if (chunks[i].n_samples <= 0) return;
+
+            // Chunk 0 starts fresh; chunks 1..N-1 get warm-up from prior chunk
+            bool warmup = (i > 0);
+            std::string r = encode_chunk(chunks[i].offset, chunks[i].n_samples, warmup);
+            if (r.empty()) {
+                init_failures.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                results[i] = std::move(r);
+            }
+        });
+    }
+
+    for (auto & t : threads) {
+        t.join();
+    }
+
+    if (init_failures.load(std::memory_order_relaxed) > 0) {
+        fprintf(stderr, "[Audio] mp3enc_init failed for %d chunk(s)\n", init_failures.load());
         return "";
     }
 
     std::string mp3_data;
-    mp3_data.reserve(enc_T); // rough preallocation
+    size_t total_size = 0;
+    for (auto & r : results) total_size += r.size();
+    mp3_data.reserve(total_size);
+    for (auto & r : results) mp3_data.append(r);
 
-    int chunk = enc_sr;
-
-    // reusable buffer (replaces malloc inside loop)
-    std::vector<float> buf((size_t)chunk * 2);
-
-    for (int pos = 0; pos < enc_T; pos += chunk) {
-        int n = (pos + chunk <= enc_T) ? chunk : (enc_T - pos);
-        // build planar chunk
-        memcpy(buf.data(),     enc_audio + pos,          (size_t)n * sizeof(float));
-        memcpy(buf.data() + n, enc_audio + enc_T + pos,  (size_t)n * sizeof(float));
-        int out_size = 0;
-        const uint8_t * mp3 = mp3enc_encode(enc, buf.data(), n, &out_size);
-        if (out_size > 0) {
-            mp3_data.append((const char *) mp3, out_size);
-        }
-    }
-    int flush_size = 0;
-    const uint8_t * flush_data = mp3enc_flush(enc, &flush_size);
-    if (flush_size > 0) {
-        mp3_data.append((const char *) flush_data, flush_size);
-    }
-    mp3enc_free(enc);
     return kcpp_base64_encode(mp3_data);
 }
 
@@ -760,167 +876,6 @@ int32_t kcpp_quick_sample(float * logits, const int n_logits, const std::vector<
     return logits_id[idx].second;
 }
 
-void kcpp_embd_batch::init_kcpp_batch(int32_t n_tokens,
-                                      int32_t npast,
-                                      bool    use_mrope,
-                                      bool    return_all_logits,
-                                      bool    mrope_is_image,
-                                      int     img_nx,
-                                      int     img_ny) {
-    const int          n_pos_per_embd = use_mrope ? 4 : 1;
-    const llama_seq_id seq_id         = 0;
-
-    if (use_mrope && mrope_is_image) {
-        GGML_ASSERT(img_nx > 0 && img_ny > 0);
-        GGML_ASSERT(img_nx * img_ny == n_tokens);
-    }
-
-    pos.resize(n_tokens * n_pos_per_embd);
-    std::fill(pos.begin(), pos.end(), 0);
-
-    n_seq_id.resize(n_tokens);
-    seq_ids.resize(n_tokens + 1);
-    logits.resize(n_tokens);
-    seq_id_0.resize(1);
-
-    seq_id_0[0]       = seq_id;
-    seq_ids[n_tokens] = nullptr;
-
-    batch.pos      = pos.data();
-    batch.n_seq_id = n_seq_id.data();
-    batch.seq_id   = seq_ids.data();
-    batch.logits   = logits.data();
-
-    for (int i = 0; i < n_tokens; ++i) {
-        n_seq_id[i] = 1;
-        seq_ids[i]  = seq_id_0.data();
-        logits[i]   = return_all_logits;
-    }
-
-    // ---- position encoding ----
-    if (!use_mrope) {
-        for (int i = 0; i < n_tokens; ++i) {
-            pos[i] = npast + i;
-        }
-    } else if (!mrope_is_image) {
-        // 1D M-RoPE (audio / embedding stream)
-        for (int i = 0; i < n_tokens; ++i) {
-            pos[i + 0 * n_tokens] = npast + i;
-            pos[i + 1 * n_tokens] = npast + i;
-            pos[i + 2 * n_tokens] = npast + i;
-            pos[i + 3 * n_tokens] = 0;
-        }
-    } else {
-        // 2D image M-RoPE
-        int idx = 0;
-        for (int y = 0; y < img_ny; ++y) {
-            for (int x = 0; x < img_nx; ++x) {
-                pos[idx + 0 * n_tokens] = npast;
-                pos[idx + 1 * n_tokens] = npast + y;
-                pos[idx + 2 * n_tokens] = npast + x;
-                pos[idx + 3 * n_tokens] = 0;
-                ++idx;
-            }
-        }
-    }
-
-    // Always request logits for last token
-    logits[n_tokens - 1] = true;
-}
-
-//for embeddings
-kcpp_embd_batch::kcpp_embd_batch(float * embd,
-                                 int32_t n_tokens,
-                                 int32_t npast,
-                                 bool    use_mrope,
-                                 bool    mrope_is_image,
-                                 int     img_nx,
-                                 int     img_ny) {
-    batch = {
-        /* n_tokens = */ n_tokens,
-        /* tokens   = */ nullptr,
-        /* embd     = */ embd,
-        /* pos      = */ nullptr,
-        /* n_seq_id = */ nullptr,
-        /* seq_id   = */ nullptr,
-        /* logits   = */ nullptr,
-    };
-
-    init_kcpp_batch(n_tokens, npast, use_mrope,
-                    /*return_all_logits=*/false, mrope_is_image, img_nx, img_ny);
-}
-
-// for tokens
-kcpp_embd_batch::kcpp_embd_batch(std::vector<llama_token> & tokens,
-                                 int32_t                    npast,
-                                 bool                       use_mrope,
-                                 bool                       return_all_logits,
-                                 bool                       mrope_is_image,
-                                 int                        img_nx,
-                                 int                        img_ny) {
-    batch = {
-        /* n_tokens = */ (int32_t) tokens.size(),
-        /* tokens   = */ tokens.data(),
-        /* embd     = */ nullptr,
-        /* pos      = */ nullptr,
-        /* n_seq_id = */ nullptr,
-        /* seq_id   = */ nullptr,
-        /* logits   = */ nullptr,
-    };
-
-    init_kcpp_batch(batch.n_tokens, npast, use_mrope, return_all_logits, mrope_is_image, img_nx, img_ny);
-}
-
-llama_batch kcpp_embd_batch::get_view(int offset, int n_tokens, int n_embd_mmproj) {
-    GGML_ASSERT(offset >= 0);
-    GGML_ASSERT(n_tokens > 0);
-    GGML_ASSERT(offset + n_tokens <= batch.n_tokens);
-
-    const int total_tokens = batch.n_tokens;
-    llama_pos * pos_ptr = nullptr;
-
-    // Detect M-RoPE vs normal RoPE
-    const bool is_mrope = (pos.size() > (size_t)total_tokens);
-
-    pos_view.clear();
-
-    if (is_mrope) {
-        const int n_pos_per_embd = pos.size() / total_tokens;
-        GGML_ASSERT(n_pos_per_embd == 4);
-
-        // Layout:
-        // src: [dim0_all_tokens][dim1_all_tokens][dim2_all_tokens][dim3_all_tokens]
-        // dst: same layout, but only [offset : offset + n_tokens]
-        pos_view.reserve(n_tokens * n_pos_per_embd);
-
-        for (int dim = 0; dim < n_pos_per_embd; ++dim) {
-            const llama_pos * src =
-                pos.data() + dim * total_tokens + offset;
-
-            pos_view.insert(
-                pos_view.end(),
-                src,
-                src + n_tokens
-            );
-        }
-
-        pos_ptr = pos_view.data();
-    }
-    else {
-        // Normal RoPE: contiguous slice
-        pos_ptr = pos.data() + offset;
-    }
-
-    return {
-        /* n_tokens = */ n_tokens,
-        /* tokens   = */ nullptr,
-        /* embd     = */ batch.embd ? batch.embd + offset*n_embd_mmproj : nullptr,
-        /* pos      = */ pos_ptr,
-        /* n_seq_id = */ batch.n_seq_id + offset,
-        /* seq_id   = */ batch.seq_id   + offset,
-        /* logits   = */ batch.logits   + offset,
-    };
-}
 
 std::vector<std::string> split_string(const std::string& input, const std::string& separator) {
     std::vector<std::string> result;
@@ -1076,4 +1031,57 @@ std::vector<ggml_backend_dev_t> kcpp_parse_device_list(const std::string & value
         devices.push_back(nullptr);
     }
     return devices;
+}
+
+bool kcpp_string_ends_with(const std::string& str, const std::string& suffix) {
+    return str.size() >= suffix.size() &&
+           str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string kcpp_rstrip(const std::string& s) {
+    size_t end = s.find_last_not_of(" \t\n\r\f\v");
+    return (end == std::string::npos) ? "" : s.substr(0, end + 1);
+}
+
+//counts the number of matching prefix tokens between two sequences
+int ComputeSharedPrefixLength(const std::vector<int> &tokens_a,const std::vector<int> &tokens_b)
+{
+    size_t min_length = std::min(tokens_a.size(), tokens_b.size());
+
+    int match_count = 0;
+    for (size_t i = 0; i < min_length; ++i) {
+        if (tokens_a[i] != tokens_b[i]) {
+            break;
+        }
+        match_count++;
+    }
+
+    return match_count;
+}
+
+//counts the number of matching prefix tokens between two sequences, returns percentage matched 0.0 to 1.0
+float ComputePrefixMatchPercent(const std::vector<int> &tokens_a,const std::vector<int> &tokens_b)
+{
+    size_t min_length = std::min(tokens_a.size(), tokens_b.size());
+
+    if (min_length == 0) {
+        return 0.0f;
+    }
+
+    int match_count = ComputeSharedPrefixLength(tokens_a, tokens_b);
+    return static_cast<float>(match_count) / static_cast<float>(min_length);
+}
+
+//returns true if and only if sequence 1 is fully contained within the starting of sequence 2
+bool FullyContainedPrefix(std::vector<int> &sequence1, std::vector<int> &sequence2)
+{
+    if (sequence1.size() > sequence2.size() || sequence1.size()==0 || sequence2.size()==0) {
+        return false;
+    }
+    for (size_t i = 0; i < sequence1.size(); ++i) {
+        if (sequence1[i] != sequence2[i]) {
+            return false;
+        }
+    }
+    return true;
 }

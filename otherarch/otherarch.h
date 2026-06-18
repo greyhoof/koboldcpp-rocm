@@ -21,8 +21,10 @@ struct kcpp_params {
     int32_t n_ctx                 =     0; // context size
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
-    int      n_threads                   = -1;
-    int      n_blasthreads               = -1;
+    int vision_min_tokens         =    -1; // Minimum image embedding tokens
+    int vision_max_tokens         =    -1; // Maximum image embedding tokens
+    int      n_threads            = -1;
+    int      n_blasthreads        = -1;
 
     // sampling parameters
     int32_t top_k             = 40;    // <= 0 to use vocab size
@@ -52,6 +54,7 @@ struct kcpp_params {
     float   dynatemp_exponent  = 1.0f;
     float adaptive_target     = -1.0f; // 0.0 - 1.0, <=0.0 is disabled
     float adaptive_decay      = 0.9f;
+    int reasoning_budget       = 0; //if > 0, controls thinking budget
 
     std::string model_filename       = ""; // model path
     std::string prompt               = "";
@@ -508,10 +511,11 @@ struct mpt_model {
 
 struct media_chunk
 {
-   int32_t clp_image_tokens = 0; //holds number of tokens llava used in this chunk
-   float * clp_img_embd = nullptr; //this holds dynamic memory and must be freed each use!
-   int32_t nx = 0; //only used for 2d roped images
-   int32_t ny = 0;
+    bool is_audio = false; //if true its audio, otherwise its vision
+    void * mtmd_chunk = nullptr; // mtmd_input_chunk, owned by this chunk
+    int32_t clp_image_tokens = 0; //holds number of tokens used in this chunk
+    int32_t nx = 0; //only used for 2d roped images
+    int32_t ny = 0;
 };
 struct media_object
 {
@@ -525,9 +529,11 @@ struct media_object
 struct speculative_draft_result
 {
     std::vector<int32_t> draftids;
+    std::vector<int32_t> verify_tokens;
     std::vector<float *> actual_logits;
     bool draft_success = false;
     int drafted_amount = 0;
+    int verify_n_past = 0;
 };
 
 struct savestate_data

@@ -54,8 +54,15 @@ KoboldCpp-ROCm is an easy-to-use AI text-generation software for GGML and GGUF m
 - For an ROCm only build, do ``make LLAMA_HIPBLAS=1 -j4`` (-j4 means it will use 4 cores of your CPU; you can adjust accordingly or leave it off altogether)
 - After all binaries are built, you can use the GUI with ``python koboldcpp.py`` and select hipBLAS or run use ROCm through the python script with the command `python koboldcpp.py --usecublas --gpulayers [number] --contextsize 4096 --model [model.gguf]`
 - There are several parameters than can be added to CLI launch, such as ``--usecublas mmq`` or ``--usecublas mmq lowvram`` which uses optimized Kernels that could increase performance.
-A typical start command looks like this: ``python koboldcpp.py --threads 6 --blasthreads 6 --usecublas --gpulayers 18 --blasbatchsize 256 --contextsize 8192 --model /AI/llama-2-70b-chat.Q4_K_M.gguf``
+  A typical start command looks like this: ``python koboldcpp.py --threads 6 --blasthreads 6 --usecublas --gpulayers 18 --blasbatchsize 256 --contextsize 8192 --model /AI/llama-2-70b-chat.Q4_K_M.gguf``
 
+## Run on RunPod
+- KoboldCpp can now be used on RunPod cloud GPUs! This is an easy way to get started without installing anything in a minute or two, and is very scalable, capable of running 70B+ models at afforable cost. [Try our RunPod image here!](https://koboldai.org/runpodcpp). Alternatively, you can also try [SimplePod](https://koboldai.org/simplepod) for smaller models
+
+## Docker
+- Caution: The KoboldCpp docker is intended for experts only, and primarily intended for cloud GPU rental users! If you're NOT an experienced user, you're recommended to use the [precompiled binaries directly instead](https://github.com/LostRuins/koboldcpp/releases/latest)
+- The docker uses a x86-64 Ubuntu Linux based environment interally, and expects a Nvidia or AMD GPU. It may perform suboptimally on some Windows and MacOS devices, and may outright fail for ARM. It applies crude AVX/AVX2 feature detection which may not work correctly on all systems, resulting in the failsafe binaries being loaded (speed will become extremely slow).
+- If you still want to proceed, the official docker can be found at https://hub.docker.com/r/koboldai/koboldcpp
 
 - **AMD GPU Acceleration**: If you're on Windows with an AMD GPU you can get CUDA/ROCm HIPblas support out of the box using the `--usecublas` flag.
 - **GPU Layer Offloading**: Want even more speedup? Combine one of the above GPU flags with `--gpulayers` to offload entire layers to the GPU! **Much faster, but uses more VRAM**. Experiment to determine number of layers to offload, and reduce by a few if you run out of memory.
@@ -233,7 +240,7 @@ and it will install everything required. Alternatively, you can download the abo
 - **Increasing Context Size**: Try `--contextsize 4096` to 2x your context size! without much perplexity gain. Note that you'll have to increase the max context in the Kobold Lite UI as well (click and edit the number text field).
 - **Reducing Prompt Processing**: Try the `--smartcontext` flag to reduce prompt processing frequency.
 - If you are having crashes or issues, you can try turning off BLAS with the `--noblas` flag. You can also try running in a non-avx2 compatibility mode with `--noavx2`. Lastly, you can try turning off mmap with `--nommap`.
- 
+
 ## Third Party Resources
 - These unofficial resources have been contributed by the community, and may be outdated or unmaintained. No official support will be provided for them!
   - Arch Linux Packages: [CUBLAS](https://aur.archlinux.org/packages/koboldcpp-cuda), and [HIPBLAS](https://aur.archlinux.org/packages/koboldcpp-hipblas).
@@ -270,6 +277,7 @@ For more information, be sure to run the program with the `--help` flag, or [che
 - **I try to keep backwards compatibility with ALL past llama.cpp models**. But you are also encouraged to reconvert/update your models if possible for best results.
 - Since v1.75, openblas has been deprecated and removed in favor of the native CPU implementation.
 - Since v1.107, CLBlast has been deprecated and removed in favor of Vulkan.
+- Phishing SCAM Warning: koboldcpp(dot)com is NOT an official site, please help to report it to google for impersonation. You should ONLY trust official downloads from the release binaries on the official github at https://github.com/LostRuins/koboldcpp/releases/latest
 
 ## License
 - The original GGML library, stable-diffusion.cpp and llama.cpp by ggerganov are licensed under the MIT License
