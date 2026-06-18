@@ -8632,8 +8632,6 @@ def show_gui():
             if manual_select:
                 print("\nA .kcppt template was selected from GUI - automatically selecting your backend...")
                 runmode_untouched = True
-            fetch_gpu_properties(False,True,True)
-        else:
             fetch_gpu_properties(True,True,True,False)
             found_new_backend = False
 
@@ -8644,7 +8642,7 @@ def show_gui():
 
             #autopick cublas if suitable, requires at least 3.5GB VRAM to auto pick
             #we do not want to autoselect hip/cublas if the user has already changed their desired backend!
-        if eligible_cuda and exitcounter < 100 and MaxMemory[0]>3500000000 and runmode_untouched and (("Use CUDA" in runopts and CUDevicesNames[0]!="") or "Use hipBLAS (ROCm)" in runopts) and (any(CUDevicesNames) or any(CLDevicesNames)):
+            if eligible_cuda and exitcounter < 100 and MaxMemory[0]>3500000000 and runmode_untouched and (("Use CUDA" in runopts and CUDevicesNames[0]!="") or "Use hipBLAS (ROCm)" in runopts) and (any(CUDevicesNames) or any(CLDevicesNames)):
                 if "Use CUDA" in runopts:
                     runopts_var.set("Use CUDA")
                     gpu_choice_var.set("0")
@@ -8655,25 +8653,25 @@ def show_gui():
                     gpu_choice_var.set("0")
                     print(f"Auto Selected HIP Backend (flag={cpusupport})\n")
                     found_new_backend = True
-            elif exitcounter < 100 and (1 in VKIsDGPU) and runmode_untouched and ("Use Vulkan" in runopts or "Use Vulkan (Old CPU)" in runopts):
-                for i in range(0,len(VKIsDGPU)):
-                    if VKIsDGPU[i]==1:
-                        if cpusupport<1 and "Use Vulkan" in runopts:
-                            runopts_var.set("Use Vulkan")
-                        else:
-                            runopts_var.set("Use Vulkan (Old CPU)")
-                        gpu_choice_var.set(str(i))
-                        print(f"Auto Selected Vulkan Backend (flag={cpusupport})\n")
-                        found_new_backend = True
-                        break
-            else:
-                if runopts_var.get()=="Use CPU" and cpusupport==1 and "Use CPU (Old CPU)" in runopts:
-                    runopts_var.set("Use CPU (Old CPU)")
-                elif runopts_var.get()=="Use CPU" and cpusupport==2 and "Failsafe Mode (Older CPU)" in runopts:
-                    runopts_var.set("Failsafe Mode (Older CPU)")
-            if not found_new_backend:
-                print(f"Auto Selected Default Backend (flag={cpusupport})\n")
-            changed_gpu_choice_var()
+                elif exitcounter < 100 and (1 in VKIsDGPU) and runmode_untouched and ("Use Vulkan" in runopts or "Use Vulkan (Old CPU)" in runopts):
+                    for i in range(0,len(VKIsDGPU)):
+                        if VKIsDGPU[i]==1:
+                            if cpusupport<1 and "Use Vulkan" in runopts:
+                                runopts_var.set("Use Vulkan")
+                            else:
+                                runopts_var.set("Use Vulkan (Old CPU)")
+                            gpu_choice_var.set(str(i))
+                            print(f"Auto Selected Vulkan Backend (flag={cpusupport})\n")
+                            found_new_backend = True
+                            break
+                else:
+                    if runopts_var.get()=="Use CPU" and cpusupport==1 and "Use CPU (Old CPU)" in runopts:
+                        runopts_var.set("Use CPU (Old CPU)")
+                    elif runopts_var.get()=="Use CPU" and cpusupport==2 and "Failsafe Mode (Older CPU)" in runopts:
+                        runopts_var.set("Failsafe Mode (Older CPU)")
+                if not found_new_backend:
+                    print(f"Auto Selected Default Backend (flag={cpusupport})\n")
+                changed_gpu_choice_var()
         except Exception:
             pass
 
