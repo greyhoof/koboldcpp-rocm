@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <string>
 #include <cctype>
+#include <cstdlib>
 #include <locale>
 #include <chrono>
 #include <algorithm>
@@ -128,6 +129,7 @@ static llama_context * guidance_ctx = nullptr; //for classifier free guidance, w
 static mtmd_context * mtmd_ctx = nullptr; //for multimodal media
 static std::vector<media_object> media_objects;
 static std::vector<int> last_media_mem; //for storing dummy tokens that will be consumed by mtmd
+static std::vector<int> media_object_token_counts; //per media object dummy token counts for inline placeholders
 static std::string media_composite_image_signature = ""; //for identifying when the media changes, we need to invalidate the cache
 static int current_media_identifier = MEDIA_TOKEN_IDENTIFIER_A;
 static int vision_max_res = 2048;
@@ -2395,6 +2397,201 @@ static bool mtmd_text_chunk_has_invalid_tokens(const mtmd_input_chunk * mtmdchun
     return false;
 }
 
+static bool kcpp_is_media_token(int token)
+{
+    return token <= MEDIA_TOKEN_IDENTIFIER_A && token > MEDIA_TOKEN_IDENTIFIER_A - 4096;
+}
+
+static int kcpp_media_token_for_index(int media_index)
+{
+    return current_media_identifier - (media_index * 2);
+}
+
+static int kcpp_media_index_from_token(int token)
+{
+    if(!kcpp_is_media_token(token))
+    {
+        return -1;
+    }
+    const int diff = current_media_identifier - token;
+    if(diff < 0 || (diff % 2) != 0)
+    {
+        return -1;
+    }
+    return diff / 2;
+}
+
+static bool kcpp_parse_attached_media_placeholder(
+    const std::string & prompt,
+    size_t pos,
+    int image_count,
+    int audio_count,
+    int & media_index,
+    size_t & placeholder_len)
+{
+    const std::string image_prefix = "(Attached Image ";
+    const std::string audio_prefix = "(Attached Audio ";
+    bool is_audio = false;
+    size_t prefix_len = 0;
+
+    if(prompt.compare(pos, image_prefix.size(), image_prefix) == 0)
+    {
+        prefix_len = image_prefix.size();
+    }
+    else if(prompt.compare(pos, audio_prefix.size(), audio_prefix) == 0)
+    {
+        is_audio = true;
+        prefix_len = audio_prefix.size();
+    }
+    else
+    {
+        return false;
+    }
+
+    size_t number_pos = pos + prefix_len;
+    size_t end_pos = number_pos;
+    while(end_pos < prompt.size() && std::isdigit((unsigned char) prompt[end_pos]))
+    {
+        ++end_pos;
+    }
+    if(end_pos == number_pos || end_pos >= prompt.size() || prompt[end_pos] != ')')
+    {
+        return false;
+    }
+
+    int number = std::atoi(prompt.substr(number_pos, end_pos - number_pos).c_str());
+    if(number <= 0)
+    {
+        return false;
+    }
+
+    int candidate = -1;
+    if(is_audio)
+    {
+        if(number <= audio_count)
+        {
+            candidate = image_count + number - 1;
+        }
+        else if(number <= (int) media_objects.size() && media_objects[number - 1].is_audio)
+        {
+            candidate = number - 1;
+        }
+    }
+    else
+    {
+        if(number <= image_count)
+        {
+            candidate = number - 1;
+        }
+        else if(number <= (int) media_objects.size() && !media_objects[number - 1].is_audio)
+        {
+            candidate = number - 1;
+        }
+    }
+
+    if(candidate < 0 || candidate >= (int) media_objects.size())
+    {
+        return false;
+    }
+    media_index = candidate;
+    placeholder_len = end_pos - pos + 1;
+    return true;
+}
+
+static void kcpp_append_media_placeholder_tokens(std::vector<int> & tokens, int media_index)
+{
+    if(media_index < 0 || media_index >= (int) media_object_token_counts.size())
+    {
+        return;
+    }
+    const int token_count = media_object_token_counts[media_index];
+    const int media_token = kcpp_media_token_for_index(media_index);
+    for(int i = 0; i < token_count; ++i)
+    {
+        tokens.push_back(media_token);
+    }
+}
+
+static bool kcpp_tokenize_prompt_with_inline_media(
+    const std::string & prompt,
+    std::vector<int> & output_tokens,
+    FileFormat file_format,
+    bool add_bos,
+    int image_count,
+    int audio_count)
+{
+    output_tokens.clear();
+    bool inserted_media = false;
+    bool emitted_anything = false;
+    size_t text_start = 0;
+
+    auto append_text = [&](size_t start, size_t end)
+    {
+        if(end <= start)
+        {
+            return;
+        }
+        std::vector<int> text_tokens;
+        TokenizeString(prompt.substr(start, end - start), text_tokens, file_format, add_bos && !emitted_anything);
+        output_tokens.insert(output_tokens.end(), text_tokens.begin(), text_tokens.end());
+        emitted_anything = true;
+    };
+
+    for(size_t pos = 0; pos < prompt.size(); ++pos)
+    {
+        int media_index = -1;
+        size_t placeholder_len = 0;
+        if(kcpp_parse_attached_media_placeholder(prompt, pos, image_count, audio_count, media_index, placeholder_len))
+        {
+            append_text(text_start, pos);
+            if(add_bos && !emitted_anything)
+            {
+                std::vector<int> bos;
+                TokenizeString("", bos, file_format, true);
+                output_tokens.insert(output_tokens.end(), bos.begin(), bos.end());
+            }
+            kcpp_append_media_placeholder_tokens(output_tokens, media_index);
+            emitted_anything = true;
+            inserted_media = true;
+            pos += placeholder_len - 1;
+            text_start = pos + 1;
+        }
+    }
+
+    append_text(text_start, prompt.size());
+    if(!inserted_media)
+    {
+        output_tokens.clear();
+    }
+    return inserted_media;
+}
+
+static int kcpp_adjust_media_truncation_start(const std::vector<int> & tokens, int offset)
+{
+    if(offset <= 0 || offset >= (int) tokens.size())
+    {
+        return offset;
+    }
+    const int token = tokens[offset];
+    if(kcpp_is_media_token(token) && tokens[offset - 1] == token)
+    {
+        while(offset < (int) tokens.size() && tokens[offset] == token)
+        {
+            ++offset;
+        }
+    }
+    return offset;
+}
+
+static bool kcpp_media_span_boundary_ok(const std::vector<int> & tokens, int pos)
+{
+    if(pos <= 0 || pos >= (int) tokens.size())
+    {
+        return true;
+    }
+    return !(kcpp_is_media_token(tokens[pos]) && tokens[pos - 1] == tokens[pos]);
+}
+
 //given an old GGUF context and a new context that has some middle portion removed,
 //find and remove the middle portion from the old context from the KV. Does not fast forward after this destructive action
 //returns true if contextshift is doable, executes it if dryrun is false
@@ -2415,6 +2612,11 @@ bool DoContextShifting(llama_context * ctx, llama_context * draft_ctx, std::vect
 
     for (int i = 0; i < current_context_tokens.size(); ++i)
     {
+        if(i >= new_tokens_len)
+        {
+            purgeneeded = false;
+            break;
+        }
         if (current_context_tokens[i] == new_context_tokens[i])
         {
             trimstart += 1;
@@ -2449,6 +2651,14 @@ bool DoContextShifting(llama_context * ctx, llama_context * draft_ctx, std::vect
         int found = ArrFindIndexOf(current_context_tokens,shared);
         if(found>=0 && found > trimstart)
         {
+            if(!kcpp_media_span_boundary_ok(current_context_tokens, trimstart) || !kcpp_media_span_boundary_ok(current_context_tokens, found))
+            {
+                if(debugmode==1 && !is_quiet)
+                {
+                    printf("\n[Context Shifting skipped: refusing to split a multimodal span]");
+                }
+                return false;
+            }
             bool ok = true;
             if(!dryrun)
             {
@@ -4994,6 +5204,7 @@ static void PrepareMediaEmbds(const int nctx, const std::vector<int> & media_int
         int introsize = media_intro.size();
         int outrosize = media_outro.size();
         last_media_mem.clear();
+        media_object_token_counts.clear();
 
         for(int i=0;i<media_objects.size();++i)
         {
@@ -5004,6 +5215,7 @@ static void PrepareMediaEmbds(const int nctx, const std::vector<int> & media_int
                 : kcpp_mtmd_bitmap_init_image_from_buf(media_data_buffer.data(), media_data_buffer.size(), vision_max_res));
             if(!bitmap.ptr)
             {
+                media_object_token_counts.push_back(0);
                 printf("\nError: MTMD media %d failed to load!",i);
                 continue;
             }
@@ -5017,6 +5229,7 @@ static void PrepareMediaEmbds(const int nctx, const std::vector<int> & media_int
             int32_t tokenized = mtmd_tokenize(mtmd_ctx, chunks.ptr.get(), &inp_txt, bitmaps.data(), bitmaps.size());
             if(tokenized != 0)
             {
+                media_object_token_counts.push_back(0);
                 media_composite_image_signature = ""; //force invalidate
                 printf("\nError: MTMD media %d failed to tokenize! (status %d)",i, tokenized);
                 continue;
@@ -5079,18 +5292,21 @@ static void PrepareMediaEmbds(const int nctx, const std::vector<int> & media_int
             }
             if(mediatokensneeded>0 && mediatokensneeded < nctx)
             {
+                media_object_token_counts.push_back(mediatokensneeded);
                 int tokcnt = mediatokensneeded;
                 if(i==0)
                 {
                     tokcnt += introsize + outrosize;
                 }
+                const int media_token = kcpp_media_token_for_index(i);
                 for(int n=0;n<tokcnt;++n)
                 {
-                    last_media_mem.push_back(current_media_identifier);
+                    last_media_mem.push_back(media_token);
                 }
             }
             else
             {
+                media_object_token_counts.push_back(0);
                 media_composite_image_signature = ""; //force invalidate
                 printf("\nWarning: Media excluded - Context size too low or not enough mtmd tokens! (needed %d)\nMedia will be IGNORED! You probably want to relaunch with a larger context size!\n",mediatokensneeded);
             }
@@ -5600,6 +5816,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     if(media_composite_image_signature=="")
     {
         last_media_mem.clear();
+        media_object_token_counts.clear();
     }
     if(media_data_changed)
     {
@@ -5607,7 +5824,21 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         media_embds_built = true;
     }
 
-    TokenizeString(kcpp_data->prompt, embd_inp, file_format, add_bos_token);
+    bool media_inserted_inline = false;
+    if(last_media_mem.size()>0)
+    {
+        media_inserted_inline = kcpp_tokenize_prompt_with_inline_media(
+            kcpp_data->prompt,
+            embd_inp,
+            file_format,
+            add_bos_token,
+            inputs.images_len,
+            inputs.audio_len);
+    }
+    if(!media_inserted_inline)
+    {
+        TokenizeString(kcpp_data->prompt, embd_inp, file_format, add_bos_token);
+    }
     if(addedmemory!="")
     {
         TokenizeString(addedmemory, embd_inp_mem, file_format, add_bos_token);
@@ -5620,6 +5851,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         std::vector<int> bos;
         TokenizeString("", bos, file_format, add_bos_token);
         int offset = embd_inp.size() - nctx + kcpp_data->n_predict;
+        offset = kcpp_adjust_media_truncation_start(embd_inp, offset);
         embd_inp = std::vector<int>(embd_inp.begin() + offset, embd_inp.end());
         //replace bos into front if exists
         if(bos.size()>0 && embd_inp.size()>0)
@@ -5628,7 +5860,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         }
     }
 
-    if(last_media_mem.size()>0) //stick the media placeholders before the added mem
+    if(last_media_mem.size()>0 && !media_inserted_inline) //stick the media placeholders before the added mem if no inline placeholders were found
     {
         if(last_media_mem.size() + kcpp_data->n_predict + 4 > nctx)
         {
@@ -6757,7 +6989,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
             while ((int)embd_inp.size() > input_consumed)
             {
                 int currtoken = embd_inp[input_consumed];
-                if(currtoken==MEDIA_TOKEN_IDENTIFIER_A || currtoken==MEDIA_TOKEN_IDENTIFIER_B) //special media token hit
+                int curr_media_index = kcpp_media_index_from_token(currtoken);
+                if(curr_media_index >= 0) //special media token hit
                 {
                     if(!media_embds_built) //this should never happen! however, handle it anyway
                     {
@@ -6778,7 +7011,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                         int mediatokensevaled = 0;
                         int introsize = media_intro.size();
                         int outrosize = media_outro.size();
-                        while(input_consumed < embd_inp.size() && (embd_inp[input_consumed]==MEDIA_TOKEN_IDENTIFIER_A || embd_inp[input_consumed]==MEDIA_TOKEN_IDENTIFIER_B))
+                        while(input_consumed < embd_inp.size() && embd_inp[input_consumed]==currtoken)
                         {
                             if (!last_n_tokens.empty())
                             {
@@ -6789,10 +7022,15 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                             ++input_consumed;
                             ++mediatokenscounted;
                         }
-                        for(int i=0;i<media_objects.size();++i)
+                        bool include_media_header = false;
+                        if(curr_media_index == 0 && curr_media_index < (int) media_object_token_counts.size())
+                        {
+                            include_media_header = (mediatokenscounted == media_object_token_counts[curr_media_index] + introsize + outrosize);
+                        }
+                        if(curr_media_index < (int) media_objects.size())
                         {
                             //note: no handling for draft_ctx as we don't support vision for it
-                            if(introsize>0 && i==0)
+                            if(include_media_header && introsize>0)
                             {
                                 //added at the start of everything
                                 kcpp_embd_batch batch = kcpp_embd_batch(media_intro, n_past, use_mrope, false);
@@ -6809,10 +7047,10 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                 mediatokensevaled += introsize;
                             }
 
-                            int start_size = media_objects[i].chunk_start_seq.size();
+                            int start_size = media_objects[curr_media_index].chunk_start_seq.size();
                             if (start_size > 0) {
                                 //add a separator between each image
-                                kcpp_embd_batch batch = kcpp_embd_batch(media_objects[i].chunk_start_seq, n_past, use_mrope, false);
+                                kcpp_embd_batch batch = kcpp_embd_batch(media_objects[curr_media_index].chunk_start_seq, n_past, use_mrope, false);
                                 auto evr = llama_decode(llama_ctx_v4, batch.batch);
                                 if(evr!=0)
                                 {
@@ -6826,12 +7064,12 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                 mediatokensevaled += start_size;
                             }
 
-                            for(int j=0;j<media_objects[i].mediachunks.size();++j)
+                            for(int j=0;j<media_objects[curr_media_index].mediachunks.size();++j)
                             {
-                                media_chunk chunk = media_objects[i].mediachunks[j];
+                                media_chunk chunk = media_objects[curr_media_index].mediachunks[j];
                                 if(allow_regular_prints)
                                 {
-                                    printf("\rProcessing Media Embedding %d (%d tokens)",(i+1), chunk.clp_image_tokens);
+                                    printf("\rProcessing Media Embedding %d (%d tokens)",(curr_media_index+1), chunk.clp_image_tokens);
                                 }
                                 bool err = kcpp_eval_media(llama_ctx_v4,chunk,kcpp_data->n_batch,&n_past);
                                 mediatokensevaled += chunk.clp_image_tokens;
@@ -6849,10 +7087,10 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                 }
                             }
 
-                            int end_size = media_objects[i].chunk_end_seq.size();
+                            int end_size = media_objects[curr_media_index].chunk_end_seq.size();
                             if (end_size > 0) {
                                 //add a separator between each image
-                                kcpp_embd_batch batch = kcpp_embd_batch(media_objects[i].chunk_end_seq, n_past, use_mrope, false);
+                                kcpp_embd_batch batch = kcpp_embd_batch(media_objects[curr_media_index].chunk_end_seq, n_past, use_mrope, false);
                                 auto evr = llama_decode(llama_ctx_v4, batch.batch);
                                 if(evr!=0)
                                 {
@@ -6866,7 +7104,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                 mediatokensevaled += end_size;
                             }
                         }
-                        if(media_objects.size()>0 && outrosize>0)
+                        if(include_media_header && media_objects.size()>0 && outrosize>0)
                         {
                             //added after all media but before prompt
                             kcpp_embd_batch batch = kcpp_embd_batch(media_outro, n_past, use_mrope, false);
