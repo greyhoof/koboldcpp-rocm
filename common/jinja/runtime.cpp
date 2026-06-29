@@ -8,6 +8,9 @@
 #include <memory>
 #include <cmath>
 
+#ifdef FILENAME
+#undef FILENAME
+#endif
 #define FILENAME "jinja-runtime"
 
 bool g_jinja_debug = false;

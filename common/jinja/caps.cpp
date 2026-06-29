@@ -9,6 +9,9 @@
 #include <functional>
 #include <sstream>
 
+#ifdef FILENAME
+#undef FILENAME
+#endif
 #define FILENAME "jinja-caps"
 
 using json = nlohmann::ordered_json;
