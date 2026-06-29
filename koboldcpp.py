@@ -78,7 +78,7 @@ dry_seq_break_max = 128
 extra_images_max = 4 # for kontext/qwen img
 
 # global vars
-KcppVersion = "1.116.1"
+KcppVersion = "1.116.2"
 showdebug = True
 kcpp_instance = None #global running instance
 global_memory = {"tunnel_url": "", "restart_target":"", "input_to_exit":False, "load_complete":False, "restart_override_base_config":"", "last_active_timestamp":datetime.now(), "triggered_sleeping":False, "current_model":"initial_model", "base_config":"", "swapReqType": None, "autoswapmode": False}
@@ -5205,6 +5205,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             global last_non_horde_req_time
             last_non_horde_req_time = time.time()
 
+        utfprint("\nOutput: " + recvtxt,1)
+
         #handle potential think tags, but only chat completions will return them. the others just drop them
         reasoningtxt = ""
         if api_format==4 or api_format==8 or api_format==9: #chat completions, responses and anthropic messages, but only chat has reasoning returned
@@ -5223,8 +5225,6 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                         reasoningtxt = parts[0]
                         recvtxt = parts[1]
                         break
-
-        utfprint("\nOutput: " + recvtxt,1)
 
         #tool calls resolution
         tool_calls = []
