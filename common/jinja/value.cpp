@@ -12,6 +12,9 @@
 #include <optional>
 #include <algorithm>
 
+#ifdef FILENAME
+#undef FILENAME
+#endif
 #define FILENAME "jinja-value"
 
 namespace jinja {
