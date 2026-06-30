@@ -5908,7 +5908,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         // Submit at least every 100 nodes, in case there are workloads without as much matmul.
         // device->max_nodes_per_submit = 100;
-        device->max_nodes_per_submit = device->uma ? 8 : 64; //kcpp fix for https://github.com/ggml-org/llama.cpp/issues/21724
+        device->max_nodes_per_submit = device->uma ? 4 : 16; //kcpp fix for https://github.com/ggml-org/llama.cpp/issues/21724
         const char* GGML_VK_MAX_NODES_PER_SUBMIT = getenv("GGML_VK_MAX_NODES_PER_SUBMIT");
         if (GGML_VK_MAX_NODES_PER_SUBMIT != nullptr) {
             uint32_t max_nodes_per_submit = std::stoul(GGML_VK_MAX_NODES_PER_SUBMIT);
