@@ -4842,7 +4842,7 @@ class KcppProxyHandler(http.server.BaseHTTPRequestHandler):
         is_chat_completions_path = (clean_path.endswith('/v1/chat/completions') or clean_path=='/chat/completions')
 
         #any requests to the following endpoints is capable of waking the server
-        wake_requests = ["/api/extra/generate/stream","/api/extra/tokencount","/api/v1/generate","/sdapi/v1/interrogate","/v1/completions","/v1/chat/completions","/v1/responses","/completions","/chat/completions","/responses","/api/extra/transcribe","/v1/audio/transcriptions","/api/extra/tts","/v1/audio/speech","/api/extra/embeddings","/v1/embeddings","/api/extra/music/prepare","/api/extra/music/generate","/sdapi/v1/txt2img","/sdapi/v1/img2img","/sdapi/v1/upscale"]
+        wake_requests = ["/api/extra/generate/stream","/api/extra/tokencount","/api/v1/generate","/sdapi/v1/interrogate","/v1/completions","/v1/chat/completions","/v1/responses","/completions","/chat/completions","/responses","/api/extra/transcribe","/v1/audio/transcriptions","/api/extra/tts","/v1/audio/speech","/api/extra/embeddings","/v1/embeddings","/api/embed","/api/extra/music/prepare","/api/extra/music/generate","/sdapi/v1/txt2img","/sdapi/v1/img2img","/sdapi/v1/upscale"]
         is_wake_request = clean_path in wake_requests
 
         autoswapEnabled = global_memory["autoswapmode"] is not None and global_memory["autoswapmode"]
@@ -4894,7 +4894,7 @@ class KcppProxyHandler(http.server.BaseHTTPRequestHandler):
                 textReqs = ["/api/extra/generate/stream","/api/extra/tokencount","/api/v1/generate","/sdapi/v1/interrogate","/v1/completions","/v1/chat/completions","/v1/responses","/completions","/chat/completions","/responses"]
                 sttReqs = ["/api/extra/transcribe","/v1/audio/transcriptions"]
                 ttsReqs = ["/api/extra/tts", "/v1/audio/speech"]
-                embedReqs = ["/api/extra/embeddings", "/v1/embeddings"]
+                embedReqs = ["/api/extra/embeddings", "/v1/embeddings", "/api/embed"]
                 musicReqs = ["/api/extra/music/prepare","/api/extra/music/generate"]
                 imageReqs = ["/sdapi/v1/txt2img", "/sdapi/v1/img2img", "/sdapi/v1/upscale"] # "/sdapi/v1/sd-models", "/sdapi/v1/options", "/sdapi/v1/samplers"
 
@@ -6905,6 +6905,7 @@ Change Mode<br>
             is_transcribe = False
             is_tts = False
             is_embeddings = False
+            is_ollama_embeddings = False
             is_music_codes = False
             is_music_audio = False
             response_body = None
@@ -7009,8 +7010,9 @@ Change Mode<br>
                 is_transcribe = True
             elif clean_path.endswith('/api/extra/tts') or clean_path.endswith('/v1/audio/speech') or clean_path=="/audio/speech" or clean_path.endswith('/tts_to_audio'):
                 is_tts = True
-            elif clean_path.endswith('/api/extra/embeddings') or clean_path.endswith('/v1/embeddings'):
+            elif clean_path.endswith('/api/extra/embeddings') or clean_path.endswith('/v1/embeddings') or clean_path=="/api/embed":
                 is_embeddings = True
+                is_ollama_embeddings = (clean_path=="/api/embed")
             elif clean_path.endswith('/api/extra/music/prepare'):
                 is_music_codes = True
             elif clean_path.endswith('/api/extra/music/generate'):
@@ -7470,17 +7472,20 @@ Change Mode<br>
                         if autoswapmode and embedName is not None:
                             modelNameToReturn = embedName
                         gendat = embeddings_generate(genparams)
-                        outdatas = []
-                        odidx = 0
-                        for od in gendat["data"]:
-                            if genparams.get("encoding_format", "")=="base64":
-                                binary_data = struct.pack('<' + 'f' * len(od), *od)
-                                b64_string = base64.b64encode(binary_data).decode('utf-8')
-                                outdatas.append({"object":"embedding","index":odidx,"embedding":b64_string})
-                            else:
-                                outdatas.append({"object":"embedding","index":odidx,"embedding":od})
-                            odidx += 1
-                        genresp = (json.dumps({"object":"list","data":outdatas,"model":modelNameToReturn,"usage":{"prompt_tokens":gendat["count"],"total_tokens":gendat["count"]}}).encode())
+                        if is_ollama_embeddings:
+                            genresp = (json.dumps({"model":modelNameToReturn,"embeddings":gendat["data"],"total_duration":1,"load_duration":1,"prompt_eval_count":gendat["count"]}).encode())
+                        else:
+                            outdatas = []
+                            odidx = 0
+                            for od in gendat["data"]:
+                                if genparams.get("encoding_format", "")=="base64":
+                                    binary_data = struct.pack('<' + 'f' * len(od), *od)
+                                    b64_string = base64.b64encode(binary_data).decode('utf-8')
+                                    outdatas.append({"object":"embedding","index":odidx,"embedding":b64_string})
+                                else:
+                                    outdatas.append({"object":"embedding","index":odidx,"embedding":od})
+                                odidx += 1
+                            genresp = (json.dumps({"object":"list","data":outdatas,"model":modelNameToReturn,"usage":{"prompt_tokens":gendat["count"],"total_tokens":gendat["count"]}}).encode())
                         self.send_response(200)
                         self.send_header('content-length', str(len(genresp)))
                         self.end_headers(content_type='application/json')
