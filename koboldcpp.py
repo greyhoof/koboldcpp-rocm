@@ -3877,6 +3877,29 @@ def normalize_tool_call_resp(obj): # Normalize various tool call formats to Open
 
     return obj
 
+def convert_tool_calls_to_ollama(tool_calls):
+    ollama_tool_calls = []
+    for idx, tool_call in enumerate(tool_calls or []):
+        try:
+            func = tool_call.get("function", {})
+            args = func.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            ollama_tool_calls.append({
+                "type": "function",
+                "function": {
+                    "index": idx,
+                    "name": func.get("name", ""),
+                    "arguments": args
+                }
+            })
+        except Exception:
+            pass
+    return ollama_tool_calls
+
 # Used to parse json for openai tool calls
 def extract_json_from_string(input_string, check_strict=False):
     parsed_json = None
@@ -5223,7 +5246,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
 
         #tool calls resolution
         tool_calls = []
-        if api_format == 4 or api_format == 2 or api_format == 8 or api_format == 9:
+        if api_format == 4 or api_format == 2 or api_format == 7 or api_format == 8 or api_format == 9:
             using_openai_tools = genparams.get('using_openai_tools', False)
             if using_openai_tools:
                 # first, let llama.cpp's chat parser handle known template-specific tool formats
@@ -5273,7 +5296,11 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             tokarr = tokenize_ids(oldprompt+recvtxt,False)
             res = {"model": modelNameToReturn,"created_at": str(datetime.now(timezone.utc).isoformat()),"response":recvtxt,"done": True,"done_reason":currfinishreason,"context": tokarr,"total_duration": 1,"load_duration": 1,"prompt_eval_count": prompttokens,"prompt_eval_duration": 1,"eval_count": comptokens,"eval_duration": 1}
         elif api_format == 7:
-            res = {"model": modelNameToReturn,"created_at": str(datetime.now(timezone.utc).isoformat()),"message":{"role":"assistant","content":recvtxt},"done": True,"done_reason":currfinishreason,"total_duration": 1,"load_duration": 1,"prompt_eval_count": prompttokens,"prompt_eval_duration": 1,"eval_count": comptokens,"eval_duration": 1}
+            ccmsg = {"role":"assistant","content":recvtxt or ""}
+            ollama_tool_calls = convert_tool_calls_to_ollama(tool_calls)
+            if ollama_tool_calls:
+                ccmsg["tool_calls"] = ollama_tool_calls
+            res = {"model": modelNameToReturn,"created_at": str(datetime.now(timezone.utc).isoformat()),"message":ccmsg,"done": True,"done_reason":currfinishreason,"total_duration": 1,"load_duration": 1,"prompt_eval_count": prompttokens,"prompt_eval_duration": 1,"eval_count": comptokens,"eval_duration": 1}
         elif api_format == 8: #oai-responses
             resp_id = f"resp-A{genparams.get('oai_uniqueid', 1)}"
             output_item_id = f"msg_0{genparams.get('oai_uniqueid', 1)}"
@@ -5380,7 +5407,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.send_header("cache-control", "no-cache")
         self.send_header("connection", "keep-alive")
-        self.end_headers(content_type='text/event-stream')
+        stream_content_type = 'application/x-ndjson' if api_format == 6 or api_format == 7 else 'text/event-stream'
+        self.end_headers(content_type=stream_content_type)
 
         # if tools, do not send anything else - OAI tool calls will be handled with fakestreaming!
         # only exception is if we know the exact toolcall tag to segment!
@@ -5392,7 +5420,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 tool_segment_tag = start
                 break
         jinjatools = (args.jinja and args.jinja_tools)
-        if (api_format == 4 or api_format == 9) and using_openai_tools:
+        if (api_format == 4 or api_format == 7 or api_format == 9) and using_openai_tools:
             if not jinjatools or not tool_segment_tag:
                 genparams['sync_toolcall_stream_ineligible'] = True
                 return
@@ -5486,9 +5514,22 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
 
                         sync_potential_toolcall_splitmatch = ""
                         if tokenStr!="" or streamDone:
+                            if (api_format == 4 or api_format == 7 or api_format == 9) and using_openai_tools and tool_segment_tag and not streamDone and not genparams.get("sync_toolcall_potential_triggered", False) and tool_segment_tag not in tokenStr:
+                                tail = ""
+                                for n in range(1, len(tool_segment_tag)):
+                                    prefix = tool_segment_tag[:n]
+                                    if tokenStr.endswith(prefix) and len(prefix) > len(tail):
+                                        tail = prefix
+                                if tail:
+                                    tokenReserve += tail
+                                    tokenStr = tokenStr[:-len(tail)]
+                                    if tokenStr == "":
+                                        await asyncio.sleep(async_sleep_short)
+                                        continue
+
                             # Tool boundary detection for tool-capable chat completions.
                             # if triggered, stop real streaming, and let the buffered fakestreaming take over
-                            if (api_format == 4 or api_format == 9) and using_openai_tools:
+                            if (api_format == 4 or api_format == 7 or api_format == 9) and using_openai_tools:
                                 tokenStr = tokenReserve + tokenStr
                                 tokenReserve = ""
                                 if tool_segment_tag in tokenStr:
@@ -5600,11 +5641,14 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                     await self.send_oai_sse_event(event_str)
                                 elif api_format == 6 or api_format == 7:
                                     created_at = str(datetime.now(timezone.utc).isoformat())
+                                    ollama_content = ""
                                     if api_format == 6:
                                         event_str = json.dumps({"model":modelNameToReturn,"created_at":created_at,"response":tokenStr,"done":False})
                                     else:
-                                        event_str = json.dumps({"model":modelNameToReturn,"created_at":created_at,"message":{"role":"assistant","content":tokenStr},"done":False})
-                                    await self.send_ollama_stream_event(event_str)
+                                        ollama_content = delta.get("content", tokenStr) if delta else tokenStr
+                                        event_str = json.dumps({"model":modelNameToReturn,"created_at":created_at,"message":{"role":"assistant","content":ollama_content},"done":False})
+                                    if api_format == 6 or ollama_content:
+                                        await self.send_ollama_stream_event(event_str)
                                 elif api_format == 9:
                                     if anthropic_first_loop:
                                         await self.send_anthropic_sse_event("message_start", json.dumps({"type":"message_start","message":{"type":"message","id":f"msg_A{req_id_suffix}","role":"assistant","model":modelNameToReturn,"usage":{"input_tokens":prompttokens,"output_tokens":0}}}))
@@ -5650,11 +5694,12 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                 await self.send_oai_sse_event(event_str)
                             elif api_format == 6 or api_format == 7: # Ollama newline-delimited JSON streaming
                                 created_at = str(datetime.now(timezone.utc).isoformat())
-                                if tokenStr:
+                                ollama_content = delta.get("content", tokenStr) if api_format == 7 and delta else tokenStr
+                                if tokenStr and (api_format == 6 or ollama_content):
                                     if api_format == 6:
                                         event_str = json.dumps({"model":modelNameToReturn,"created_at":created_at,"response":tokenStr,"done":False})
                                     else:
-                                        event_str = json.dumps({"model":modelNameToReturn,"created_at":created_at,"message":{"role":"assistant","content":tokenStr},"done":False})
+                                        event_str = json.dumps({"model":modelNameToReturn,"created_at":created_at,"message":{"role":"assistant","content":ollama_content},"done":False})
                                     await self.send_ollama_stream_event(event_str)
                                 if streamDone:
                                     prompttokens = batch_final_result.prompt_tokens if using_batch_stream else handle.get_last_input_count()
@@ -7165,7 +7210,7 @@ Change Mode<br>
                             self.send_header('content-length', str(len(genresp)))
                             self.end_headers(content_type='application/json')
                             self.wfile.write(genresp)
-                        elif (api_format == 4 or api_format == 9) and genparams.get('using_openai_tools', False): #special case, fake streaming for openai tool calls
+                        elif (api_format == 4 or api_format == 7 or api_format == 9) and genparams.get('using_openai_tools', False): #special case, fake streaming for tool calls
                             # we only send content_text and reasoning_text if tools aren't used. they contain the balance of the output after sync_toolcall_potential_triggered was triggered
                             content_text = genparams.get('sync_toolcall_extra_content', "") #populated by the sse call, we don't use gendat['choices'][0]['message'].get('content', None)
                             reasoning_text = genparams.get('sync_toolcall_extra_reasoning_content', "")
@@ -7175,6 +7220,8 @@ Change Mode<br>
                                     toolsdata_res = gendat['choices'][0]['message']['tool_calls']
                                     if toolsdata_res and len(toolsdata_res)>0:
                                         toolsdata_res[0]["index"] = 0 # need to add an index for OWUI
+                                elif api_format == 7:
+                                    toolsdata_res = gendat.get("message", {}).get("tool_calls", [])
                                 elif api_format == 9:
                                     # gendat["content"] is a list of Anthropic content blocks; pull out the tool_use ones and reformat to OAI shape for the shared emission code
                                     for block in gendat.get("content", []):
@@ -7190,7 +7237,23 @@ Change Mode<br>
                             except Exception:
                                 toolsdata_res = []
 
-                            if api_format == 9: # Anthropic fake-stream for tool calls
+                            if api_format == 7: # Ollama fake-stream for tool calls
+                                created_at = str(datetime.now(timezone.utc).isoformat())
+                                if not content_text and genparams.get('sync_toolcall_stream_ineligible', False):
+                                    content_text = gendat.get("message", {}).get("content", "")
+                                if content_text or toolsdata_res:
+                                    chunk_msg = {"role":"assistant","content":"" if toolsdata_res else (content_text or "")}
+                                    if toolsdata_res:
+                                        chunk_msg["tool_calls"] = toolsdata_res
+                                    chunk = {"model":modelNameToReturn,"created_at":created_at,"message":chunk_msg,"done":False}
+                                    self.wfile.write(f'{json.dumps(chunk)}\n'.encode())
+                                    self.wfile.flush()
+                                final_msg = {"role":"assistant","content":""}
+                                final_chunk = {"model":modelNameToReturn,"created_at":created_at,"message":final_msg,"done":True,"done_reason":gendat.get("done_reason", currfinishreason),"total_duration":gendat.get("total_duration", 1),"load_duration":gendat.get("load_duration", 1),"prompt_eval_count":gendat.get("prompt_eval_count", handle.get_last_input_count()),"prompt_eval_duration":gendat.get("prompt_eval_duration", 1),"eval_count":gendat.get("eval_count", handle.get_last_token_count()),"eval_duration":gendat.get("eval_duration", 1)}
+                                self.wfile.write(f'{json.dumps(final_chunk)}\n'.encode())
+                                self.wfile.flush()
+
+                            elif api_format == 9: # Anthropic fake-stream for tool calls
                                 req_id_suffix = genparams.get('oai_uniqueid', 1)
                                 start_msg = {"type": "message", "id": f"msg_A{req_id_suffix}", "role": "assistant", "model": modelNameToReturn, "usage": {"input_tokens": 0, "output_tokens": 0}}
                                 self.wfile.write(f'event: message_start\ndata: {json.dumps({"type":"message_start","message":start_msg})}\n\n'.encode())
