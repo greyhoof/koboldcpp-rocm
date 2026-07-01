@@ -33,6 +33,10 @@
 #include "utils.h"
 #include "llmutils.h"
 
+#ifdef GGML_USE_CUDA
+#  include "ggml-cuda.h"
+#endif
+
 #include "llama_v2.cpp"
 #include "llama_v3.cpp"
 #include "gptj_v1.cpp"
