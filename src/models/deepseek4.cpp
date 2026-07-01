@@ -210,9 +210,8 @@ static ggml_tensor * dsv4_build_kq_zero_bias(
     return ggml_fill(ctx, res, 0.0f);
 }
 
-//kcpp: avoid redefine conflict
-// static constexpr int64_t DSV4_CSA_RATIO  = 4;
-// static constexpr int64_t DSV4_HCA_RATIO  = 128;
+static constexpr int64_t DSV4_CSA_RATIO  = 4;
+static constexpr int64_t DSV4_HCA_RATIO  = 128;
 
 static ggml_tensor * dsv4_hc_affine(
         ggml_context * ctx,

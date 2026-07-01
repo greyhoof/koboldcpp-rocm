@@ -11,8 +11,8 @@
 // llama_kv_cache_iswa
 //
 //kcpp: use a global flag to adjust swa padding
-static int kcpp_extra_swa_padding = 0;
-static int kcpp_active_swa_size = 0;
+int kcpp_extra_swa_padding = 0;
+int kcpp_active_swa_size = 0;
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,

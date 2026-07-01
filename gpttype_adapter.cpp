@@ -21,6 +21,7 @@
 #include <string>
 #include <cctype>
 #include <cstdlib>
+#include <cfloat>
 #include <locale>
 #include <chrono>
 #include <algorithm>
@@ -32,12 +33,8 @@
 #include "utils.h"
 #include "llmutils.h"
 
-//for easier compilation
-//concat source files into one file for compilation purposes
 #include "llama_v2.cpp"
 #include "llama_v3.cpp"
-#include "src/llama.cpp"
-#include "common/chat.cpp"
 #include "gptj_v1.cpp"
 #include "gptj_v2.cpp"
 #include "gptj_v3.cpp"
@@ -49,14 +46,23 @@
 #include "neox_v2.cpp"
 #include "neox_v3.cpp"
 #include "mpt_v3.cpp"
+
 #include "tools/mtmd/mtmd.h"
 #include "tools/mtmd/mtmd-helper.h"
 #include "common/speculative.h"
+#include "common/chat.h"
+#include "common/log.h"
+#include "llama-grammar.h"
 #include "vendor/stb/stb_image.h"
 #include "otherarch/sdcpp/thirdparty/stb_image_resize.h"
 #include "common/common.h"
 #include "common/fit.h"
 #include "ggml-rpc.h"
+#include "llama-impl.h"
+#include "llama-ext.h"
+#include "llama-model.h"
+#include "llama-vocab.h"
+#include "nlohmann/json.hpp"
 
 #if defined(GGML_USE_HIP)
 // for rocblas_initialize()
@@ -186,6 +192,10 @@ static const int smartcache_rnn_lifeboat_percent = 65;
 static const int smartcache_rnn_lifeboat_extra_slot_min_user_slots = 4;
 
 extern bool kcpp_permit_any_repack;
+extern bool kcpp_pipeline_parallelism;
+extern bool OldBPETokenizerMode;
+extern int kcpp_extra_swa_padding;
+extern int kcpp_active_swa_size;
 
 inline int kcpp_cpu_has_blas(void) {
 #if defined(GGML_USE_BLAS) || defined(GGML_USE_CUDA) || defined(GGML_USE_VULKAN) || defined(GGML_USE_SYCL)
@@ -2053,6 +2063,77 @@ void sample_temperature(llama_token_data_array * candidates_p, float temp, float
     }
 }
 
+static std::pair<std::vector<uint32_t>, llama_partial_utf8> kcpp_decode_utf8(
+        const std::string & src,
+        llama_partial_utf8 partial_start) {
+    static const int lookup[] = { 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 3, 4 };
+    const char * pos = src.c_str();
+    std::vector<uint32_t> code_points;
+
+    code_points.reserve(src.size() + 1);
+    uint32_t value    = partial_start.value;
+    int      n_remain = partial_start.n_remain;
+
+    while (*pos != 0 && n_remain > 0) {
+        uint8_t next_byte = static_cast<uint8_t>(*pos);
+        if ((next_byte >> 6) != 2) {
+            code_points.push_back(0);
+            return std::make_pair(std::move(code_points), llama_partial_utf8{ 0, -1 });
+        }
+        value = (value << 6) + (next_byte & 0x3F);
+        ++pos;
+        --n_remain;
+    }
+
+    if (partial_start.n_remain > 0 && n_remain == 0) {
+        code_points.push_back(value);
+    }
+
+    while (*pos != 0) {
+        uint8_t first_byte = static_cast<uint8_t>(*pos);
+        uint8_t highbits   = first_byte >> 4;
+        n_remain = lookup[highbits] - 1;
+
+        if (n_remain < 0) {
+            code_points.clear();
+            code_points.push_back(0);
+            return std::make_pair(std::move(code_points), llama_partial_utf8{ 0, n_remain });
+        }
+
+        uint8_t mask = (1 << (7 - n_remain)) - 1;
+        value = first_byte & mask;
+
+        ++pos;
+        while (*pos != 0 && n_remain > 0) {
+            value = (value << 6) + (static_cast<uint8_t>(*pos) & 0x3F);
+            ++pos;
+            --n_remain;
+        }
+        if (n_remain == 0) {
+            code_points.push_back(value);
+        }
+    }
+    code_points.push_back(0);
+
+    return std::make_pair(std::move(code_points), llama_partial_utf8{ value, n_remain });
+}
+
+static llama_grammar_candidates kcpp_llama_grammar_reject_candidates(
+        const llama_grammar_rules      & rules,
+        const llama_grammar_stacks     & stacks,
+        const llama_grammar_candidates & candidates) {
+    if (stacks.empty()) {
+        return {};
+    }
+
+    auto rejects = llama_grammar_reject_candidates_for_stack(rules, stacks.front(), candidates);
+    for (size_t i = 1, size = stacks.size(); i < size; ++i) {
+        rejects = llama_grammar_reject_candidates_for_stack(rules, stacks[i], rejects);
+    }
+
+    return rejects;
+}
+
 void sample_grammar(FileFormat file_format, int32_t n_vocab, llama_token_data_array * candidates, const struct llama_grammar * grammar) {
 
     const int64_t t_start_sample_us = ggml_time_us();
@@ -2085,12 +2166,12 @@ void sample_grammar(FileFormat file_format, int32_t n_vocab, llama_token_data_ar
         } else if (piece.empty() || piece[0] == 0) {
             rejects[i] = true;
         } else {
-            candidates_decoded.push_back(decode_utf8(piece.c_str(), grammar->partial_utf8));
+            candidates_decoded.push_back(kcpp_decode_utf8(piece, grammar->partial_utf8));
             candidates_grammar.push_back({ i, candidates_decoded.back().first.data(), candidates_decoded.back().second });
         }
     }
 
-    for (auto reject: llama_grammar_reject_candidates(grammar->rules, grammar->stacks, candidates_grammar)) {
+    for (auto reject: kcpp_llama_grammar_reject_candidates(grammar->rules, grammar->stacks, candidates_grammar)) {
         rejects[reject.index] = true;
     }
 
@@ -2324,7 +2405,7 @@ static void grammar_accept_token(FileFormat file_format, int32_t n_vocab, struct
     const std::string piece = FileFormatTokenizeID(token,file_format);
 
     // Note terminating 0 in decoded string
-    const auto   decoded     = decode_utf8(piece.c_str(), grammar->partial_utf8);
+    const auto   decoded     = kcpp_decode_utf8(piece, grammar->partial_utf8);
     const auto & code_points = decoded.first;
     for (auto it = code_points.begin(), end = code_points.end() - 1; it != end; ++it) {
         llama_grammar_accept(grammar, *it);

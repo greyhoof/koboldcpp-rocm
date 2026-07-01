@@ -27,7 +27,7 @@
 // helpers
 //
 
-static bool OldBPETokenizerMode = false;
+bool OldBPETokenizerMode = false;
 
 struct naive_trie {
     naive_trie() : has_value(false), value(0) {

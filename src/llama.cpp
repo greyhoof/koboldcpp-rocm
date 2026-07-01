@@ -19,7 +19,6 @@
 #include "llama-memory-recurrent.cpp"
 #include "llama-model-loader.cpp"
 #include "llama-model-saver.cpp"
-#include "llama-model.cpp"
 #include "llama-quant.cpp"
 #include "llama-hparams.cpp"
 #include "llama-graph.cpp"
@@ -46,10 +45,6 @@
 #include <type_traits>
 #include <iostream>
 #include <vector>
-
-#ifdef GGML_USE_CUDA
-#  include "ggml-cuda.h"
-#endif
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data

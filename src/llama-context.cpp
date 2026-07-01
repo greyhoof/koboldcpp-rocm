@@ -23,7 +23,7 @@
 //
 
 //kcpp: use a global flag to toggle pipeline parallelism to avoid messing with ctx params
-static bool kcpp_pipeline_parallelism = false;
+bool kcpp_pipeline_parallelism = false;
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
