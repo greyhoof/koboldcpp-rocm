@@ -5360,6 +5360,10 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(f'data: {data}\n\n'.encode())
         self.wfile.flush()
 
+    async def send_ollama_stream_event(self, data):
+        self.wfile.write(f'{data}\n'.encode())
+        self.wfile.flush()
+
     async def handle_sse_stream(self, genparams, api_format):
         global friendlymodelname, currfinishreason, thinkformats, tool_call_pairs, cached_chat_template
         global autoswapmode, textName, sttName, ttsName, embedName, musicName, imageName, mmprojName
@@ -5594,6 +5598,13 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                 elif api_format == 3:  # non chat completions
                                     event_str = json.dumps({"id":cmpl_id,"object":"text_completion","created":int(time.time()),"model":modelNameToReturn,"choices":[{"index":0,"finish_reason":None,"text":tokenStr}]})
                                     await self.send_oai_sse_event(event_str)
+                                elif api_format == 6 or api_format == 7:
+                                    created_at = str(datetime.now(timezone.utc).isoformat())
+                                    if api_format == 6:
+                                        event_str = json.dumps({"model":modelNameToReturn,"created_at":created_at,"response":tokenStr,"done":False})
+                                    else:
+                                        event_str = json.dumps({"model":modelNameToReturn,"created_at":created_at,"message":{"role":"assistant","content":tokenStr},"done":False})
+                                    await self.send_ollama_stream_event(event_str)
                                 elif api_format == 9:
                                     if anthropic_first_loop:
                                         await self.send_anthropic_sse_event("message_start", json.dumps({"type":"message_start","message":{"type":"message","id":f"msg_A{req_id_suffix}","role":"assistant","model":modelNameToReturn,"usage":{"input_tokens":prompttokens,"output_tokens":0}}}))
@@ -5637,6 +5648,27 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                     await self.send_oai_sse_event(addonstr)
                                 event_str = json.dumps({"id":cmpl_id,"object":"text_completion","created":int(time.time()),"model":modelNameToReturn,"choices":[{"index":0,"finish_reason":currfinishreason,"text":tokenStr}]})
                                 await self.send_oai_sse_event(event_str)
+                            elif api_format == 6 or api_format == 7: # Ollama newline-delimited JSON streaming
+                                created_at = str(datetime.now(timezone.utc).isoformat())
+                                if tokenStr:
+                                    if api_format == 6:
+                                        event_str = json.dumps({"model":modelNameToReturn,"created_at":created_at,"response":tokenStr,"done":False})
+                                    else:
+                                        event_str = json.dumps({"model":modelNameToReturn,"created_at":created_at,"message":{"role":"assistant","content":tokenStr},"done":False})
+                                    await self.send_ollama_stream_event(event_str)
+                                if streamDone:
+                                    prompttokens = batch_final_result.prompt_tokens if using_batch_stream else handle.get_last_input_count()
+                                    completion_tokens = current_token
+                                    final_chunk = {"model":modelNameToReturn,"created_at":created_at,"done":True,"done_reason":currfinishreason,"total_duration":1,"load_duration":1,"prompt_eval_count":prompttokens,"prompt_eval_duration":1,"eval_count":completion_tokens,"eval_duration":1}
+                                    if api_format == 6:
+                                        finalraw = handle.batch_generate_pending_output(batch_request_id) if using_batch_stream else handle.get_pending_output()
+                                        finaltxt = finalraw.decode("UTF-8", "ignore")
+                                        oldprompt = genparams.get('ollamabodyprompt', "")
+                                        final_chunk["response"] = ""
+                                        final_chunk["context"] = tokenize_ids(oldprompt+finaltxt,False)
+                                    else:
+                                        final_chunk["message"] = {"role":"assistant","content":""}
+                                    await self.send_ollama_stream_event(json.dumps(final_chunk))
                             elif api_format == 8: #oai-responses
                                 resp_id = f"resp-A{genparams.get('oai_uniqueid', 1)}"
                                 item_id = f"msg_0{genparams.get('oai_uniqueid', 1)}"
@@ -7111,6 +7143,8 @@ Change Mode<br>
                     # Check if streaming chat completions, if so, set stream mode to true
                     if (api_format == 4 or api_format == 3 or api_format == 8 or api_format == 9) and "stream" in genparams and genparams["stream"]:
                         sse_stream_flag = True
+                    if (api_format == 6 or api_format == 7) and genparams.get('stream', True):
+                        sse_stream_flag = True
                     if continuous_batching_python_eligible(genparams, api_format):
                         genparams['_batch_expected'] = True
                         modelbusy.release()
@@ -7125,35 +7159,7 @@ Change Mode<br>
                         if autoswapmode and textName is not None:
                             modelNameToReturn = textName
                         # Headers are already sent when streaming
-                        if (api_format == 6 or api_format == 7) and genparams.get('stream', True):
-                            #ollama fake streaming
-                            self.send_response(200)
-                            self.send_header("X-Accel-Buffering", "no")
-                            self.send_header("cache-control", "no-cache")
-                            self.send_header("connection", "keep-alive")
-                            self.end_headers(content_type='text/event-stream')
-                            if api_format == 6:
-                                bodytxt = gendat.get("response","") # extract and erase the AI response from the sync payload.
-                                gendat["response"] = ""
-                                pl = {"model":modelNameToReturn,"created_at":str(datetime.now(timezone.utc).isoformat()),"response":bodytxt,"done":False}
-                                self.wfile.write(f'{json.dumps(pl)}\n'.encode())
-                                self.wfile.flush()
-                                time.sleep(0.05) #short delay
-                                self.wfile.write(f'{json.dumps(gendat)}\n'.encode()) # note: gendat already contains done=true and empty response
-                                self.wfile.flush()
-                                time.sleep(0.05) #short delay
-                            else:
-                                bodytxt = gendat.get("message",{}).get("content","") # extract and erase the AI response from the sync payload.
-                                gendat["message"] = {"role":"assistant","content":""}
-                                pl = {"model":modelNameToReturn,"created_at":str(datetime.now(timezone.utc).isoformat()),"message":{"role":"assistant","content":bodytxt},"done":False}
-                                self.wfile.write(f'{json.dumps(pl)}\n'.encode())
-                                self.wfile.flush()
-                                time.sleep(0.05) #short delay
-                                self.wfile.write(f'{json.dumps(gendat)}\n'.encode()) # note: gendat already contains done=true and empty response
-                                self.wfile.flush()
-                                time.sleep(0.05) #short delay
-                            self.close_connection = True
-                        elif not sse_stream_flag:
+                        if not sse_stream_flag:
                             self.send_response(200)
                             genresp = (json.dumps(gendat).encode())
                             self.send_header('content-length', str(len(genresp)))
@@ -7550,9 +7556,16 @@ Change Mode<br>
         self.end_headers(content_type='text/html')
 
     def end_headers(self, content_type=None):
-        self.send_header('access-control-allow-origin', '*')
+        origin = self.headers.get('Origin')
+        if origin:
+            self.send_header('access-control-allow-origin', origin)
+            self.send_header('access-control-allow-credentials', 'true')
+            self.send_header('vary', 'Origin')
+        else:
+            self.send_header('access-control-allow-origin', '*')
         self.send_header('access-control-allow-methods', '*')
         self.send_header('access-control-allow-headers', '*, Accept, Content-Type, Content-Length, Cache-Control, Accept-Encoding, X-CSRF-Token, Client-Agent, X-Fields, Content-Type, Authorization, X-Requested-With, X-HTTP-Method-Override, apikey, genkey')
+        self.send_header('access-control-allow-private-network', 'true')
         self.send_header("cache-control", "no-store")
         if content_type is not None:
             self.send_header('content-type', content_type)
