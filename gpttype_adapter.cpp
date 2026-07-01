@@ -599,8 +599,9 @@ static size_t estimate_draft_autofit_tax_mb(
     if(draft_is_mtp_estimate)
     {
         draft_ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        draft_ctx_params.n_seq_max = base_ctx_params.n_seq_max;
         draft_ctx_params.n_rs_seq = speculative_chunk_amt;
-        draft_ctx_params.n_outputs_max = base_ctx_params.n_seq_max; //match the real MTP draft context (see speculative_decoding_setup) so the autofit tax doesn't over-reserve the draft compute buffer at n_batch*n_vocab (~2GB on large-vocab models like Gemma)
+        draft_ctx_params.n_outputs_max = std::max<uint32_t>(1, base_ctx_params.n_seq_max); //match the real MTP draft context so the autofit tax doesn't over-reserve the draft compute buffer at n_batch*n_vocab (~2GB on large-vocab models like Gemma)
         measure_model_bytes = has_draft_model;
     }
 
@@ -885,7 +886,7 @@ static void mtp_decoding_setup(llama_model * main_model, llama_context * main_ct
     mtp_ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     mtp_ctx_params.ctx_other = main_ctx;
     mtp_ctx_params.n_rs_seq = 0;
-    mtp_ctx_params.n_outputs_max = 1;
+    mtp_ctx_params.n_outputs_max = std::max<uint32_t>(1, mtp_ctx_params.n_seq_max);
 
     printf("\nAttempting to create built-in MTP context from the main model.\n");
     draft_ctx = llama_init_from_model(main_model, mtp_ctx_params);
@@ -4266,7 +4267,7 @@ public:
         std::unique_lock<std::mutex> lock(batch_mutex);
         batch_legacy_waiting++;
         batch_cv.notify_all();
-        batch_cv.wait(lock, [](){ return !batch_has_live_locked(); });
+        batch_cv.wait(lock, [](){ return !batch_legacy_active && !batch_has_live_locked(); });
         batch_legacy_waiting--;
         batch_invalidate_legacy_context_locked();
         batch_legacy_active = true;
@@ -4762,7 +4763,7 @@ static void batch_start_worker_locked()
 
 bool gpttype_batch_generate_enabled()
 {
-    return continuous_batching_slots > 1 && file_format == FileFormat::GGUF_GENERIC && llama_ctx_v4 && kcpp_data;
+    return continuous_batching_slots > 1 && file_format == FileFormat::GGUF_GENERIC && llama_ctx_v4 && kcpp_data && !draft_ctx && !guidance_ctx;
 }
 
 int gpttype_batch_generate_submit(const generation_inputs inputs)

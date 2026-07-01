@@ -2351,7 +2351,7 @@ def continuous_batching_python_eligible(genparams, api_format):
     if model_path and not model_path.endswith(".gguf"):
         utfprint("Batching disabled due to file format",2)
         return False
-    if not getattr(args, "noshift", False) or getattr(args, "smartcontext", False) or getattr(args, "draftmodel", "") or getattr(args, "enableguidance", False):
+    if not getattr(args, "noshift", False) or getattr(args, "smartcontext", False) or getattr(args, "draftmodel", "") or getattr(args, "usemtp", False) or getattr(args, "enableguidance", False):
         utfprint("Batching disabled due to loaded settings",2)
         return False
     if genparams.get("negative_prompt") or genparams.get("images") or genparams.get("audio"):
