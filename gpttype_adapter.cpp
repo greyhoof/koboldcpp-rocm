@@ -5645,11 +5645,11 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     std::vector<int> media_intro; //added before media list
     std::vector<int> media_outro; //added before media list
     std::string intro = "\nAttached Media:\n";
-    if(mtmd_ctx && kcpp_mtmd_is_gemma4uv(mtmd_ctx)) //ugly fix for gemma4uv vision coherency
-    {
-        intro = "\n<|channel><channel|>" + intro;
-    }
-    TokenizeString(intro, media_intro, file_format, add_bos_token);
+    // if(mtmd_ctx && kcpp_mtmd_is_gemma4uv(mtmd_ctx)) //ugly fix for gemma4uv vision coherency
+    // {
+    //     intro = "\n<|channel><channel|>" + intro;
+    // }
+    TokenizeString(intro, media_intro, file_format, false);
 
     //clear previous run media memory, just-in-time free
     for(int i=0;i<media_objects.size();++i)
