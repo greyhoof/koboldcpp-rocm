@@ -1530,6 +1530,7 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         jsoninfo["all_prompts"] = nlohmann::json::array();
         jsoninfo["all_negative_prompts"] = nlohmann::json::array();
         jsoninfo["all_seeds"] = nlohmann::json::array();
+        jsoninfo["lora_meta"] = lora_meta;
         jsoninfo["version"] = "KoboldCpp";
     }
     sd_image_t* upscaled_image = nullptr;
