@@ -8,6 +8,7 @@
 #include "model/common/rope.hpp"
 #include "model/diffusion/dit.hpp"
 #include "model/diffusion/model.hpp"
+#include "model/diffusion/sefi_image.hpp"
 #include "model_loader.h"
 
 #define FLUX_GRAPH_SIZE 10240
@@ -26,6 +27,9 @@ namespace Flux {
     struct FluxConfig {
         SDVersion version         = VERSION_FLUX;
         bool is_chroma            = false;
+        bool is_sefi              = false;
+        int64_t semantic_channels = 0;
+        float sefi_delta_t        = 0.1f;
         int patch_size            = 2;
         int64_t in_channels       = 64;
         int64_t out_channels      = 64;
@@ -88,6 +92,21 @@ namespace Flux {
                 config.share_modulation = true;
                 config.ref_index_scale  = 10.f;
                 config.use_mlp_silu_act = true;
+            } else if (sd_version_is_sefi_image(version)) {
+                config.is_sefi           = true;
+                config.semantic_channels = 16;
+                config.in_channels       = 128 + config.semantic_channels;
+                config.patch_size        = 1;
+                config.out_channels      = 128 + config.semantic_channels;
+                config.mlp_ratio         = 3.f;
+                config.theta             = 2000;
+                config.axes_dim          = {32, 32, 32, 32};
+                config.vec_in_dim        = 0;
+                config.qkv_bias          = false;
+                config.disable_bias      = true;
+                config.share_modulation  = true;
+                config.ref_index_scale   = 10.f;
+                config.use_mlp_silu_act  = true;
             } else if (sd_version_is_longcat(version)) {
                 config.context_in_dim = 3584;
                 config.vec_in_dim     = 0;
@@ -723,8 +742,8 @@ namespace Flux {
 
                 auto m     = adaLN_modulation_1->forward(ctx, ggml_silu(ctx->ggml_ctx, c));  // [N, 2 * hidden_size]
                 auto m_vec = ggml_ext_chunk(ctx->ggml_ctx, m, 2, 0);
-                shift      = m_vec[0];  // [N, hidden_size]
-                scale      = m_vec[1];  // [N, hidden_size]
+                shift      = m_vec[0];
+                scale      = m_vec[1];
             }
 
             x = Flux::modulate(ctx->ggml_ctx, norm_final->forward(ctx, x), shift, scale);
@@ -902,6 +921,8 @@ namespace Flux {
             }
             if (config.is_chroma) {
                 blocks["distilled_guidance_layer"] = std::make_shared<ChromaApproximator>(config.in_dim, config.hidden_size);
+            } else if (config.is_sefi) {
+                blocks["dual_time_embed"] = std::make_shared<SefiImage::SefiDualTimestepEmbeddings>(256, config.hidden_size);
             } else {
                 blocks["time_in"] = std::make_shared<MLPEmbedder>(256, config.hidden_size, !config.disable_bias);
                 if (config.vec_in_dim > 0) {
@@ -1027,6 +1048,11 @@ namespace Flux {
                 if (y != nullptr) {
                     txt_img_mask = ggml_pad(ctx->ggml_ctx, y, static_cast<int>(img->ne[1]), 0, 0, 0);
                 }
+            } else if (config.is_sefi) {
+                auto dual_time_embed = std::dynamic_pointer_cast<SefiImage::SefiDualTimestepEmbeddings>(blocks["dual_time_embed"]);
+                auto timestep_sem    = ggml_view_1d(ctx->ggml_ctx, timesteps, 1, 0);
+                auto timestep_tex    = ggml_view_1d(ctx->ggml_ctx, timesteps, 1, ggml_element_size(timesteps));
+                vec                  = dual_time_embed->forward(ctx, timestep_sem, timestep_tex);
             } else {
                 auto time_in = std::dynamic_pointer_cast<MLPEmbedder>(blocks["time_in"]);
                 vec          = time_in->forward(ctx, ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, 256, 10000, 1000.f));
@@ -1459,7 +1485,7 @@ namespace Flux {
                                  const sd::Tensor<float>& y_tensor                        = {},
                                  const sd::Tensor<float>& guidance_tensor                 = {},
                                  const std::vector<sd::Tensor<float>>& ref_latents_tensor = {},
-                                 bool increase_ref_index                                  = false,
+                                 Rope::RefIndexMode ref_index_mode                        = Rope::RefIndexMode::FIXED,
                                  std::vector<int> skip_layers                             = {},
                                  const sd::Tensor<float>& pulid_id_tensor                 = {},
                                  float pulid_id_weight                                    = 1.0f) {
@@ -1500,9 +1526,9 @@ namespace Flux {
                 set_backend_tensor_data(mod_index_arange, mod_index_arange_vec.data());
             }
             std::set<int> txt_arange_dims;
-            if (sd_version_is_flux2(version)) {
-                txt_arange_dims    = {3};
-                increase_ref_index = true;
+            if (sd_version_is_flux2(version) || sd_version_is_sefi_image(version)) {
+                txt_arange_dims = {3};
+                ref_index_mode  = Rope::RefIndexMode::INCREASE;
             } else if (version == VERSION_OVIS_IMAGE) {
                 txt_arange_dims = {1, 2};
             }
@@ -1513,7 +1539,7 @@ namespace Flux {
                                             static_cast<int>(context->ne[1]),
                                             txt_arange_dims,
                                             ref_latents,
-                                            increase_ref_index,
+                                            ref_index_mode,
                                             config.ref_index_scale,
                                             config.theta,
                                             circular_y_enabled,
@@ -1573,7 +1599,7 @@ namespace Flux {
                                   const sd::Tensor<float>& y                        = {},
                                   const sd::Tensor<float>& guidance                 = {},
                                   const std::vector<sd::Tensor<float>>& ref_latents = {},
-                                  bool increase_ref_index                           = false,
+                                  Rope::RefIndexMode ref_index_mode                 = Rope::RefIndexMode::FIXED,
                                   std::vector<int> skip_layers                      = std::vector<int>(),
                                   const sd::Tensor<float>& pulid_id                 = {},
                                   float pulid_id_weight                             = 1.0f) {
@@ -1584,7 +1610,7 @@ namespace Flux {
             // guidance: [N, ]
             // pulid_id: empty (no injection) or [N, num_id_tokens=32, kv_dim=2048]
             auto get_graph = [&]() -> ggml_cgraph* {
-                return build_graph(x, timesteps, context, c_concat, y, guidance, ref_latents, increase_ref_index, skip_layers, pulid_id, pulid_id_weight);
+                return build_graph(x, timesteps, context, c_concat, y, guidance, ref_latents, ref_index_mode, skip_layers, pulid_id, pulid_id_weight);
             };
 
             auto result = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
@@ -1606,7 +1632,7 @@ namespace Flux {
                            tensor_or_empty(diffusion_params.y),
                            tensor_or_empty(extra->guidance),
                            diffusion_params.ref_latents ? *diffusion_params.ref_latents : empty_ref_latents,
-                           diffusion_params.increase_ref_index,
+                           diffusion_params.ref_index_mode,
                            extra->skip_layers ? *extra->skip_layers : empty_skip_layers,
                            tensor_or_empty(extra->pulid_id),
                            extra->pulid_id_weight);
@@ -1657,7 +1683,7 @@ namespace Flux {
                                        {},
                                        guidance,
                                        {},
-                                       false);
+                                       Rope::RefIndexMode::FIXED);
                 int64_t t1   = ggml_time_ms();
 
                 GGML_ASSERT(!out_opt.empty());

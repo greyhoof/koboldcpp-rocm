@@ -653,7 +653,7 @@ ArgOptions SDContextParams::get_options() {
          on_sampler_rng_arg},
         {"",
          "--prediction",
-         "prediction type override, one of [eps, v, edm_v, sd3_flow, flux_flow, flux2_flow]",
+         "prediction type override, one of [eps, v, edm_v, sd3_flow, flux_flow, sefi_flow]",
          on_prediction_arg},
         {"",
          "--lora-apply-mode",
@@ -710,7 +710,18 @@ bool SDContextParams::resolve(SDMode mode) {
 }
 
 bool SDContextParams::validate(SDMode mode) {
-    if (mode != UPSCALE && mode != METADATA && model_path.length() == 0 && diffusion_model_path.length() == 0) {
+    if (mode == CONVERT) {
+        const bool has_convert_input = model_path.length() != 0 ||
+                                       clip_l_path.length() != 0 ||
+                                       clip_g_path.length() != 0 ||
+                                       t5xxl_path.length() != 0 ||
+                                       diffusion_model_path.length() != 0 ||
+                                       vae_path.length() != 0;
+        if (!has_convert_input) {
+            LOG_ERROR("error: convert mode needs at least one model input path\n");
+            return false;
+        }
+    } else if (mode != UPSCALE && mode != METADATA && model_path.length() == 0 && diffusion_model_path.length() == 0) {
         LOG_ERROR("error: the following arguments are required: model_path/diffusion_model\n");
         return false;
     }
@@ -960,7 +971,7 @@ ArgOptions SDGenerationParams::get_options() {
          &hires_upscaler},
         {"",
          "--extra-sample-args",
-         "extra sampler/scheduler/guidance args, key=value list. CFG supports guidance_schedule; APG supports apg_eta, apg_momentum, apg_norm_threshold, apg_norm_threshold_smoothing; SLG supports slg_uncond; lcm supports noise_clip_std, noise_scale_start, noise_scale_end; ltx2 supports max_shift, base_shift, stretch, terminal; euler_ge supports gamma;; logit_normal supports mu, std, logsnr_min, logsnr_max, resolution_aware",
+         "extra sampler/scheduler/guidance args, key=value list. CFG supports guidance_schedule; APG supports apg_eta, apg_momentum, apg_norm_threshold, apg_norm_threshold_smoothing; SLG supports slg_uncond; lcm supports noise_clip_std, noise_scale_start, noise_scale_end; flux supports base_shift, max_shift; ltx2 supports max_shift, base_shift, stretch, terminal; euler_ge supports gamma;; logit_normal supports mu, std, logsnr_min, logsnr_max, resolution_aware",
          (int)',',
          &extra_sample_args},
         {"",
@@ -996,6 +1007,10 @@ ArgOptions SDGenerationParams::get_options() {
          "--batch-count",
          "batch count",
          &batch_count},
+        {"",
+         "--qwen-image-layers",
+         "number of Qwen Image Layered layers; latent/output count is layers + 1 (default: 3)",
+         &qwen_image_layers},
         {"",
          "--video-frames",
          "video frames (default: 1)",
@@ -1475,7 +1490,7 @@ ArgOptions SDGenerationParams::get_options() {
          on_high_noise_sample_method_arg},
         {"",
          "--scheduler",
-         "denoiser sigma scheduler, one of [discrete, karras, exponential, ays, gits, smoothstep, sgm_uniform, simple, kl_optimal, lcm, bong_tangent, ltx2, logit_normal], default: model-specific",
+         "denoiser sigma scheduler, one of [discrete, karras, exponential, ays, gits, smoothstep, sgm_uniform, simple, kl_optimal, lcm, bong_tangent, ltx2, logit_normal, flux2, flux, beta], alias: normal=discrete, default: model-specific",
          on_scheduler_arg},
         {"",
          "--sigmas",
@@ -1816,6 +1831,7 @@ bool SDGenerationParams::from_json_str(
     load_if_exists("width", width);
     load_if_exists("height", height);
     load_if_exists("batch_count", batch_count);
+    load_if_exists("qwen_image_layers", qwen_image_layers);
     load_if_exists("video_frames", video_frames);
     load_if_exists("fps", fps);
     load_if_exists("upscale_repeats", upscale_repeats);
@@ -2240,6 +2256,11 @@ bool SDGenerationParams::validate(SDMode mode) {
         return false;
     }
 
+    if (qwen_image_layers < 0) {
+        LOG_ERROR("error: qwen_image_layers must be non-negative");
+        return false;
+    }
+
     if (sample_params.sample_steps <= 0) {
         LOG_ERROR("error: the sample_steps must be greater than 0\n");
         return false;
@@ -2406,6 +2427,7 @@ sd_img_gen_params_t SDGenerationParams::to_sd_img_gen_params_t() {
     params.strength              = strength;
     params.seed                  = seed;
     params.batch_count           = batch_count;
+    params.qwen_image_layers     = qwen_image_layers;
     params.control_image         = control_image.get();
     params.control_strength      = control_strength;
     params.pm_params             = pm_params;
@@ -2531,6 +2553,7 @@ std::string SDGenerationParams::to_string() const {
         << "  width: " << width << ",\n"
         << "  height: " << height << ",\n"
         << "  batch_count: " << batch_count << ",\n"
+        << "  qwen_image_layers: " << qwen_image_layers << ",\n"
         << "  init_image_path: \"" << init_image_path << "\",\n"
         << "  end_image_path: \"" << end_image_path << "\",\n"
         << "  mask_image_path: \"" << mask_image_path << "\",\n"
