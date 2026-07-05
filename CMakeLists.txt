@@ -519,6 +519,8 @@ add_library(sdtype_adapter
             otherarch/sdcpp/src/upscaler.cpp
             otherarch/sdcpp/src/runtime/guidance.cpp
             otherarch/sdcpp/src/runtime/guidance.h
+            otherarch/sdcpp/src/runtime/imatrix.cpp
+            otherarch/sdcpp/src/runtime/imatrix.h
             otherarch/sdcpp/src/stable-diffusion.cpp
             otherarch/sdcpp/thirdparty/zip.c
             otherarch/sdcpp/src/model_io/gguf_io.cpp
