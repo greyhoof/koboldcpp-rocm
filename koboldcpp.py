@@ -11600,7 +11600,7 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
         global maxctx
         maxctx = args.contextsize
 
-    args.defaultgenamt = max(64, min(args.defaultgenamt, 16384))
+    args.defaultgenamt = max(64, min(args.defaultgenamt, 32768))
     args.defaultgenamt = min(args.defaultgenamt, maxctx / 2)
 
     #this uses the true port instead of the displayport, because we dont want to shut down a router
