@@ -21,10 +21,12 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "core/ggml_extend_backend.h"
 #include "core/ggml_graph_cut.h"
+#include "core/layer_split_partition.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -1745,6 +1747,13 @@ protected:
     size_t max_graph_vram_bytes           = 0;
     bool stream_layers_enabled            = false;
     size_t observed_max_effective_budget_ = 0;
+    bool graph_cut_layer_split_enabled    = false;
+    std::vector<size_t> graph_cut_layer_split_backend_vram_limits_;
+
+    std::vector<ggml_backend_t> extra_runtime_backends;  // borrowed (SDBackendManager-owned)
+    ggml_backend_sched_t sched             = nullptr;    // owned, multi-device only
+    ggml_backend_t cpu_fallback_backend    = nullptr;    // owned, sched requires a trailing CPU backend
+    bool multi_device_eval_callback_warned = false;
 
     std::shared_ptr<WeightAdapter> weight_adapter = nullptr;
     std::weak_ptr<RunnerWeightManager> weight_manager;
@@ -1771,6 +1780,9 @@ protected:
 
     sd::ggml_graph_cut::PlanCache graph_cut_plan_cache_;
     std::unordered_set<const ggml_tensor*> params_tensor_set_;
+    std::unordered_map<const ggml_tensor*, ggml_backend_t> graph_cut_layer_split_assignments_;
+    std::unordered_map<const ggml_tensor*, ggml_backend_t> graph_cut_layer_split_node_assignments_;
+    bool graph_cut_layer_split_primary_notice_logged_ = false;
 
     template <typename T>
     static sd::Tensor<T> take_or_empty(std::optional<sd::Tensor<T>> tensor) {
@@ -1869,6 +1881,20 @@ protected:
         params_tensor_set_dirty_ = false;
     }
 
+    ggml_tensor* canonical_param_tensor(ggml_tensor* tensor) {
+        if (tensor == nullptr) {
+            return nullptr;
+        }
+        if (params_tensor_set_.find(tensor) != params_tensor_set_.end()) {
+            return tensor;
+        }
+        if (tensor->view_src != nullptr &&
+            params_tensor_set_.find(tensor->view_src) != params_tensor_set_.end()) {
+            return tensor->view_src;
+        }
+        return nullptr;
+    }
+
     std::vector<ggml_tensor*> collect_used_param_tensors(ggml_cgraph* gf) {
         std::vector<ggml_tensor*> used_params;
         rebuild_params_tensor_set();
@@ -1881,12 +1907,8 @@ protected:
         seen_params.reserve(static_cast<size_t>(n_leafs));
         for (int i = 0; i < n_leafs; ++i) {
             ggml_tensor* leaf       = sd::ggml_graph_cut::leaf_tensor(gf, i);
-            ggml_tensor* param_leaf = leaf;
-            if (param_leaf != nullptr && params_tensor_set_.find(param_leaf) == params_tensor_set_.end()) {
-                param_leaf = param_leaf->view_src;
-            }
+            ggml_tensor* param_leaf = canonical_param_tensor(leaf);
             if (param_leaf != nullptr &&
-                params_tensor_set_.find(param_leaf) != params_tensor_set_.end() &&
                 seen_params.insert(param_leaf).second) {
                 used_params.push_back(param_leaf);
             }
@@ -2013,7 +2035,127 @@ protected:
         return true;
     }
 
+    // Pass explicit buffer types: synthesized defaults can make CUDA devices
+    // report supporting each other's buffers and skip a required copy.
+    bool ensure_sched(ggml_cgraph* gf) {
+        if (sched != nullptr) {
+            return true;
+        }
+        std::vector<ggml_backend_t> backends;
+        backends.reserve(extra_runtime_backends.size() + 2);
+        backends.push_back(runtime_backend);
+        for (ggml_backend_t backend : extra_runtime_backends) {
+            backends.push_back(backend);
+        }
+        if (cpu_fallback_backend == nullptr && !sd_backend_is_cpu(runtime_backend)) {
+            cpu_fallback_backend = sd_backend_cpu_init();
+        }
+        if (cpu_fallback_backend != nullptr) {
+            backends.push_back(cpu_fallback_backend);
+        }
+
+        std::vector<ggml_backend_buffer_type_t> bufts;
+        bufts.reserve(backends.size());
+        ggml_backend_dev_t main_dev = ggml_backend_get_device(runtime_backend);
+        for (ggml_backend_t backend : backends) {
+            ggml_backend_buffer_type_t buft = nullptr;
+            if (backend == cpu_fallback_backend && main_dev != nullptr) {
+                buft = ggml_backend_dev_host_buffer_type(main_dev);
+            }
+            if (buft == nullptr) {
+                buft = ggml_backend_get_default_buffer_type(backend);
+            }
+            bufts.push_back(buft);
+        }
+
+        size_t graph_size = MAX_GRAPH_SIZE;
+        if (gf != nullptr) {
+            graph_size = std::max<size_t>(graph_size, (size_t)ggml_graph_n_nodes(gf));
+        }
+        sched = ggml_backend_sched_new(backends.data(),
+                                       bufts.data(),
+                                       (int)backends.size(),
+                                       graph_size,
+                                       /*parallel=*/false,
+                                       /*op_offload=*/false);
+        if (sched == nullptr) {
+            LOG_ERROR("%s: failed to create backend sched", get_desc().c_str());
+            return false;
+        }
+        return true;
+    }
+
+    ggml_backend_t backend_for_weight(const ggml_tensor* tensor) const {
+        if (tensor == nullptr || tensor->buffer == nullptr) {
+            return nullptr;
+        }
+        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+            ggml_backend_buffer_is_host(tensor->buffer)) {
+            return nullptr;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+        if (dev == nullptr) {
+            return nullptr;
+        }
+        if (ggml_backend_get_device(runtime_backend) == dev) {
+            return runtime_backend;
+        }
+        for (ggml_backend_t backend : extra_runtime_backends) {
+            if (ggml_backend_get_device(backend) == dev) {
+                return backend;
+            }
+        }
+        return nullptr;
+    }
+
+    // Weightless ops have no scheduler anchor, so pin them to the most recent
+    // weight device. Views must stay unpinned or cross-device copies can be
+    // skipped for their consumers.
+    void pin_multi_device_nodes(ggml_cgraph* gf) {
+        if (sched == nullptr || gf == nullptr) {
+            return;
+        }
+        ggml_backend_t current = runtime_backend;
+        const int n_nodes      = ggml_graph_n_nodes(gf);
+        for (int i = 0; i < n_nodes; i++) {
+            ggml_tensor* node    = ggml_graph_node(gf, i);
+            auto node_assignment = graph_cut_layer_split_node_assignments_.find(node);
+            if (node_assignment != graph_cut_layer_split_node_assignments_.end()) {
+                current = node_assignment->second;
+            }
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                ggml_backend_t weight_backend = backend_for_weight(node->src[s]);
+                if (weight_backend != nullptr) {
+                    if (node_assignment == graph_cut_layer_split_node_assignments_.end()) {
+                        current = weight_backend;
+                    }
+                }
+            }
+            if (node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+                node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
+                continue;
+            }
+            if (ggml_backend_supports_op(current, node)) {
+                ggml_backend_sched_set_tensor_backend(sched, node, current);
+            }
+        }
+    }
+
+    bool is_multi_device() const {
+        return !extra_runtime_backends.empty();
+    }
+
     bool alloc_compute_buffer(ggml_cgraph* gf) {
+        if (is_multi_device()) {
+            // The sched replaces the gallocr. Do NOT ggml_backend_sched_reserve
+            // the graph here: reserve runs split_graph, which rewires the
+            // graph's src pointers to sched-internal copy tensors, and the
+            // later ggml_backend_sched_alloc_graph would split the already
+            // rewired graph, silently corrupting every cross-backend input. A
+            // graph must be split at most once; the alloc in execute_graph
+            // performs the real allocation.
+            return ensure_sched(gf);
+        }
         if (compute_allocr != nullptr) {
             return true;
         }
@@ -2229,12 +2371,14 @@ protected:
                plan.valid &&
                max_graph_vram_bytes > 0 &&
                plan.segments.size() > 1 &&
-               !sd_backend_is_cpu(runtime_backend);
+               !sd_backend_is_cpu(runtime_backend) &&
+               !is_multi_device();
     }
 
     bool can_attempt_graph_cut_segmented_compute() const {
         return max_graph_vram_bytes > 0 &&
-               !sd_backend_is_cpu(runtime_backend);
+               !sd_backend_is_cpu(runtime_backend) &&
+               !is_multi_device();
     }
 
     bool resolve_graph_cut_plan(ggml_cgraph* gf,
@@ -2311,6 +2455,123 @@ protected:
                           effective_budget / (1024.0 * 1024.0));
             }
         }
+        return true;
+    }
+
+    bool resolve_graph_cut_layer_split_plan(ggml_cgraph* gf,
+                                            GraphCutPlan* plan_out) {
+        GGML_ASSERT(plan_out != nullptr);
+        GGML_ASSERT(gf != nullptr);
+        *plan_out = sd::ggml_graph_cut::resolve_plan(runtime_backend,
+                                                     gf,
+                                                     &graph_cut_plan_cache_,
+                                                     0,
+                                                     params_tensor_set_,
+                                                     get_desc().c_str());
+        return true;
+    }
+
+    bool assign_graph_cut_layer_split_backends(ggml_cgraph* gf) {
+        graph_cut_layer_split_node_assignments_.clear();
+        if (!graph_cut_layer_split_enabled) {
+            return true;
+        }
+        if (!is_multi_device()) {
+            LOG_ERROR("%s graph-cut layer split requires multiple runtime backends", get_desc().c_str());
+            return false;
+        }
+
+        GraphCutPlan plan;
+        if (!resolve_graph_cut_layer_split_plan(gf, &plan)) {
+            return false;
+        }
+        if (!plan.valid || !plan.has_cuts || plan.segments.size() <= 1) {
+            auto manager = weight_manager.lock();
+            if (manager == nullptr) {
+                LOG_ERROR("%s weight manager is not set for graph-cut layer split", get_desc().c_str());
+                return false;
+            }
+            std::vector<ggml_tensor*> graph_params = collect_used_param_tensors(gf);
+            if (!graph_params.empty() &&
+                !manager->assign_compute_backend(graph_params, runtime_backend)) {
+                LOG_ERROR("%s graph-cut layer split failed to assign unmarked graph params to %s",
+                          get_desc().c_str(),
+                          sd::layer_split_backend_device_display_name(runtime_backend).c_str());
+                return false;
+            }
+            for (ggml_tensor* param : graph_params) {
+                if (param != nullptr) {
+                    graph_cut_layer_split_assignments_[param] = runtime_backend;
+                }
+            }
+            const int n_nodes = ggml_graph_n_nodes(gf);
+            for (int i = 0; i < n_nodes; i++) {
+                ggml_tensor* node = ggml_graph_node(gf, i);
+                if (node != nullptr) {
+                    graph_cut_layer_split_node_assignments_[node] = runtime_backend;
+                }
+            }
+            if (!graph_cut_layer_split_primary_notice_logged_) {
+                LOG_WARN("%s graph-cut layer split: graph has no mark_graph_cut segments; using primary backend %s for %zu graph params",
+                         get_desc().c_str(),
+                         sd::layer_split_backend_device_display_name(runtime_backend).c_str(),
+                         graph_params.size());
+                graph_cut_layer_split_primary_notice_logged_ = true;
+            } else {
+                LOG_DEBUG("%s graph-cut layer split: graph has no mark_graph_cut segments; using primary backend %s for %zu graph params",
+                          get_desc().c_str(),
+                          sd::layer_split_backend_device_display_name(runtime_backend).c_str(),
+                          graph_params.size());
+            }
+            return true;
+        }
+
+        std::vector<ggml_backend_t> split_backends;
+        split_backends.reserve(extra_runtime_backends.size() + 1);
+        split_backends.push_back(runtime_backend);
+        for (ggml_backend_t backend : extra_runtime_backends) {
+            if (backend != nullptr) {
+                split_backends.push_back(backend);
+            }
+        }
+
+        auto manager = weight_manager.lock();
+        if (manager == nullptr) {
+            LOG_ERROR("%s weight manager is not set for graph-cut layer split", get_desc().c_str());
+            return false;
+        }
+
+        sd::GraphCutLayerSplitAssignment assignment;
+        auto canonicalize_param = [this](ggml_tensor* tensor) {
+            return canonical_param_tensor(tensor);
+        };
+        if (!sd::partition_graph_cut_layer_split(get_desc().c_str(),
+                                                 gf,
+                                                 plan,
+                                                 split_backends,
+                                                 graph_cut_layer_split_backend_vram_limits_,
+                                                 max_graph_vram_bytes,
+                                                 graph_cut_layer_split_assignments_,
+                                                 canonicalize_param,
+                                                 &assignment)) {
+            return false;
+        }
+
+        for (size_t i = 0; i < split_backends.size(); i++) {
+            if (assignment.tensors_by_backend[i].empty()) {
+                continue;
+            }
+            if (!manager->assign_compute_backend(assignment.tensors_by_backend[i], split_backends[i])) {
+                LOG_ERROR("%s graph-cut layer split failed to assign params to %s",
+                          get_desc().c_str(),
+                          sd::layer_split_backend_device_display_name(split_backends[i]).c_str());
+                return false;
+            }
+        }
+
+        graph_cut_layer_split_node_assignments_ = std::move(assignment.node_assignments);
+        sd::log_graph_cut_layer_split_assignment(get_desc().c_str(), split_backends, assignment);
+
         return true;
     }
 
@@ -2490,7 +2751,14 @@ protected:
         };
         ComputeBufferGuard compute_buffer_guard(this, free_compute_buffer);
 
-        if (!ggml_gallocr_alloc_graph(compute_allocr, gf)) {
+        if (is_multi_device()) {
+            ggml_backend_sched_reset(sched);
+            pin_multi_device_nodes(gf);  // reset clears the pins; re-apply before alloc
+            if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+                LOG_ERROR("%s sched alloc compute graph failed", get_desc().c_str());
+                return std::nullopt;
+            }
+        } else if (!ggml_gallocr_alloc_graph(compute_allocr, gf)) {
             LOG_ERROR("%s alloc compute graph failed", get_desc().c_str());
             return std::nullopt;
         }
@@ -2499,11 +2767,27 @@ protected:
         if (sd_backend_is_cpu(runtime_backend)) {
             sd_backend_cpu_set_n_threads(runtime_backend, n_threads);
         }
+        if (cpu_fallback_backend != nullptr) {
+            sd_backend_cpu_set_n_threads(cpu_fallback_backend, n_threads);
+        }
 
-        ggml_status status = sd_backend_graph_compute_with_eval_callback(runtime_backend,
-                                                                         gf,
-                                                                         sd_get_backend_eval_callback(),
-                                                                         sd_get_backend_eval_callback_data());
+        ggml_status status;
+        if (is_multi_device()) {
+            if (sd_get_backend_eval_callback() != nullptr && !multi_device_eval_callback_warned) {
+                LOG_WARN("%s: eval callback is not supported with multiple runtime backends; ignoring",
+                         get_desc().c_str());
+                multi_device_eval_callback_warned = true;
+            }
+            status = ggml_backend_sched_graph_compute(sched, gf);
+            if (status == GGML_STATUS_SUCCESS) {
+                ggml_backend_sched_synchronize(sched);
+            }
+        } else {
+            status = sd_backend_graph_compute_with_eval_callback(runtime_backend,
+                                                                 gf,
+                                                                 sd_get_backend_eval_callback(),
+                                                                 sd_get_backend_eval_callback_data());
+        }
         if (status != GGML_STATUS_SUCCESS) {
             LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
             return std::nullopt;
@@ -2680,6 +2964,10 @@ public:
         free_params_ctx();
         free_compute_ctx();
         free_cache_ctx_and_buffer();
+        if (cpu_fallback_backend != nullptr) {
+            ggml_backend_free(cpu_fallback_backend);
+            cpu_fallback_backend = nullptr;
+        }
     }
 
     virtual GGMLRunnerContext get_context() {
@@ -2720,10 +3008,20 @@ public:
             ggml_gallocr_free(compute_allocr);
             compute_allocr = nullptr;
         }
+        if (sched != nullptr) {
+            ggml_backend_sched_free(sched);
+            sched = nullptr;
+        }
     }
 
     // do copy after alloc graph
     void set_backend_tensor_data(ggml_tensor* tensor, const void* data) {
+        if (is_multi_device()) {
+            // The sched only assigns a backend (and thus a buffer) to tensors
+            // that participate in the graph; flag standalone data tensors as
+            // inputs so they get one.
+            ggml_set_input(tensor);
+        }
         backend_tensor_data_map[tensor] = data;
     }
 
@@ -2814,6 +3112,11 @@ public:
         GGML_ASSERT(gf != nullptr);
         rebuild_params_tensor_set();
 
+        if (!assign_graph_cut_layer_split_backends(gf)) {
+            free_compute_ctx();
+            return std::nullopt;
+        }
+
         if (can_attempt_graph_cut_segmented_compute()) {
             GraphCutPlan plan;
             if (!resolve_graph_cut_plan(gf, &plan)) {
@@ -2859,7 +3162,49 @@ public:
     }
 
     void set_stream_layers_enabled(bool enabled) {
+        if (enabled && is_multi_device()) {
+            LOG_WARN("%s: --stream-layers is not supported with multiple runtime backends; ignoring",
+                     get_desc().c_str());
+            return;
+        }
         stream_layers_enabled = enabled;
+    }
+
+    void set_graph_cut_layer_split_enabled(bool enabled) {
+        graph_cut_layer_split_enabled = enabled;
+        if (!enabled) {
+            graph_cut_layer_split_assignments_.clear();
+            graph_cut_layer_split_node_assignments_.clear();
+            graph_cut_layer_split_primary_notice_logged_ = false;
+        }
+    }
+
+    void set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits) {
+        graph_cut_layer_split_backend_vram_limits_ = limits;
+        graph_cut_layer_split_assignments_.clear();
+        graph_cut_layer_split_node_assignments_.clear();
+        graph_cut_layer_split_primary_notice_logged_ = false;
+    }
+
+    void set_runtime_backends(const std::vector<ggml_backend_t>& backends) {
+        extra_runtime_backends.clear();
+        for (ggml_backend_t backend : backends) {
+            if (backend == nullptr || backend == runtime_backend) {
+                continue;
+            }
+            if (std::find(extra_runtime_backends.begin(), extra_runtime_backends.end(), backend) ==
+                extra_runtime_backends.end()) {
+                extra_runtime_backends.push_back(backend);
+            }
+        }
+        graph_cut_layer_split_assignments_.clear();
+        graph_cut_layer_split_node_assignments_.clear();
+        graph_cut_layer_split_primary_notice_logged_ = false;
+        if (is_multi_device() && stream_layers_enabled) {
+            LOG_WARN("%s: --stream-layers is not supported with multiple runtime backends; ignoring",
+                     get_desc().c_str());
+            stream_layers_enabled = false;
+        }
     }
 };
 

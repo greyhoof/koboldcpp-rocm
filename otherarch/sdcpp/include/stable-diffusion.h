@@ -54,6 +54,8 @@ enum sample_method_t {
     EULER_CFG_PP_SAMPLE_METHOD,
     EULER_A_CFG_PP_SAMPLE_METHOD,
     EULER_GE_SAMPLE_METHOD,
+    DPMPP2M_SDE_SAMPLE_METHOD,
+    DPMPP2M_SDE_BT_SAMPLE_METHOD,
     SAMPLE_METHOD_COUNT
 };
 
@@ -214,20 +216,17 @@ typedef struct {
     bool tae_preview_only;
     bool diffusion_conv_direct;
     bool vae_conv_direct;
-    bool circular_x;
-    bool circular_y;
     bool force_sdxl_vae_conv_scale;
-    bool chroma_use_dit_mask;
-    bool chroma_use_t5_mask;
-    int chroma_t5_mask_pad;
-    bool qwen_image_zero_cond_t;
     enum sd_vae_format_t vae_format;
     const char* max_vram;  // GiB budget or backend assignment spec for graph-cut segmented param offload (0 = disabled, -1 = auto)
     bool stream_layers;  // Enable residency+prefetch streaming on top of --max-vram (no effect without --max-vram)
     bool eager_load;  // Load all params into the params backend at model-load time instead of lazily on first use
     const char* backend;
     const char* params_backend;
+    const char* split_mode;  // weight distribution for multi-device modules: layer (default) or row, or per-module assignments e.g. "diffusion=row"
+    bool auto_fit;
     const char* rpc_servers;
+    const char* model_args;
 } sd_ctx_params_t;
 
 typedef struct {
@@ -381,6 +380,8 @@ typedef struct {
     sd_cache_params_t cache;
     sd_hires_params_t hires;
     int qwen_image_layers;
+    bool circular_x;
+    bool circular_y;
 } sd_img_gen_params_t;
 
 typedef struct {
@@ -407,6 +408,8 @@ typedef struct {
     sd_tiling_params_t vae_tiling_params;
     sd_cache_params_t cache;
     sd_hires_params_t hires;
+    bool circular_x;
+    bool circular_y;
 } sd_vid_gen_params_t;
 
 typedef struct sd_ctx_t sd_ctx_t;
@@ -518,7 +521,8 @@ SD_API bool convert_with_components(const char* model_path,
                                     const char* output_path,
                                     enum sd_type_t output_type,
                                     const char* tensor_type_rules,
-                                    bool convert_name);
+                                    bool convert_name,
+                                    int n_threads);
 
 SD_API bool preprocess_canny(sd_image_t image,
                              float high_threshold,
@@ -534,6 +538,12 @@ SD_API void disable_imatrix_collection(void);
 
 SD_API const char* sd_commit(void);
 SD_API const char* sd_version(void);
+
+// List available ggml backend devices, one `name<TAB>description` per line.
+// The names are the device names accepted by the --backend / --params-backend
+// assignment specs. Returns the number of bytes required, excluding the null
+// terminator. Passing nullptr or buffer_size 0 only queries the required size.
+SD_API size_t sd_list_devices(char* buffer, size_t buffer_size);
 
 // for C API, caller needs to call free_sd_images to free the memory after use
 // This helps avoid CRT problems on Windows when memory is allocated in the library but freed in the caller, which may use a different CRT.

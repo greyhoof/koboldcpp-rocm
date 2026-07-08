@@ -4,11 +4,14 @@
 #include <filesystem>
 #include <limits>
 #include <set>
+#include <type_traits>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "core/ggml_extend.hpp"
 #include "core/ggml_graph_cut.h"
+#include "core/layer_split_partition.h"
 
 #include "core/rng.hpp"
 #include "core/rng_mt19937.hpp"
@@ -19,6 +22,7 @@
 #include "stable-diffusion.h"
 
 #include "conditioning/conditioner.hpp"
+#include "core/backend_fit.h"
 #include "extensions/generation_extension.h"
 #include "model/adapter/lora.hpp"
 #include "model/diffusion/anima.hpp"
@@ -55,10 +59,10 @@
 #include "name_conversion.h"
 #include "runtime/latent-preview.h"
 
+#include <atomic>
+
 const char* sd_vae_format_name(enum sd_vae_format_t format);
 static SDVersion sd_vae_format_to_version(enum sd_vae_format_t format, SDVersion fallback);
-
-#include <atomic>
 
 const char* model_version_to_str[] = {
     "SD 1.x",
@@ -172,6 +176,13 @@ static float get_cache_reuse_threshold(const sd_cache_params_t& params) {
 
 /*=============================================== StableDiffusionGGML ================================================*/
 
+template <typename T, typename = void>
+struct has_set_runtime_backends : std::false_type {};
+template <typename T>
+struct has_set_runtime_backends<T,
+                                std::void_t<decltype(std::declval<T&>().set_runtime_backends(
+                                    std::declval<const std::vector<ggml_backend_t>&>()))>> : std::true_type {};
+
 static_assert(std::atomic<sd_cancel_mode_t>::is_always_lock_free,
               "sd_cancel_mode_t must be lock-free");
 
@@ -212,6 +223,8 @@ public:
     bool eager_load    = false;
     std::string backend_spec;
     std::string params_backend_spec;
+    std::string split_mode_spec;
+    bool auto_fit_enabled = false;
 
     bool is_using_v_parameterization     = false;
     bool is_using_edm_v_parameterization = false;
@@ -259,6 +272,15 @@ public:
         return max_vram_assignment.bytes_for_backend(backend_for(module));
     }
 
+    std::vector<size_t> layer_split_vram_limits_for_backends(const std::vector<ggml_backend_t>& backends) {
+        std::vector<size_t> limits;
+        limits.reserve(backends.size());
+        for (ggml_backend_t backend : backends) {
+            limits.push_back(max_vram_assignment.bytes_for_backend(backend));
+        }
+        return limits;
+    }
+
     bool ensure_backend_pair(SDBackendModule module) {
         if (backend_for(module) == nullptr) {
             return false;
@@ -279,23 +301,233 @@ public:
         if (model_manager == nullptr) {
             return true;
         }
+        ModelManager::ResidencyMode residency_mode =
+            backend_manager.params_backend_is_disk(module) ? ModelManager::ResidencyMode::Disk : ModelManager::ResidencyMode::ParamBackend;
+
+        std::vector<ggml_backend_t> module_backends = backend_manager.runtime_backends(module);
+        if (module_backends.size() > 1) {
+            if constexpr (has_set_runtime_backends<T>::value) {
+                if (module == SDBackendModule::DIFFUSION || module == SDBackendModule::TE) {
+                    if (backend_manager.split_mode(module) == SDSplitMode::ROW) {
+                        return register_row_split_runner_params(desc,
+                                                                model,
+                                                                module,
+                                                                module_backends,
+                                                                std::move(group_tensors),
+                                                                residency_mode,
+                                                                params_mem_size);
+                    }
+                    return register_layer_split_runner_params(desc,
+                                                              model,
+                                                              module,
+                                                              module_backends,
+                                                              std::move(group_tensors),
+                                                              residency_mode,
+                                                              params_mem_size);
+                }
+            }
+            LOG_WARN("%s module does not support multiple runtime backends; using %s",
+                     sd_backend_module_name(module),
+                     sd::layer_split_backend_device_display_name(module_backends[0]).c_str());
+        }
         return model_manager->register_param_tensors(desc,
                                                      std::move(group_tensors),
-                                                     backend_manager.params_backend_is_disk(module) ? ModelManager::ResidencyMode::Disk : ModelManager::ResidencyMode::ParamBackend,
+                                                     residency_mode,
                                                      backend_for(module),
                                                      params_backend_for(module),
                                                      params_mem_size);
+    }
+
+    template <typename T>
+    bool register_row_split_runner_params(const std::string& desc,
+                                          const std::shared_ptr<T>& model,
+                                          SDBackendModule module,
+                                          const std::vector<ggml_backend_t>& module_backends,
+                                          std::map<std::string, ggml_tensor*> group_tensors,
+                                          ModelManager::ResidencyMode residency_mode,
+                                          size_t* params_mem_size) {
+        ggml_backend_t main_backend = module_backends[0];
+
+        auto fall_back_to_layer_split = [&](const char* reason) {
+            LOG_WARN("%s: row split unavailable (%s); falling back to layer split", desc.c_str(), reason);
+            return register_layer_split_runner_params(desc,
+                                                      model,
+                                                      module,
+                                                      module_backends,
+                                                      std::move(group_tensors),
+                                                      residency_mode,
+                                                      params_mem_size);
+        };
+
+        ggml_backend_dev_t main_dev = ggml_backend_get_device(main_backend);
+        ggml_backend_reg_t reg      = main_dev != nullptr ? ggml_backend_dev_backend_reg(main_dev) : nullptr;
+        if (reg == nullptr) {
+            return fall_back_to_layer_split("no backend registry");
+        }
+        const size_t reg_dev_count = ggml_backend_reg_dev_count(reg);
+        std::vector<float> tensor_split(reg_dev_count, 0.0f);
+        constexpr int64_t compute_headroom_bytes = 2ll * 1024 * 1024 * 1024;
+        for (ggml_backend_t backend : module_backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            int reg_index          = -1;
+            for (size_t i = 0; i < reg_dev_count; i++) {
+                if (ggml_backend_reg_dev_get(reg, i) == dev) {
+                    reg_index = (int)i;
+                    break;
+                }
+            }
+            if (reg_index < 0) {
+                return fall_back_to_layer_split("devices span different backend registries");
+            }
+            size_t free_bytes = 0, total_bytes = 0;
+            ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+            int64_t usable_bytes    = std::max<int64_t>((int64_t)free_bytes - compute_headroom_bytes,
+                                                     (int64_t)free_bytes / 8);
+            tensor_split[reg_index] = usable_bytes > 0 ? (float)((double)usable_bytes / (1024.0 * 1024.0)) : 1.0f;
+        }
+
+        ggml_backend_buffer_type_t split_buft = backend_manager.split_buffer_type(main_backend, tensor_split);
+        if (split_buft == nullptr) {
+            return fall_back_to_layer_split("backend has no split buffer type");
+        }
+        model_manager->set_split_buffer_type(main_backend, split_buft);
+
+        std::map<std::string, ggml_tensor*> split_tensors;
+        if constexpr (std::is_base_of_v<Conditioner, T>) {
+            model->get_layer_split_param_tensors(split_tensors);
+        } else {
+            split_tensors = group_tensors;
+        }
+
+        std::map<std::string, ggml_tensor*> row_split_map;
+        std::map<std::string, ggml_tensor*> regular_map;
+        size_t row_split_bytes = 0;
+        for (const auto& kv : group_tensors) {
+            if (split_tensors.count(kv.first) != 0 &&
+                sd::layer_split_tensor_block_index(kv.first) >= 0 &&
+                ModelManager::tensor_shape_supports_split_buffer(kv.second)) {
+                row_split_map[kv.first] = kv.second;
+                row_split_bytes += ggml_nbytes(kv.second);
+            } else {
+                regular_map[kv.first] = kv.second;
+            }
+        }
+        if (row_split_map.empty()) {
+            return fall_back_to_layer_split("no row-splittable transformer block weights found");
+        }
+
+        LOG_INFO("%s row split: %zu tensors (%.1f MB) split across %zu devices (main %s)",
+                 desc.c_str(),
+                 row_split_map.size(),
+                 row_split_bytes / (1024.f * 1024.f),
+                 module_backends.size(),
+                 sd::layer_split_backend_device_display_name(main_backend).c_str());
+
+        if (!model_manager->register_param_tensors(desc,
+                                                   std::move(row_split_map),
+                                                   residency_mode,
+                                                   main_backend,
+                                                   params_backend_for(module),
+                                                   params_mem_size,
+                                                   /*allow_split_buffer=*/true)) {
+            return false;
+        }
+        return model_manager->register_param_tensors(desc,
+                                                     std::move(regular_map),
+                                                     residency_mode,
+                                                     main_backend,
+                                                     params_backend_for(module),
+                                                     params_mem_size);
+    }
+
+    // Register graph-cut layer-split tensors on the primary backend first.
+    // The first real graph assigns each param tensor to a runtime backend
+    // before weights are loaded or staged.
+    template <typename T>
+    bool register_layer_split_runner_params(const std::string& desc,
+                                            const std::shared_ptr<T>& model,
+                                            SDBackendModule module,
+                                            const std::vector<ggml_backend_t>& module_backends,
+                                            std::map<std::string, ggml_tensor*> group_tensors,
+                                            ModelManager::ResidencyMode residency_mode,
+                                            size_t* params_mem_size) {
+        bool has_cpu_device = false;
+        for (ggml_backend_t backend : module_backends) {
+            has_cpu_device = has_cpu_device || sd_backend_is_cpu(backend);
+        }
+        if (has_cpu_device) {
+            // The scheduler reserves the CPU slot for its fallback backend, and
+            // CPU weight participation is what --params-backend <module>=cpu is
+            // for; a CPU device in a split list is almost certainly a mistake.
+            LOG_WARN(
+                "%s: layer split across a CPU device is not supported; using %s "
+                "(use --params-backend %s=cpu to keep weights in RAM)",
+                desc.c_str(),
+                sd::layer_split_backend_device_display_name(module_backends[0]).c_str(),
+                sd_backend_module_name(module));
+            return model_manager->register_param_tensors(desc,
+                                                         std::move(group_tensors),
+                                                         residency_mode,
+                                                         module_backends[0],
+                                                         params_backend_for(module),
+                                                         params_mem_size);
+        }
+
+        model->set_runtime_backends(module_backends);
+        model->set_graph_cut_layer_split_backend_vram_limits(layer_split_vram_limits_for_backends(module_backends));
+        model->set_graph_cut_layer_split_enabled(true);
+        const bool params_follow_runtime = backend_manager.params_backend_follows_runtime(module) ||
+                                           backend_manager.params_backend_is_disk(module);
+        ggml_backend_t initial_params_backend = params_follow_runtime ? module_backends[0] : params_backend_for(module);
+        if (initial_params_backend == nullptr) {
+            return false;
+        }
+
+        LOG_INFO("%s graph-cut layer split: deferring %zu tensors across %zu runtime backends until first graph",
+                 desc.c_str(),
+                 group_tensors.size(),
+                 module_backends.size());
+
+        return model_manager->register_param_tensors(desc,
+                                                     std::move(group_tensors),
+                                                     residency_mode,
+                                                     module_backends[0],
+                                                     initial_params_backend,
+                                                     params_mem_size,
+                                                     false,
+                                                     params_follow_runtime);
     }
 
     bool init_backend() {
         std::string error;
         if (!backend_manager.init(backend_spec.c_str(),
                                   params_backend_spec.c_str(),
+                                  split_mode_spec.c_str(),
                                   &error)) {
             LOG_ERROR("backend config failed: %s", error.c_str());
             return false;
         }
         return ensure_backend_pair(SDBackendModule::DIFFUSION);
+    }
+
+    bool row_split_active() {
+        for (SDBackendModule module : {SDBackendModule::DIFFUSION, SDBackendModule::TE}) {
+            if (backend_manager.split_mode(module) == SDSplitMode::ROW &&
+                backend_manager.runtime_backends(module).size() > 1) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool graph_cut_layer_split_active() {
+        for (SDBackendModule module : {SDBackendModule::DIFFUSION, SDBackendModule::TE}) {
+            if (backend_manager.split_mode(module) == SDSplitMode::LAYER &&
+                backend_manager.runtime_backends(module).size() > 1) {
+                return true;
+            }
+        }
+        return false;
     }
 
     std::shared_ptr<RNG> get_rng(rng_type_t rng_type) {
@@ -359,6 +591,8 @@ public:
         eager_load          = sd_ctx_params->eager_load;
         backend_spec        = SAFE_STR(sd_ctx_params->backend);
         params_backend_spec = SAFE_STR(sd_ctx_params->params_backend);
+        split_mode_spec     = SAFE_STR(sd_ctx_params->split_mode);
+        auto_fit_enabled    = sd_ctx_params->auto_fit;
         max_vram_assignment.reset(0.f);
         {
             std::string error;
@@ -383,21 +617,6 @@ public:
         }
 
         ggml_log_set(ggml_log_callback_default, nullptr);
-
-        if (!init_backend()) {
-            return false;
-        }
-        {
-            std::string error;
-            if (!max_vram_assignment.canonicalize_backend_keys(&error)) {
-                LOG_ERROR("%s", error.c_str());
-                return false;
-            }
-        }
-        if (stream_layers && !backend_manager.params_backend_is_cpu(SDBackendModule::DIFFUSION)) {
-            LOG_WARN("--stream-layers has no effect unless diffusion params backend is cpu; ignoring");
-            stream_layers = false;
-        }
 
         std::string clip_vision_fixed     = SAFE_STR(sd_ctx_params->clip_vision_path);
         std::string clipg_path_fixed      = SAFE_STR(sd_ctx_params->clip_g_path);
@@ -788,6 +1007,35 @@ public:
             model_loader.set_wtype_override(wtype, tensor_type_rules);
         }
 
+        if (auto_fit_enabled) {
+            if (!sd::backend_fit::derive_backend_specs(model_loader,
+                                                       wtype,
+                                                       max_vram_assignment,
+                                                       backend_spec,
+                                                       params_backend_spec)) {
+                return false;
+            }
+        }
+
+        if (!init_backend()) {
+            return false;
+        }
+        {
+            std::string error;
+            if (!max_vram_assignment.canonicalize_backend_keys(&error)) {
+                LOG_ERROR("%s", error.c_str());
+                return false;
+            }
+        }
+        if (stream_layers && !backend_manager.params_backend_is_cpu(SDBackendModule::DIFFUSION)) {
+            LOG_WARN("--stream-layers has no effect unless diffusion params backend is cpu; ignoring");
+            stream_layers = false;
+        }
+        if (eager_load && graph_cut_layer_split_active()) {
+            LOG_WARN("--eager-load is not supported with graph-cut layer split; weights will be prepared lazily");
+            eager_load = false;
+        }
+
         std::map<ggml_type, uint32_t> wtype_stat                 = model_loader.get_wtype_stat();
         std::map<ggml_type, uint32_t> conditioner_wtype_stat     = model_loader.get_conditioner_wtype_stat();
         std::map<ggml_type, uint32_t> diffusion_model_wtype_stat = model_loader.get_diffusion_model_wtype_stat();
@@ -829,12 +1077,17 @@ public:
             // Avoid full-model LoRA merge buffers on constrained setups.
             const bool params_offloaded      = params_backend_for(SDBackendModule::DIFFUSION) != backend_for(SDBackendModule::DIFFUSION);
             const bool streaming_constrained = stream_layers || params_offloaded;
-            if (have_quantized_weight || streaming_constrained) {
+            if (have_quantized_weight || streaming_constrained || row_split_active()) {
                 apply_lora_immediately = false;
             } else {
                 apply_lora_immediately = true;
             }
         } else if (sd_ctx_params->lora_apply_mode == LORA_APPLY_IMMEDIATELY) {
+            if (row_split_active()) {
+                LOG_WARN(
+                    "row-split tensors do not support the immediately LoRA apply mode; "
+                    "LoRAs will not be applied to them (use --lora-apply-mode at_runtime)");
+            }
             apply_lora_immediately = true;
         } else {
             apply_lora_immediately = false;
@@ -858,10 +1111,6 @@ public:
         if (version == VERSION_SDXS_512_DS || version == VERSION_SDXS_09) {
             tae_preview_only = false;
             use_tae          = true;
-        }
-
-        if (sd_ctx_params->circular_x || sd_ctx_params->circular_y) {
-            LOG_INFO("Using circular padding for convolutions");
         }
 
         {
@@ -922,10 +1171,11 @@ public:
                 if (is_chroma) {
                     cond_stage_model = std::make_shared<T5CLIPEmbedder>(backend_for(SDBackendModule::TE),
                                                                         tensor_storage_map,
-                                                                        sd_ctx_params->chroma_use_t5_mask,
-                                                                        sd_ctx_params->chroma_t5_mask_pad,
                                                                         false,
-                                                                        model_manager);
+                                                                        1,
+                                                                        false,
+                                                                        model_manager,
+                                                                        sd_ctx_params->model_args);
                 } else if (version == VERSION_OVIS_IMAGE) {
                     cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
                                                                      tensor_storage_map,
@@ -942,8 +1192,8 @@ public:
                                                                      tensor_storage_map,
                                                                      "model.diffusion_model",
                                                                      version,
-                                                                     sd_ctx_params->chroma_use_dit_mask,
-                                                                     model_manager);
+                                                                     model_manager,
+                                                                     sd_ctx_params->model_args);
             } else if (sd_version_is_flux2(version) || sd_version_is_sefi_image(version)) {
                 bool is_chroma   = false;
                 cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
@@ -956,8 +1206,8 @@ public:
                                                                      tensor_storage_map,
                                                                      "model.diffusion_model",
                                                                      version,
-                                                                     sd_ctx_params->chroma_use_dit_mask,
-                                                                     model_manager);
+                                                                     model_manager,
+                                                                     sd_ctx_params->model_args);
             } else if (sd_version_is_ltxav(version)) {
                 cond_stage_model = std::make_shared<LTXAVEmbedder>(backend_for(SDBackendModule::TE),
                                                                    tensor_storage_map,
@@ -1015,8 +1265,8 @@ public:
                                                                           tensor_storage_map,
                                                                           "model.diffusion_model",
                                                                           version,
-                                                                          sd_ctx_params->qwen_image_zero_cond_t,
-                                                                          model_manager);
+                                                                          model_manager,
+                                                                          sd_ctx_params->model_args);
             } else if (sd_version_is_longcat(version)) {
                 cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
                                                                  tensor_storage_map,
@@ -1028,8 +1278,8 @@ public:
                                                                      tensor_storage_map,
                                                                      "model.diffusion_model",
                                                                      version,
-                                                                     sd_ctx_params->chroma_use_dit_mask,
-                                                                     model_manager);
+                                                                     model_manager,
+                                                                     sd_ctx_params->model_args);
             } else if (version == VERSION_HIDREAM_O1) {
                 cond_stage_model = std::make_shared<HiDreamO1::HiDreamO1Conditioner>(backend_for(SDBackendModule::TE),
                                                                                      tensor_storage_map,
@@ -1368,16 +1618,6 @@ public:
                     high_noise_diffusion_model->set_flash_attention_enabled(true);
                 }
             }
-
-            diffusion_model->set_circular_axes(sd_ctx_params->circular_x, sd_ctx_params->circular_y);
-            if (high_noise_diffusion_model) {
-                high_noise_diffusion_model->set_circular_axes(sd_ctx_params->circular_x, sd_ctx_params->circular_y);
-            }
-            if (control_net) {
-                control_net->set_circular_axes(sd_ctx_params->circular_x, sd_ctx_params->circular_y);
-            }
-            circular_x = sd_ctx_params->circular_x;
-            circular_y = sd_ctx_params->circular_y;
         }
 
         LOG_DEBUG("validating model metadata");
@@ -2718,7 +2958,16 @@ public:
         }
         auto latents = first_stage_model->diffusion_to_vae_latents(x);
         first_stage_model->set_temporal_tiling_enabled(vae_tiling_params.temporal_tiling);
-        return first_stage_model->decode(n_threads, latents, vae_tiling_params, decode_video, circular_x, circular_y);
+        auto decoded = first_stage_model->decode(n_threads, latents, vae_tiling_params, decode_video, circular_x, circular_y);
+        if (decoded.empty() && auto_fit_enabled) {
+            bool prefer_temporal_tiling = decode_video && std::dynamic_pointer_cast<LTXVideoVAE>(first_stage_model) != nullptr;
+            if (sd::backend_fit::prepare_vae_decode_retry_tiling(vae_tiling_params, prefer_temporal_tiling)) {
+                first_stage_model->free_compute_buffer();
+                first_stage_model->set_temporal_tiling_enabled(vae_tiling_params.temporal_tiling);
+                decoded = first_stage_model->decode(n_threads, latents, vae_tiling_params, decode_video, circular_x, circular_y);
+            }
+        }
+        return decoded;
     }
 
     sd::Tensor<float> normalize_ltx_video_latents(const sd::Tensor<float>& x) {
@@ -2761,22 +3010,6 @@ public:
         auto flow_denoiser = std::dynamic_pointer_cast<DiscreteFlowDenoiser>(denoiser);
         return !!flow_denoiser;
     }
-
-    //added for kcpp
-    void SetCircularAxesAll(bool circular_x, bool circular_y)
-    {
-        diffusion_model->set_circular_axes(circular_x, circular_y);
-        if (high_noise_diffusion_model) {
-            high_noise_diffusion_model->set_circular_axes(circular_x, circular_y);
-        }
-        if (control_net) {
-            control_net->set_circular_axes(circular_x, circular_y);
-        }
-        if (first_stage_model) {
-            first_stage_model->set_circular_axes(circular_x, circular_y);
-        }
-    }
-    //end added for kcpp
 
 };
 
@@ -2842,6 +3075,8 @@ const char* sample_method_to_str[] = {
     "euler_cfg_pp",
     "euler_a_cfg_pp",
     "euler_ge",
+    "dpm++2m_sde",
+    "dpm++2m_sde_bt",
 };
 
 const char* sd_sample_method_name(enum sample_method_t sample_method) {
@@ -3083,15 +3318,13 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->eager_load           = false;
     sd_ctx_params->enable_mmap          = false;
     sd_ctx_params->diffusion_flash_attn = false;
-    sd_ctx_params->circular_x           = false;
-    sd_ctx_params->circular_y           = false;
-    sd_ctx_params->chroma_use_dit_mask  = true;
-    sd_ctx_params->chroma_use_t5_mask   = false;
-    sd_ctx_params->chroma_t5_mask_pad   = 1;
     sd_ctx_params->vae_format           = SD_VAE_FORMAT_AUTO;
     sd_ctx_params->backend              = nullptr;
     sd_ctx_params->params_backend       = nullptr;
+    sd_ctx_params->split_mode           = nullptr;
+    sd_ctx_params->auto_fit             = false;
     sd_ctx_params->rpc_servers          = nullptr;
+    sd_ctx_params->model_args           = nullptr;
     sd_ctx_params->pulid_weights_path   = nullptr;
 }
 
@@ -3130,13 +3363,11 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "eager_load: %s\n"
              "backend: %s\n"
              "params_backend: %s\n"
+             "split_mode: %s\n"
+             "model_args: %s\n"
+             "auto_fit: %s\n"
              "flash_attn: %s\n"
              "diffusion_flash_attn: %s\n"
-             "circular_x: %s\n"
-             "circular_y: %s\n"
-             "chroma_use_dit_mask: %s\n"
-             "chroma_use_t5_mask: %s\n"
-             "chroma_t5_mask_pad: %d\n"
              "vae_format: %s\n",
              SAFE_STR(sd_ctx_params->model_path),
              SAFE_STR(sd_ctx_params->clip_l_path),
@@ -3166,13 +3397,11 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              BOOL_STR(sd_ctx_params->eager_load),
              SAFE_STR(sd_ctx_params->backend),
              SAFE_STR(sd_ctx_params->params_backend),
+             SAFE_STR(sd_ctx_params->split_mode),
+             SAFE_STR(sd_ctx_params->model_args),
+             BOOL_STR(sd_ctx_params->auto_fit),
              BOOL_STR(sd_ctx_params->flash_attn),
              BOOL_STR(sd_ctx_params->diffusion_flash_attn),
-             BOOL_STR(sd_ctx_params->circular_x),
-             BOOL_STR(sd_ctx_params->circular_y),
-             BOOL_STR(sd_ctx_params->chroma_use_dit_mask),
-             BOOL_STR(sd_ctx_params->chroma_use_t5_mask),
-             sd_ctx_params->chroma_t5_mask_pad,
              sd_vae_format_name(sd_ctx_params->vae_format));
 
     return buf;
@@ -3250,6 +3479,8 @@ void sd_img_gen_params_init(sd_img_gen_params_t* sd_img_gen_params) {
     sd_img_gen_params->batch_count       = 1;
     sd_img_gen_params->control_strength  = 0.9f;
     sd_img_gen_params->qwen_image_layers = 3;
+    sd_img_gen_params->circular_x        = false;
+    sd_img_gen_params->circular_y        = false;
     sd_img_gen_params->pm_params         = {nullptr, 0, nullptr, 20.f};
     sd_img_gen_params->pulid_params      = {nullptr, 1.0f};
     sd_img_gen_params->vae_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
@@ -3283,6 +3514,8 @@ char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params) {
              "control_strength: %.2f\n"
              "photo maker: {style_strength = %.2f, id_images_count = %d, id_embed_path = %s}\n"
              "VAE tiling: %s (temporal=%s, extra_tiling_args=%s)\n"
+             "circular_x: %s\n"
+             "circular_y: %s\n"
              "hires: {enabled=%s, upscaler=%s, model_path=%s, scale=%.2f, target=%dx%d, steps=%d, denoising_strength=%.2f}\n",
              SAFE_STR(sd_img_gen_params->prompt),
              SAFE_STR(sd_img_gen_params->negative_prompt),
@@ -3304,6 +3537,8 @@ char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params) {
              BOOL_STR(sd_img_gen_params->vae_tiling_params.enabled),
              BOOL_STR(sd_img_gen_params->vae_tiling_params.temporal_tiling),
              SAFE_STR(sd_img_gen_params->vae_tiling_params.extra_tiling_args),
+             BOOL_STR(sd_img_gen_params->circular_x),
+             BOOL_STR(sd_img_gen_params->circular_y),
              BOOL_STR(sd_img_gen_params->hires.enabled),
              sd_hires_upscaler_name(sd_img_gen_params->hires.upscaler),
              SAFE_STR(sd_img_gen_params->hires.model_path),
@@ -3353,6 +3588,8 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->hires.upscale_tile_size               = 128;
     sd_vid_gen_params->hires.custom_sigmas                   = nullptr;
     sd_vid_gen_params->hires.custom_sigmas_count             = 0;
+    sd_vid_gen_params->circular_x                            = false;
+    sd_vid_gen_params->circular_y                            = false;
     sd_cache_params_init(&sd_vid_gen_params->cache);
 }
 
@@ -3609,6 +3846,8 @@ static float resolve_eta(sd_ctx_t* sd_ctx,
             case DPMPP2S_A_SAMPLE_METHOD:
             case ER_SDE_SAMPLE_METHOD:
             case EULER_A_CFG_PP_SAMPLE_METHOD:
+            case DPMPP2M_SDE_SAMPLE_METHOD:
+            case DPMPP2M_SDE_BT_SAMPLE_METHOD:
                 return 1.0f;
             default:;
         }
@@ -4298,6 +4537,25 @@ struct CircularAxesState {
     bool circular_y = false;
 };
 
+static void apply_circular_axes_to_diffusion(sd_ctx_t* sd_ctx, bool circular_x, bool circular_y) {
+    sd_ctx->sd->circular_x = circular_x;
+    sd_ctx->sd->circular_y = circular_y;
+    if (sd_ctx->sd->diffusion_model) {
+        sd_ctx->sd->diffusion_model->set_circular_axes(circular_x, circular_y);
+    }
+    if (sd_ctx->sd->high_noise_diffusion_model) {
+        sd_ctx->sd->high_noise_diffusion_model->set_circular_axes(circular_x, circular_y);
+    }
+    if (sd_ctx->sd->control_net) {
+        sd_ctx->sd->control_net->set_circular_axes(circular_x, circular_y);
+    }
+    if (circular_x || circular_y) {
+        LOG_INFO("Using circular padding for convolutions (x=%s, y=%s)",
+                 circular_x ? "true" : "false",
+                 circular_y ? "true" : "false");
+    }
+}
+
 static CircularAxesState configure_image_vae_axes(sd_ctx_t* sd_ctx,
                                                   const sd_img_gen_params_t* sd_img_gen_params,
                                                   const GenerationRequest& request) {
@@ -4408,13 +4666,56 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
         LOG_INFO("IMG2IMG");
 
         if (request->strength < 1.f) {
-            size_t t_enc = static_cast<size_t>(plan->sample_steps * request->strength);
-            if (t_enc == static_cast<size_t>(plan->sample_steps)) {
-                t_enc--;
+            bool strength_as_noise_level = false;
+            bool force_first_sigma       = false;
+            for (const auto& [key, value] : parse_key_value_args(sd_img_gen_params->sample_params.extra_sample_args, "img2img arg")) {
+                if (key == "strength_as_noise_level") {
+                    if (!parse_strict_bool(value, strength_as_noise_level)) {
+                        LOG_WARN("ignoring invalid img2img sample arg '%s=%s'", key.c_str(), value.c_str());
+                    }
+                } else if (key == "force_first_sigma") {
+                    if (!parse_strict_bool(value, force_first_sigma)) {
+                        LOG_WARN("ignoring invalid img2img sample arg '%s=%s'", key.c_str(), value.c_str());
+                    }
+                }
+            }
+
+            size_t t_enc;
+            float target_sigma = -1;
+            if (!strength_as_noise_level) {
+                t_enc = static_cast<size_t>(plan->sample_steps * request->strength);
+                if (t_enc == static_cast<size_t>(plan->sample_steps)) {
+                    t_enc--;
+                }
+            } else {
+                LOG_DEBUG("Interpreting denoise strength as relative noise level");
+                // assume x_noised = K * (x * (1-noise_level) + noise * noise_level) = K * lerp(x, noise, noise_level)
+                // K = 1, noise_level = sigma for flow models
+                // K = 1+sigma, noise_level=sigma/(1+sigma) for diffusion models
+                float target_noise_level = request->strength;
+                target_sigma             = sd_ctx->sd->denoiser->noise_level_to_sigma(target_noise_level);
+                size_t start_index       = 0;
+                for (size_t i = 0; i < plan->sigmas.size(); ++i) {
+                    if (plan->sigmas[i] <= target_sigma) {
+                        start_index = i;
+                        break;
+                    }
+                }
+
+                if (start_index >= plan->sigmas.size() - 1) {
+                    start_index = plan->sigmas.size() - 2;  // Leave at least 1 step
+                }
+                t_enc = plan->sample_steps - start_index - 1;
             }
             LOG_INFO("target t_enc is %zu steps", t_enc);
             std::vector<float> sigma_sched;
             sigma_sched.assign(plan->sigmas.begin() + plan->sample_steps - t_enc - 1, plan->sigmas.end());
+
+            if (target_sigma > 0 && force_first_sigma && strength_as_noise_level) {
+                LOG_DEBUG("force_first_sigma to %.4f (from %.4f)", target_sigma, sigma_sched[0]);
+                sigma_sched[0] = target_sigma;
+            }
+
             plan->sigmas       = std::move(sigma_sched);
             plan->sample_steps = static_cast<int>(plan->sigmas.size() - 1);
         }
@@ -5011,6 +5312,7 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
     sd_ctx->sd->sampler_rng->manual_seed(request.seed);
     sd_ctx->sd->set_flow_shift(sd_img_gen_params->sample_params.flow_shift);
     sd_ctx->sd->apply_loras(sd_img_gen_params->loras, sd_img_gen_params->lora_count);
+    apply_circular_axes_to_diffusion(sd_ctx, sd_img_gen_params->circular_x, sd_img_gen_params->circular_y);
 
     ImageVaeAxesGuard axes_guard(sd_ctx, sd_img_gen_params, request);
 
@@ -5900,6 +6202,7 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
     }
     int64_t t0                    = ggml_time_ms();
     sd_ctx->sd->vae_tiling_params = sd_vid_gen_params->vae_tiling_params;
+    apply_circular_axes_to_diffusion(sd_ctx, sd_vid_gen_params->circular_x, sd_vid_gen_params->circular_y);
     GenerationRequest request(sd_ctx, sd_vid_gen_params);
     bool has_input_audio = sd_vid_gen_params->input_audio != nullptr &&
                            sd_vid_gen_params->input_audio->data != nullptr &&
@@ -6325,10 +6628,6 @@ namespace kcpp_sd {
         res.vae_scale_factor = ctx->sd->get_vae_scale_factor();
         res.spatial_multiple = get_spatial_multiple(ctx);
         return res;
-    }
-
-    void SetCircularAxesAll(sd_ctx_t* ctx, bool circular_x, bool circular_y) {
-        ctx->sd->SetCircularAxesAll(circular_x, circular_y);
     }
 
     void set_lora_cache(sd_ctx_t *ctx, bool enable) {

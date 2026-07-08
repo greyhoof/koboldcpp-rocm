@@ -444,6 +444,12 @@ ArgOptions SDContextParams::get_options() {
          (int)',',
          &tensor_type_rules},
         {"",
+         "--model-args",
+         "extra model args, key=value list. Supports chroma_use_dit_mask, chroma_use_t5_mask, "
+         "chroma_t5_mask_pad, qwen_image_zero_cond_t",
+         (int)',',
+         &model_args},
+        {"",
          "--photo-maker",
          "path to PHOTOMAKER model",
          0,
@@ -469,6 +475,13 @@ ArgOptions SDContextParams::get_options() {
          (int)',',
          &params_backend},
         {"",
+         "--split-mode",
+         "weight distribution for modules assigned multiple devices (--backend \"diffusion=cuda0&cuda1\"): "
+         "layer (whole transformer blocks per device, default) or row (matmul rows split across devices, CUDA only). "
+         "Accepts a single mode or per-module assignments, e.g. row or diffusion=row,te=layer",
+         (int)',',
+         &split_mode},
+        {"",
          "--rpc-servers",
          "comma-separated list of RPC servers to connect to for offloading, in the format host:port, e.g. localhost:50052,192.168.1.3:50052",
          (int)',',
@@ -486,10 +499,6 @@ ArgOptions SDContextParams::get_options() {
          "number of threads to use during computation (default: -1). "
          "If threads <= 0, then threads will be set to the number of CPU physical cores",
          &n_threads},
-        {"",
-         "--chroma-t5-mask-pad",
-         "t5 mask pad size of chroma",
-         &chroma_t5_mask_pad},
     };
 
     options.bool_options = {
@@ -501,6 +510,12 @@ ArgOptions SDContextParams::get_options() {
          "--eager-load",
          "load all params into the params backend at model-load time instead of lazily on first use (defaults to false)",
          true, &eager_load},
+        {"",
+         "--auto-fit",
+         "pick the diffusion/te/vae device placements automatically from the model size and the per-device "
+         "memory budgets (--max-vram; defaults to free memory minus a small margin). Overrides --backend and "
+         "--params-backend; may split modules across GPUs (--split-mode still selects layer or row)",
+         true, &auto_fit},
         {"",
          "--force-sdxl-vae-conv-scale",
          "force use of conv scale on sdxl vae",
@@ -541,30 +556,6 @@ ArgOptions SDContextParams::get_options() {
          "--vae-conv-direct",
          "use ggml_conv2d_direct in the vae model",
          true, &vae_conv_direct},
-        {"",
-         "--circular",
-         "enable circular padding for convolutions",
-         true, &circular},
-        {"",
-         "--circularx",
-         "enable circular RoPE wrapping on x-axis (width) only",
-         true, &circular_x},
-        {"",
-         "--circulary",
-         "enable circular RoPE wrapping on y-axis (height) only",
-         true, &circular_y},
-        {"",
-         "--chroma-disable-dit-mask",
-         "disable dit mask for chroma",
-         false, &chroma_use_dit_mask},
-        {"",
-         "--qwen-image-zero-cond-t",
-         "enable zero_cond_t for qwen image",
-         true, &qwen_image_zero_cond_t},
-        {"",
-         "--chroma-enable-t5-mask",
-         "enable t5 mask for chroma",
-         true, &chroma_use_t5_mask},
     };
 
     auto on_type_arg = [&](int argc, const char** argv, int index) {
@@ -663,6 +654,18 @@ ArgOptions SDContextParams::get_options() {
          "but it usually offers faster inference speed and, in some cases, lower memory usage. "
          "The at_runtime mode, on the other hand, is exactly the opposite.",
          on_lora_apply_mode_arg},
+        {"",
+         "--list-devices",
+         "list available ggml backend devices (one 'name<TAB>description' per line) and exit; "
+         "the names are the device names accepted by --backend and --params-backend",
+         [](int /*argc*/, const char** /*argv*/, int /*index*/) {
+             size_t device_list_size = sd_list_devices(nullptr, 0);
+             std::vector<char> devices(device_list_size + 1);
+             sd_list_devices(devices.data(), devices.size());
+             fputs(devices.data(), stdout);
+             std::exit(0);
+             return 0;
+         }},
     };
 
     return options;
@@ -818,6 +821,9 @@ std::string SDContextParams::to_string() const {
         << "  eager_load: " << (eager_load ? "true" : "false") << ",\n"
         << "  backend: \"" << backend << "\",\n"
         << "  params_backend: \"" << params_backend << "\",\n"
+        << "  split_mode: \"" << split_mode << "\",\n"
+        << "  model_args: \"" << model_args << "\",\n"
+        << "  auto_fit: " << (auto_fit ? "true" : "false") << ",\n"
         << "  enable_mmap: " << (enable_mmap ? "true" : "false") << ",\n"
         << "  control_net_cpu: " << (control_net_cpu ? "true" : "false") << ",\n"
         << "  clip_on_cpu: " << (clip_on_cpu ? "true" : "false") << ",\n"
@@ -826,13 +832,6 @@ std::string SDContextParams::to_string() const {
         << "  diffusion_flash_attn: " << (diffusion_flash_attn ? "true" : "false") << ",\n"
         << "  diffusion_conv_direct: " << (diffusion_conv_direct ? "true" : "false") << ",\n"
         << "  vae_conv_direct: " << (vae_conv_direct ? "true" : "false") << ",\n"
-        << "  circular: " << (circular ? "true" : "false") << ",\n"
-        << "  circular_x: " << (circular_x ? "true" : "false") << ",\n"
-        << "  circular_y: " << (circular_y ? "true" : "false") << ",\n"
-        << "  chroma_use_dit_mask: " << (chroma_use_dit_mask ? "true" : "false") << ",\n"
-        << "  qwen_image_zero_cond_t: " << (qwen_image_zero_cond_t ? "true" : "false") << ",\n"
-        << "  chroma_use_t5_mask: " << (chroma_use_t5_mask ? "true" : "false") << ",\n"
-        << "  chroma_t5_mask_pad: " << chroma_t5_mask_pad << ",\n"
         << "  prediction: " << sd_prediction_name(prediction) << ",\n"
         << "  lora_apply_mode: " << sd_lora_apply_mode_name(lora_apply_mode) << ",\n"
         << "  force_sdxl_vae_conv_scale: " << (force_sdxl_vae_conv_scale ? "true" : "false") << "\n"
@@ -885,20 +884,17 @@ sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool taesd_preview) {
     sd_ctx_params.tae_preview_only                = taesd_preview;
     sd_ctx_params.diffusion_conv_direct           = diffusion_conv_direct;
     sd_ctx_params.vae_conv_direct                 = vae_conv_direct;
-    sd_ctx_params.circular_x                      = circular || circular_x;
-    sd_ctx_params.circular_y                      = circular || circular_y;
     sd_ctx_params.force_sdxl_vae_conv_scale       = force_sdxl_vae_conv_scale;
-    sd_ctx_params.chroma_use_dit_mask             = chroma_use_dit_mask;
-    sd_ctx_params.chroma_use_t5_mask              = chroma_use_t5_mask;
-    sd_ctx_params.chroma_t5_mask_pad              = chroma_t5_mask_pad;
-    sd_ctx_params.qwen_image_zero_cond_t          = qwen_image_zero_cond_t;
     sd_ctx_params.vae_format                      = str_to_vae_format(vae_format);
     sd_ctx_params.max_vram                        = max_vram.c_str();
     sd_ctx_params.stream_layers                   = stream_layers;
     sd_ctx_params.eager_load                      = eager_load;
     sd_ctx_params.backend                         = effective_backend.c_str();
     sd_ctx_params.params_backend                  = effective_params_backend.c_str();
+    sd_ctx_params.split_mode                      = split_mode.c_str();
+    sd_ctx_params.auto_fit                        = auto_fit;
     sd_ctx_params.rpc_servers                     = rpc_servers.c_str();
+    sd_ctx_params.model_args                      = model_args.empty() ? nullptr : model_args.c_str();
     return sd_ctx_params;
 }
 
@@ -1077,7 +1073,7 @@ ArgOptions SDGenerationParams::get_options() {
          &sample_params.guidance.slg.layer_end},
         {"",
          "--eta",
-         "noise multiplier (default: 0 for ddim_trailing, tcd, res_multistep and res_2s; 1 for euler_a, er_sde and dpm++2s_a)",
+         "noise multiplier (default: 0 for ddim_trailing, tcd, res_multistep and res_2s; 1 for euler_a, er_sde, dpm++2s_a, dpm++2m_sde and dpm++2m_sde_bt)",
          &sample_params.eta},
         {"",
          "--flow-shift",
@@ -1109,7 +1105,7 @@ ArgOptions SDGenerationParams::get_options() {
          &high_noise_sample_params.guidance.slg.layer_end},
         {"",
          "--high-noise-eta",
-         "(high noise) noise multiplier (default: 0 for ddim_trailing, tcd, res_multistep and res_2s; 1 for euler_a, er_sde and dpm++2s_a)",
+         "(high noise) noise multiplier (default: 0 for ddim_trailing, tcd, res_multistep and res_2s; 1 for euler_a, er_sde, dpm++2s_a, dpm++2m_sde and dpm++2m_sde_bt)",
          &high_noise_sample_params.eta},
         {"",
          "--strength",
@@ -1160,6 +1156,18 @@ ArgOptions SDGenerationParams::get_options() {
          "disable auto resize of ref images",
          false,
          &auto_resize_ref_image},
+        {"",
+         "--circular",
+         "enable circular padding on both axes for tileable output",
+         true, &circular},
+        {"",
+         "--circularx",
+         "enable circular padding on x-axis (width) only",
+         true, &circular_x},
+        {"",
+         "--circulary",
+         "enable circular padding on y-axis (height) only",
+         true, &circular_y},
         {"",
          "--disable-image-metadata",
          "do not embed generation metadata on image files",
@@ -1480,12 +1488,12 @@ ArgOptions SDGenerationParams::get_options() {
          on_seed_arg},
         {"",
          "--sampling-method",
-         "sampling method, one of [euler, euler_a, heun, dpm2, dpm++2s_a, dpm++2m, dpm++2mv2, ipndm, ipndm_v, lcm, ddim_trailing, tcd, res_multistep, res_2s, er_sde, euler_cfg_pp, euler_a_cfg_pp]"
+         "sampling method, one of [euler, euler_a, heun, dpm2, dpm++2s_a, dpm++2m, dpm++2mv2, dpm++2m_sde, dpm++2m_sde_bt, ipndm, ipndm_v, lcm, ddim_trailing, tcd, res_multistep, res_2s, er_sde, euler_cfg_pp, euler_a_cfg_pp]"
          "(default: euler for Flux/SD3/Wan, euler_a otherwise)",
          on_sample_method_arg},
         {"",
          "--high-noise-sampling-method",
-         "(high noise) sampling method, one of [euler, euler_a, heun, dpm2, dpm++2s_a, dpm++2m, dpm++2mv2, ipndm, ipndm_v, lcm, ddim_trailing, tcd, res_multistep, res_2s, er_sde, euler_cfg_pp, euler_a_cfg_pp]"
+         "(high noise) sampling method, one of [euler, euler_a, heun, dpm2, dpm++2s_a, dpm++2m, dpm++2mv2, dpm++2m_sde, dpm++2m_sde_bt, ipndm, ipndm_v, lcm, ddim_trailing, tcd, res_multistep, res_2s, er_sde, euler_cfg_pp, euler_a_cfg_pp]"
          " default: euler for Flux/SD3/Wan, euler_a otherwise",
          on_high_noise_sample_method_arg},
         {"",
@@ -2446,6 +2454,8 @@ sd_img_gen_params_t SDGenerationParams::to_sd_img_gen_params_t() {
     params.hires.upscale_tile_size   = hires_upscale_tile_size;
     params.hires.custom_sigmas       = hires_custom_sigmas.empty() ? nullptr : hires_custom_sigmas.data();
     params.hires.custom_sigmas_count = static_cast<int>(hires_custom_sigmas.size());
+    params.circular_x                = circular || circular_x;
+    params.circular_y                = circular || circular_y;
     return params;
 }
 
@@ -2511,6 +2521,8 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.hires.upscale_tile_size   = hires_upscale_tile_size;
     params.hires.custom_sigmas       = hires_custom_sigmas.empty() ? nullptr : hires_custom_sigmas.data();
     params.hires.custom_sigmas_count = static_cast<int>(hires_custom_sigmas.size());
+    params.circular_x                = circular || circular_x;
+    params.circular_y                = circular || circular_y;
     return params;
 }
 
