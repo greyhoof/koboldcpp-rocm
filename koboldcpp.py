@@ -2500,7 +2500,7 @@ def sd_get_device_override(deviceid, module=''):
         result = module + '=' + device_name
     else:
         result = device_name
-    return result;
+    return result
 
 def sd_load_model(model_filename,vae_filename,t5xxl_filename,clip1_filename,clip2_filename,photomaker_filename,upscaler_filename,audio_vae_filename):
     global args
