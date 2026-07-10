@@ -3120,7 +3120,7 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io) {
-    LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
+    LLAMA_LOG_DEBUG("\n%s: writing state\n", __func__);
 
     // write model info
     {
