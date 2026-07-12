@@ -7942,7 +7942,8 @@ def splitmode_choices_to_int(value): #layer=1, row=2, tensor=3
     if value=='layer':
         return 1
     elif value=='row':
-        return 2
+        print("!!!\nWARNING: split mode row was removed! Using tensor split instead!\n!!!")
+        return 3
     elif value=='tensor':
         return 3
     return 1
