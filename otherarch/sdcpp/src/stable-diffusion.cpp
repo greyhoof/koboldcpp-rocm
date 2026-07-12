@@ -666,10 +666,10 @@ public:
 
         // begin kcpp replacements
         SDVersion tempver = model_loader.get_sd_version();
+        bool fallback_swapped = false;
 
         // kcpp fallback to separate diffusion model passed as model
-        if (tempver == VERSION_COUNT &&
-        strlen(SAFE_STR(sd_ctx_params->model_path)) > 0 &&
+        if (strlen(SAFE_STR(sd_ctx_params->model_path)) > 0 &&
         strlen(SAFE_STR(sd_ctx_params->diffusion_model_path)) == 0 &&
         (t5_path_fixed!=""||clipl_path_fixed!=""))
         {
@@ -680,11 +680,12 @@ public:
                 if (!model_loader.init_from_file(sd_ctx_params->model_path, "model.diffusion_model.")) {
                     LOG_WARN("loading diffusion model from '%s' failed", sd_ctx_params->model_path);
                 }
+                fallback_swapped = true;
                 tempver = model_loader.get_sd_version();
             }
         }
 
-        if (tempver == VERSION_ANIMA &&
+        if (tempver == VERSION_ANIMA && !fallback_swapped &&
             strlen(SAFE_STR(sd_ctx_params->model_path)) > 0 &&
             strlen(SAFE_STR(sd_ctx_params->diffusion_model_path)) == 0 &&
             !model_loader.has_diffusion_model_tensors()
