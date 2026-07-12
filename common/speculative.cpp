@@ -25,7 +25,7 @@
 #define SPC_ERR(fmt, ...) LOG_ERR("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
 
-#define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
+#define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  256
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
