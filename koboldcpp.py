@@ -3023,6 +3023,7 @@ def tts_generate(genparams):
     speaker_json = tts_prepare_voice_json(genparams.get("speaker_json","")) #handle custom json voices
     voicestr = genparams.get("voice", genparams.get("speaker_wav", ""))
     oai_voicemap = ["alloy","onyx","echo","nova","shimmer"] # map to kcpp defaults
+    q3tts_voicemap = ["aiden","serena","ono_anna","ryan","sohee","eric","dylan","vivian","uncle_fu"]
     voice_mapping = voicelist
     normalized_voice = voicestr.strip().lower() if voicestr else ""
     if normalized_voice.endswith(".wav"):
@@ -3031,6 +3032,8 @@ def tts_generate(genparams):
         voice = voice_mapping.index(normalized_voice) + 1
     elif normalized_voice in oai_voicemap:
         voice = oai_voicemap.index(normalized_voice) + 1
+    elif normalized_voice in q3tts_voicemap:
+        voice = q3tts_voicemap.index(normalized_voice) + 1
     else:
         voice = simple_lcg_hash(voicestr.strip()) if voicestr else 1
     inputs = tts_generation_inputs()

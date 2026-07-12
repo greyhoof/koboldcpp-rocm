@@ -1181,9 +1181,10 @@ static tts_generation_outputs ttstype_generate_qwen3tts(const tts_generation_inp
         std::string speaker_instruction = inputs.speaker_instruction;
 
         int speakerID = inputs.speaker_seed;
+        //{"aiden":2861, "dylan":2878, "eric":2875, "ono_anna":2873,"ryan":3061, "serena":3066, "sohee":2864, "uncle_fu":3010, "vivian":3065}
         int speakermap[] = {2861,3066,2873,3061,2864,2875,2878,3065,3010};
 
-        if (speakerID > 0 && speakerID <= 5) {
+        if (speakerID > 0 && speakerID <= 9) {
             speakerID = speakermap[speakerID-1];
         } else {
             speakerID = -1;
