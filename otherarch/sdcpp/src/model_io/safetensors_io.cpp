@@ -11,6 +11,7 @@
 #include "binary_io.h"
 #include "core/util.h"
 #include "json.hpp"
+#include "kcpp_sdcpp_quantized_safetensors.hpp"
 
 static constexpr size_t ST_HEADER_SIZE_LEN = 8;
 
@@ -77,6 +78,8 @@ static ggml_type safetensors_dtype_to_ggml_type(const std::string& dtype) {
         ttype = GGML_TYPE_F16;
     } else if (dtype == "F8_E5M2") {
         ttype = GGML_TYPE_F16;
+    } else if (dtype == "I8") {
+        ttype = GGML_TYPE_F16;
     } else if (dtype == "I32") {
         ttype = GGML_TYPE_I32;
     } else if (dtype == "I64") {
@@ -139,12 +142,17 @@ bool read_safetensors_file(const std::string& file_path,
     }
 
     tensor_storages.clear();
+    auto quant_layers = kcpp_safetensors_quant::read_quantization_metadata(header_);
     for (auto& item : header_.items()) {
         std::string name           = item.key();
         nlohmann::json tensor_info = item.value();
         // LOG_DEBUG("%s %s\n", name.c_str(), tensor_info.dump().c_str());
 
         if (name == "__metadata__") {
+            continue;
+        }
+
+        if (kcpp_safetensors_quant::should_skip_side_tensor(name, quant_layers)) {
             continue;
         }
 
@@ -198,7 +206,19 @@ bool read_safetensors_file(const std::string& file_path,
         size_t tensor_data_size = end - begin;
 
         bool tensor_size_ok;
-        if (dtype == "F8_E4M3") {
+        if (dtype == "I8") {
+            if (!kcpp_safetensors_quant::fill_i8_tensorwise_storage(header_,
+                                                                    quant_layers,
+                                                                    name,
+                                                                    data_start,
+                                                                    file_size_,
+                                                                    tensor_data_size,
+                                                                    tensor_storage,
+                                                                    error)) {
+                return false;
+            }
+            tensor_size_ok = true;
+        } else if (dtype == "F8_E4M3") {
             tensor_storage.is_f8_e4m3 = true;
             // f8 -> f16
             tensor_size_ok = (tensor_storage.nbytes() == tensor_data_size * 2);
