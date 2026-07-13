@@ -11,7 +11,7 @@
 #include "binary_io.h"
 #include "core/util.h"
 #include "json.hpp"
-#include "kcpp_sdcpp_quantized_safetensors.hpp"
+#include "model_io/kcpp_sdcpp_quantized_safetensors.hpp"
 
 static constexpr size_t ST_HEADER_SIZE_LEN = 8;
 

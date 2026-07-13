@@ -16,7 +16,7 @@
 
 #include "core/util.h"
 #include "model_io/gguf_io.h"
-#include "kcpp_sdcpp_quantized_safetensors.hpp"
+#include "model_io/kcpp_sdcpp_quantized_safetensors.hpp"
 #include "model_io/safetensors_io.h"
 #include "model_io/torch_legacy_io.h"
 #include "model_io/torch_zip_io.h"
