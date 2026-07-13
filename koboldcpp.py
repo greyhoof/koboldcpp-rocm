@@ -5874,7 +5874,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 if exceptional:
                     return True
                 if readable:
-                    data = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+                    dontwait = getattr(socket, "MSG_DONTWAIT", 0)
+                    data = sock.recv(1, socket.MSG_PEEK | dontwait)
                     if len(data) == 0:
                         return True
                 return False
@@ -5924,16 +5925,20 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
     async def handle_image_request(self, generate_fn, param, cancel_fn):
         monitor_task = None
         try:
-            monitor_task = asyncio.create_task(self.monitor_connection(cancel_fn))
-            result = await asyncio.to_thread(generate_fn, param)
+            if cancel_fn:
+                monitor_task = asyncio.create_task(self.monitor_connection(cancel_fn))
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, generate_fn, param)
             return result
         except (BrokenPipeError, ConnectionAbortedError) as cae: # attempt to abort if connection lost
             print("An ongoing connection was aborted or interrupted!")
             print(cae)
-            cancel_fn()
+            if cancel_fn:
+                cancel_fn()
             await asyncio.sleep(0.1) #short delay
         except Exception as e:
             print(e)
+            raise
         finally:
             if monitor_task and not monitor_task.done():
                 monitor_task.cancel()
