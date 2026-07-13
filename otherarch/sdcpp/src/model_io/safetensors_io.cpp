@@ -152,7 +152,7 @@ bool read_safetensors_file(const std::string& file_path,
             continue;
         }
 
-        if (kcpp_safetensors_quant::should_skip_side_tensor(name, quant_layers)) {
+        if (kcpp_safetensors_quant::should_skip_side_tensor(header_, name, quant_layers)) {
             continue;
         }
 
@@ -208,6 +208,7 @@ bool read_safetensors_file(const std::string& file_path,
         bool tensor_size_ok;
         if (dtype == "I8") {
             if (!kcpp_safetensors_quant::fill_i8_tensorwise_storage(header_,
+                                                                    file,
                                                                     quant_layers,
                                                                     name,
                                                                     data_start,
