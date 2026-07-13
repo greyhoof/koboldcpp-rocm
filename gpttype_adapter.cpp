@@ -869,6 +869,7 @@ static bool speculative_state_setup(llama_context * main_ctx, const llama_contex
     }
     catch(const std::exception & e)
     {
+        common_log_flush(common_log_main());
         printf("Error: failed to initialize speculative decoding state: %s\n", e.what());
         llama_free(draft_ctx);
         draft_ctx = nullptr;
@@ -878,6 +879,7 @@ static bool speculative_state_setup(llama_context * main_ctx, const llama_contex
 
     if(draft_spec == nullptr)
     {
+        common_log_flush(common_log_main());
         printf("Error: failed to initialize speculative decoding state.\n");
         llama_free(draft_ctx);
         draft_ctx = nullptr;
@@ -992,7 +994,7 @@ static void speculative_decoding_setup(std::string spec_model_filename, llama_co
         {
             if(debugmode==1)
             {
-                printf("WARNING: Draft model vocab of (%d) does not match base vocab of (%d).\nIn debug mode, this restriction is bypassed. However, speculative decoding may malfunction!\n",draftvocab,base_n_vocab);
+                printf("WARNING: Draft model vocab of (%d) does not match base vocab of (%d).\n",draftvocab,base_n_vocab);
             }
             else
             {
@@ -3482,6 +3484,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             if(!dospam)
             {
                 llama_log_set(currlogger, curruserdat);
+                common_log_set_verbosity_thold(oldverbosity);
             }
             printf("Autofit Success: %d, Autofit Result: ",success);
             print_fitted_params(model_params,llama_ctx_params);
@@ -3489,7 +3492,6 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             {
                 //revert to previous
                 model_params.n_gpu_layers = inputs.gpulayers;
-                common_log_set_verbosity_thold(oldverbosity);
             }
         }
 
