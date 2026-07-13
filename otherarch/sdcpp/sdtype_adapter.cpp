@@ -953,7 +953,7 @@ static sd_audio_t load_audio_from_b64(const std::string& b64audio) {
 
 bool supports_reference_images(kcpp_sd::model_info info)
 {
-    bool supported = (info.is_wan || info.is_ltx || info.supports_ref_image || info.is_kontext || photomaker_enabled);
+    bool supported = (info.is_wan || info.is_ltx || info.supports_ref_image || info.is_kontext || photomaker_enabled) && !info.is_zimage;
     return supported;
 }
 
