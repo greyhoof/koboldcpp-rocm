@@ -183,7 +183,7 @@ namespace Qwen {
             auto to_v     = std::dynamic_pointer_cast<Linear>(blocks["to_v"]);
             auto to_out_0 = std::dynamic_pointer_cast<Linear>(blocks["to_out.0"]);
 
-            if (sd_backend_is(ctx->backend, "Vulkan")) {
+            if (sd_backend_is(ctx->backend, "Vulkan") || sd_backend_is(ctx->backend, "ROCm")) {
                 to_out_0->set_force_prec_f32(true);
             }
 
@@ -517,7 +517,7 @@ namespace Qwen {
                 if (input->ne[3] == 1) {
                     input = ggml_reshape_4d(ctx->ggml_ctx, input, input->ne[0], input->ne[1], 1, input->ne[2]);
                 }
-                return DiT::patchify(ctx->ggml_ctx, input, 1, config.patch_size, config.patch_size, N);
+                return DiT::patchify_3d(ctx->ggml_ctx, input, 1, config.patch_size, config.patch_size, N);
             };
 
             auto img           = patchify_input(x);

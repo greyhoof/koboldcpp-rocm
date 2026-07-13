@@ -34,6 +34,7 @@
 #include "model/diffusion/ideogram4.hpp"
 #include "model/diffusion/krea2.hpp"
 #include "model/diffusion/lens.hpp"
+#include "model/diffusion/lingbot_video.hpp"
 #include "model/diffusion/ltxv.hpp"
 #include "model/diffusion/minit2i.hpp"
 #include "model/diffusion/mmdit.hpp"
@@ -89,6 +90,7 @@ const char* model_version_to_str[] = {
     "Wan 2.x",
     "Wan 2.2 I2V",
     "Wan 2.2 TI2V",
+    "LingBot Video",
     "Qwen Image",
     "Qwen Image Layered",
     "Anima",
@@ -226,8 +228,12 @@ public:
     std::string split_mode_spec;
     bool auto_fit_enabled = false;
 
+    bool diffusion_conv_direct = false;
+
     bool is_using_v_parameterization     = false;
     bool is_using_edm_v_parameterization = false;
+
+    size_t control_net_params_mem_size = 0;
 
     std::shared_ptr<ModelManager> model_manager;
 
@@ -496,6 +502,76 @@ public:
                                                      params_mem_size,
                                                      false,
                                                      params_follow_runtime);
+    }
+
+    bool unload_control_net() {
+        if (control_net == nullptr) {
+            return true;
+        }
+        if (model_manager != nullptr) {
+            if (!model_manager->unregister_param_tensors("ControlNet", &control_net_params_mem_size)) {
+                return false;
+            }
+        }
+        control_net.reset();
+        control_net_params_mem_size = 0;
+        return true;
+    }
+
+    bool load_control_net_from_file(const std::string& path) {
+        if (path.empty()) {
+            LOG_ERROR("sd_ctx_load_control_net: empty path");
+            return false;
+        }
+        if (model_manager == nullptr) {
+            LOG_ERROR("sd_ctx_load_control_net: model_manager not initialized");
+            return false;
+        }
+
+        if (!unload_control_net()) {
+            return false;
+        }
+
+        ModelLoader& shared_loader = model_manager->loader();
+        if (!shared_loader.init_from_file(path)) {
+            LOG_ERROR("sd_ctx_load_control_net: failed to load '%s'", path.c_str());
+            return false;
+        }
+        shared_loader.convert_tensors_name();
+
+        if (!ensure_backend_pair(SDBackendModule::CONTROL_NET)) {
+            LOG_ERROR("sd_ctx_load_control_net: control_net backend unavailable");
+            return false;
+        }
+
+        control_net = std::make_shared<ControlNet>(backend_for(SDBackendModule::CONTROL_NET),
+                                                   params_backend_for(SDBackendModule::CONTROL_NET),
+                                                   shared_loader.get_tensor_storage_map(),
+                                                   version,
+                                                   "",
+                                                   model_manager);
+        if (diffusion_conv_direct) {
+            LOG_INFO("Using Conv2d direct in the control net");
+            control_net->set_conv2d_direct_enabled(true);
+        }
+        if (!register_runner_params("ControlNet",
+                                    control_net,
+                                    SDBackendModule::CONTROL_NET,
+                                    &control_net_params_mem_size)) {
+            LOG_ERROR("sd_ctx_load_control_net: register_runner_params failed");
+            control_net.reset();
+            control_net_params_mem_size = 0;
+            return false;
+        }
+        if (!model_manager->validate_registered_tensors()) {
+            LOG_ERROR("sd_ctx_load_control_net: registered tensors validation failed");
+            unload_control_net();
+            return false;
+        }
+        LOG_INFO("sd_ctx_load_control_net: loaded '%s' (%.2f MB)",
+                 path.c_str(),
+                 control_net_params_mem_size / 1024.0 / 1024.0);
+        return true;
     }
 
     bool init_backend() {
@@ -1102,10 +1178,12 @@ public:
         model_loader.process_model_files(enable_mmap, needs_writable_mmap);
         load_alphas_cumprod(model_loader);
 
+        diffusion_conv_direct = sd_ctx_params->diffusion_conv_direct;
+
         size_t text_encoder_params_mem_size = 0;
         size_t unet_params_mem_size         = 0;
         size_t vae_params_mem_size          = 0;
-        size_t control_net_params_mem_size  = 0;
+        control_net_params_mem_size         = 0;
         size_t extension_params_mem_size    = 0;
 
         bool tae_preview_only = sd_ctx_params->tae_preview_only;
@@ -1155,7 +1233,7 @@ public:
                                                                  tensor_storage_map,
                                                                  version,
                                                                  "",
-                                                                 false,
+                                                                 true,
                                                                  model_manager);
                 diffusion_model  = std::make_shared<Krea2::Krea2Runner>(backend_for(SDBackendModule::DIFFUSION),
                                                                        tensor_storage_map,
@@ -1254,6 +1332,25 @@ public:
                         return false;
                     }
                 }
+            } else if (sd_version_is_lingbot_video(version)) {
+                bool enable_vision = false;
+                for (const auto& [name, _] : tensor_storage_map) {
+                    if (starts_with(name, "text_encoders.llm.visual.")) {
+                        enable_vision = true;
+                        break;
+                    }
+                }
+                cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
+                                                                 tensor_storage_map,
+                                                                 version,
+                                                                 "",
+                                                                 enable_vision,
+                                                                 model_manager);
+                diffusion_model  = std::make_shared<LingBotVideo::LingBotVideoRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                                     tensor_storage_map,
+                                                                                     "model.diffusion_model",
+                                                                                     model_manager,
+                                                                                     sd_ctx_params->model_args);
             } else if (sd_version_is_qwen_image(version)) {
                 bool enable_vision = version != VERSION_QWEN_IMAGE_LAYERED;
                 cond_stage_model   = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
@@ -1753,6 +1850,7 @@ public:
                     }
                 } else if (sd_version_is_sd3(version) ||
                            sd_version_is_wan(version) ||
+                           sd_version_is_lingbot_video(version) ||
                            sd_version_is_qwen_image(version) ||
                            version == VERSION_HIDREAM_O1 ||
                            sd_version_is_anima(version) ||
@@ -2601,7 +2699,7 @@ public:
             sd::Tensor<float> timesteps_tensor({static_cast<int64_t>(timesteps_vec.size())}, timesteps_vec);
             sd::Tensor<float> guidance_tensor({1}, std::vector<float>{guidance.distilled_guidance});
             sd::Tensor<float> noised_input = x * c_in;
-            if (!denoise_mask.empty() && (version == VERSION_WAN2_2_TI2V || sd_version_is_ltxav(version))) {
+            if (!denoise_mask.empty() && (version == VERSION_WAN2_2_TI2V || sd_version_is_ltxav(version) || sd_version_is_lingbot_video(version))) {
                 noised_input = noised_input * denoise_mask + init_latent * (1.0f - denoise_mask);
             }
 
@@ -2847,7 +2945,7 @@ public:
     int get_diffusion_model_down_factor() {
         int down_factor = 8;  // unet
         if (sd_version_is_dit(version)) {
-            if (sd_version_is_wan(version)) {
+            if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version)) {
                 down_factor = 2;
             } else {
                 down_factor = 1;
@@ -2910,7 +3008,7 @@ public:
         int latent_frames = frames;
         if (sd_version_is_ltxav(version)) {
             latent_frames = ((frames - 1) / 8) + 1;
-        } else if (sd_version_is_wan(version)) {
+        } else if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version)) {
             latent_frames = ((frames - 1) / 4) + 1;
         }
         return latent_frames;
@@ -2923,7 +3021,7 @@ public:
         if (sd_version_is_ltxav(version)) {
             return (latent_frames - 1) * 8 + 1;
         }
-        if (sd_version_is_wan(version)) {
+        if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version)) {
             return (latent_frames - 1) * 4 + 1;
         }
         return latent_frames;
@@ -3599,7 +3697,7 @@ struct sd_ctx_t {
 };
 
 static bool sd_version_supports_video_generation(SDVersion version) {
-    return version == VERSION_SVD || sd_version_is_wan(version) || sd_version_is_ltxav(version);
+    return version == VERSION_SVD || sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_ltxav(version);
 }
 
 static bool sd_version_supports_image_generation(SDVersion version) {
@@ -3769,6 +3867,27 @@ SD_API bool sd_ctx_supports_video_generation(const sd_ctx_t* sd_ctx) {
         return false;
     }
     return sd_version_supports_video_generation(sd_ctx->sd->version);
+}
+
+SD_API bool sd_ctx_load_control_net(sd_ctx_t* sd_ctx, const char* path) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || path == nullptr) {
+        return false;
+    }
+    return sd_ctx->sd->load_control_net_from_file(path);
+}
+
+SD_API bool sd_ctx_unload_control_net(sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+    return sd_ctx->sd->unload_control_net();
+}
+
+SD_API bool sd_ctx_has_control_net(const sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+    return sd_ctx->sd->control_net != nullptr;
 }
 
 enum sample_method_t sd_get_default_sample_method(const sd_ctx_t* sd_ctx) {
@@ -5802,6 +5921,27 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
 
         int64_t t2 = ggml_time_ms();
         LOG_INFO("encode_first_stage completed, taking %" PRId64 " ms", t2 - t1);
+    } else if (sd_version_is_lingbot_video(sd_ctx->sd->version) && !start_image.empty()) {
+        LOG_INFO("LingBot Video IMG2VID");
+
+        int64_t t1             = ggml_time_ms();
+        auto init_img          = start_image.reshape({start_image.shape()[0], start_image.shape()[1], 1, start_image.shape()[2], 1});
+        auto init_image_latent = sd_ctx->sd->encode_first_stage(init_img);
+        if (init_image_latent.empty()) {
+            LOG_ERROR("failed to encode init video frame");
+            return std::nullopt;
+        }
+
+        latents.init_latent = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
+        sd::ops::slice_assign(&latents.init_latent, 2, 0, init_image_latent.shape()[2], init_image_latent);
+
+        latents.denoise_mask = sd::full<float>({latents.init_latent.shape()[0], latents.init_latent.shape()[1], latents.init_latent.shape()[2], 1, 1}, 1.f);
+        sd::ops::fill_slice(&latents.denoise_mask, 2, 0, init_image_latent.shape()[2], 0.0f);
+
+        latents.ref_images.push_back(start_image);
+
+        int64_t t2 = ggml_time_ms();
+        LOG_INFO("encode_first_stage completed, taking %" PRId64 " ms", t2 - t1);
     } else if (sd_ctx->sd->diffusion_model->get_desc() == "Wan2.1-VACE-1.3B" ||
                sd_ctx->sd->diffusion_model->get_desc() == "Wan2.x-VACE-14B") {
         LOG_INFO("VACE");
@@ -5912,6 +6052,7 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
     condition_params.clip_skip       = request.clip_skip;
     condition_params.text            = request.prompt;
     condition_params.zero_out_masked = true;
+    condition_params.ref_images      = &latents.ref_images;
 
     int64_t prepare_start_ms = ggml_time_ms();
     embeds.cond              = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
