@@ -10415,6 +10415,8 @@ def convert_invalid_args(args):
         dict["sdclip2"] = dict["sdclipg"]
     if "jinja_tools" in dict and dict["jinja_tools"]:
         dict["jinja"] = True
+    if "jinjathink" in dict and dict["jinjathink"] and dict["jinjathink"]!="default":
+        dict["jinja"] = True
     if "jinja_kwargs" in dict and dict["jinja_kwargs"]:
         dict["jinja"] = True
     if "sdgendefaults" in dict and "gendefaults" not in dict:
