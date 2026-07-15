@@ -95,6 +95,7 @@
 #include "models/hunyuan-dense.cpp"
 #include "models/hunyuan-moe.cpp"
 #include "models/hunyuan-vl.cpp"
+#include "models/hy-v3.cpp"
 #include "models/internlm2.cpp"
 #include "models/jais.cpp"
 #include "models/jais2.cpp"
@@ -400,6 +401,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_hunyuan_vl(params);
         case LLM_ARCH_HUNYUAN_DENSE:
             return new llama_model_hunyuan_dense(params);
+        case LLM_ARCH_HY_V3:
+            return new llama_model_hy_v3(params);
         case LLM_ARCH_SMOLLM3:
             return new llama_model_smollm3(params);
         case LLM_ARCH_OPENAI_MOE:
@@ -2307,7 +2310,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                     }
 
-                    if (arch == LLM_ARCH_STEP35 && hparams.n_layer_nextn > 0) {
+                    if ((arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_HY_V3) && hparams.n_layer_nextn > 0) {
                         if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                             filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                         } else {
@@ -2663,6 +2666,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_JAIS2:
         case LLM_ARCH_OPENAI_MOE:
         case LLM_ARCH_HUNYUAN_DENSE:
+        case LLM_ARCH_HY_V3:
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_SMALLTHINKER:
