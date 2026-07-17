@@ -6259,6 +6259,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     {
         bool triggersc = kcpp_data->use_smartcontext;
         bool triggerff = kcpp_data->use_fastforward;
+        std::vector<int> embd_inp_before_fastforward;
+        bool attempted_fastforward = false;
         if(!blank_prompt) //special case for blank prompts, no fast forward or shifts
         {
             int ff_swa_retain_amount = 0; //a hack for SWA to improve coherency for illegal rewinds
@@ -6283,6 +6285,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
             }
             if(triggerff)
             {
+                embd_inp_before_fastforward = embd_inp;
+                attempted_fastforward = true;
                 ContextFastForward(current_context_tokens, embd_inp, n_past, last_n_tokens, nctx, smartcontext, triggersc, false, 4, ff_swa_retain_amount);
             }
         }
@@ -6294,11 +6298,37 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
             }
             else
             {
-                llama_memory_seq_rm(llama_get_memory(llama_ctx_v4), 0, n_past, -1);
+                bool kv_trim_ok = llama_memory_seq_rm(llama_get_memory(llama_ctx_v4), 0, n_past, -1);
+                if(!kv_trim_ok && attempted_fastforward)
+                {
+                    llama_memory_clear(llama_get_memory(llama_ctx_v4),true);
+                    embd_inp = embd_inp_before_fastforward;
+                    n_past = 0;
+                    std::fill(last_n_tokens.begin(), last_n_tokens.end(), 0);
+                    if(debugmode==1 && !is_quiet)
+                    {
+                        printf("\nNote: KV cache could not be rewound for prompt reuse; reprocessing full prompt instead.\n");
+                    }
+                }
             }
             if(draft_ctx)
             {
-                llama_memory_seq_rm(llama_get_memory(draft_ctx), 0, n_past, -1);
+                if(n_past==0)
+                {
+                    llama_memory_clear(llama_get_memory(draft_ctx),true);
+                }
+                else if(!llama_memory_seq_rm(llama_get_memory(draft_ctx), 0, n_past, -1) && attempted_fastforward)
+                {
+                    llama_memory_clear(llama_get_memory(llama_ctx_v4),true);
+                    llama_memory_clear(llama_get_memory(draft_ctx),true);
+                    embd_inp = embd_inp_before_fastforward;
+                    n_past = 0;
+                    std::fill(last_n_tokens.begin(), last_n_tokens.end(), 0);
+                    if(debugmode==1 && !is_quiet)
+                    {
+                        printf("\nNote: Draft KV cache could not be rewound for prompt reuse; reprocessing full prompt instead.\n");
+                    }
+                }
             }
         }
     }
