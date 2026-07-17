@@ -10417,6 +10417,20 @@ def convert_invalid_args(args):
         dict["jinja"] = True
     if "jinjathink" in dict and dict["jinjathink"] and dict["jinjathink"]!="default":
         dict["jinja"] = True
+        jinja_kwargs = None
+        if "jinja_kwargs" in dict and dict["jinja_kwargs"]:
+            try:
+                if isinstance(dict["jinja_kwargs"], str):
+                    jinja_kwargs = json.loads(dict["jinja_kwargs"])
+                elif isinstance(dict["jinja_kwargs"], type({})):
+                    jinja_kwargs = dict["jinja_kwargs"]
+            except Exception:
+                jinja_kwargs = None
+        else:
+            jinja_kwargs = {}
+        if isinstance(jinja_kwargs, type({})):
+            jinja_kwargs["enable_thinking"] = dict["jinjathink"]=="true"
+            dict["jinja_kwargs"] = json.dumps(jinja_kwargs)
     if "jinja_kwargs" in dict and dict["jinja_kwargs"]:
         dict["jinja"] = True
     if "sdgendefaults" in dict and "gendefaults" not in dict:
