@@ -43,6 +43,7 @@ import gzip
 import queue
 
 # constants
+num_server_threads = 40
 sampler_order_max = 7
 tensor_split_max = 16
 images_max = 16
@@ -7725,7 +7726,7 @@ Change Mode<br>
         return super(KcppServerRequestHandler, self).end_headers()
 
 def RunServerMultiThreaded(addr, port, server_handler):
-    global exitcounter, sslvalid, global_memory
+    global exitcounter, sslvalid, global_memory, num_server_threads
     if is_port_in_use(port):
         print(f"Warning: Port {port} already appears to be in use by another program.")
 
@@ -7747,10 +7748,9 @@ def RunServerMultiThreaded(addr, port, server_handler):
         if ipv6_sock:
             ipv6_sock = context.wrap_socket(ipv6_sock, server_side=True)
 
-    numThreads = 24
     try:
         ipv4_sock.bind((addr, port))
-        ipv4_sock.listen(numThreads)
+        ipv4_sock.listen(num_server_threads)
     except Exception:
         ipv4_sock = None
         print("IPv4 Socket Failed to Bind.")
@@ -7758,7 +7758,7 @@ def RunServerMultiThreaded(addr, port, server_handler):
     if ipv6_sock:
         try:
             ipv6_sock.bind((addr, port))
-            ipv6_sock.listen(numThreads)
+            ipv6_sock.listen(num_server_threads)
         except Exception:
             ipv6_sock = None
             print("IPv6 Socket Failed to Bind. IPv6 will be unavailable.")
@@ -7776,7 +7776,7 @@ def RunServerMultiThreaded(addr, port, server_handler):
             with http.server.HTTPServer((addr, port), handler, False) as self.httpd:
                 try:
                     if ipv4_sock and ipv6_sock:
-                        self.httpd.socket = ipv4_sock if self.i < 16 else ipv6_sock
+                        self.httpd.socket = ipv4_sock if self.i < (num_server_threads/2) else ipv6_sock
                     elif ipv6_sock:
                         self.httpd.socket = ipv6_sock
                     elif ipv4_sock:
@@ -7801,7 +7801,7 @@ def RunServerMultiThreaded(addr, port, server_handler):
             self.httpd.server_close()
 
     threadArr = []
-    for i in range(numThreads):
+    for i in range(num_server_threads):
         threadArr.append(Thread(i))
     while 1:
         try:
@@ -7809,7 +7809,7 @@ def RunServerMultiThreaded(addr, port, server_handler):
         except (KeyboardInterrupt,SystemExit):
             global exitcounter
             exitcounter = 999
-            for i in range(numThreads):
+            for i in range(num_server_threads):
                 try:
                     threadArr[i].stop()
                 except Exception:
