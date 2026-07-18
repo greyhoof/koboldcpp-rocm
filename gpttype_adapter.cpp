@@ -4258,12 +4258,17 @@ struct BatchGenerateRequest
     bool has_pending = false;
     llama_token pending_token = 0;
     int i_batch = -1;
+    bool i_batch_is_prefill = false;
     llama_sampler * sampler = nullptr;
     std::vector<std::string> generated_pieces;
     std::string output;
     int prompt_token_count = 0;
     int completion_token_count = 0;
     std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point process_start_time;
+    std::chrono::steady_clock::time_point generation_start_time;
+    float init_time = 0.0f;
+    float process_time = 0.0f;
     stop_reason finish_reason = stop_reason::INVALID;
     bool abort_requested = false;
     generation_outputs result;
@@ -4598,7 +4603,15 @@ static void batch_finish_request_locked(BatchGenerateRequest & req, stop_reason 
 {
     auto finish_time = std::chrono::steady_clock::now();
     float total_time = req.start_time.time_since_epoch().count() == 0 ? 0.0f : std::chrono::duration<float>(finish_time - req.start_time).count();
-    float generated_tps = total_time > 0.0f ? (float) req.completion_token_count / total_time : 0.0f;
+    float init_time = req.init_time;
+    float process_time = req.process_time;
+    float gen_time = req.generation_start_time.time_since_epoch().count() == 0 ? 0.0f : std::chrono::duration<float>(finish_time - req.generation_start_time).count();
+    if(process_time == 0.0f && req.prompt_token_count > 0 && total_time > 0.0f)
+    {
+        process_time = std::max(0.0f, total_time - init_time);
+    }
+    float processed_tps = process_time > 0.0f ? (float) req.prompt_token_count / process_time : 0.0f;
+    float generated_tps = gen_time > 0.0f ? (float) req.completion_token_count / gen_time : 0.0f;
     req.finish_reason = reason;
     req.result.status = (reason == stop_reason::ERROR_ENCOUNTERED) ? 0 : 1;
     req.result.stopreason = reason;
@@ -4611,8 +4624,8 @@ static void batch_finish_request_locked(BatchGenerateRequest & req, stop_reason 
         llama_memory_seq_rm(llama_get_memory(llama_ctx_v4), req.slot, -1, -1);
     }
     req.slot = -1;
-    printf("\n[%s] BatchRequest:%d, Prompt:%d, Generated:%d/%d in %.2fs (%.2fT/s), Stop:%d",
-        get_timestamp_str().c_str(), req.id, req.prompt_token_count, req.completion_token_count, req.max_length, total_time, generated_tps, (int) reason);
+    printf("\n[%s] BatchRequest:%d, Init:%.2fs, Processed:%d in %.2fs (%.2fT/s), Generated:%d/%d in %.2fs (%.2fT/s), Total:%.2fs, Stop:%d",
+        get_timestamp_str().c_str(), req.id, init_time, req.prompt_token_count, process_time, processed_tps, req.completion_token_count, req.max_length, gen_time, generated_tps, total_time, (int) reason);
     fflush(stdout);
     batch_cv.notify_all();
 }
@@ -4657,6 +4670,7 @@ static bool batch_claim_waiting_locked()
         req->slot = slot;
         req->state = BatchState::PREFILL;
         batch_touched_since_legacy = true;
+        req->start_time = std::chrono::steady_clock::now();
 
         ApplyPromptFormatAdjustments(req->prompt_added_memory, req->prompt);
         std::vector<llama_token> added_memory_tokens; //temporary buf before copying over
@@ -4701,8 +4715,12 @@ static bool batch_claim_waiting_locked()
         req->n_past = 0;
         req->has_pending = false;
         req->i_batch = -1;
-        req->start_time = std::chrono::steady_clock::now();
+        req->i_batch_is_prefill = false;
         llama_memory_seq_rm(llama_get_memory(llama_ctx_v4), slot, -1, -1);
+        req->process_start_time = std::chrono::steady_clock::now();
+        req->generation_start_time = std::chrono::steady_clock::time_point();
+        req->init_time = std::chrono::duration<float>(req->process_start_time - req->start_time).count();
+        req->process_time = 0.0f;
         claimed = true;
     }
     return claimed;
@@ -4738,6 +4756,7 @@ static void batch_worker_loop()
                 }
                 BatchGenerateRequest & req = *req_ptr;
                 req.i_batch = -1;
+                req.i_batch_is_prefill = false;
                 if(req.abort_requested)
                 {
                     batch_finish_request_locked(req, stop_reason::INVALID);
@@ -4751,6 +4770,7 @@ static void batch_worker_loop()
                         if(is_last)
                         {
                             req.i_batch = batch.n_tokens;
+                            req.i_batch_is_prefill = true;
                         }
                         common_batch_add(batch, req.prompt_tokens[req.prompt_pos], req.n_past, { req.slot }, is_last);
                         req.prompt_pos++;
@@ -4764,6 +4784,7 @@ static void batch_worker_loop()
                 else if(req.state == BatchState::GENERATING && req.has_pending)
                 {
                     req.i_batch = batch.n_tokens;
+                    req.i_batch_is_prefill = false;
                     common_batch_add(batch, req.pending_token, req.n_past, { req.slot }, true);
                     req.n_past++;
                     req.has_pending = false;
@@ -4783,6 +4804,7 @@ static void batch_worker_loop()
         }
 
         int decode_status = llama_decode(llama_ctx_v4, batch);
+        auto decode_finish_time = std::chrono::steady_clock::now();
 
         std::lock_guard<std::mutex> lock(batch_mutex);
         if(decode_status != 0)
@@ -4806,6 +4828,11 @@ static void batch_worker_loop()
             if(!req || req->state != BatchState::GENERATING || req->i_batch < 0)
             {
                 continue;
+            }
+            if(req->i_batch_is_prefill && req->generation_start_time.time_since_epoch().count() == 0)
+            {
+                req->generation_start_time = decode_finish_time;
+                req->process_time = std::chrono::duration<float>(decode_finish_time - req->process_start_time).count();
             }
             llama_token sampled = llama_sampler_sample(req->sampler, llama_ctx_v4, req->i_batch);
             req->completion_token_count++;
