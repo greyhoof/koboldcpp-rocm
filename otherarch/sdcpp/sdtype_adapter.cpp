@@ -19,6 +19,7 @@
 
 #include "stable-diffusion.h"
 #include "src/kcpp_sd_extensions.h"
+#include "src/core/util.h"
 #include "ggml-backend.h"
 
 using namespace kcpp_sd;
@@ -191,7 +192,7 @@ static std::string read_str_from_disk(std::string filepath)
     std::string output;
     std::cout << "\nTry read vocab from " << filepath << std::endl;
 
-    std::ifstream file(filepath);  // text mode
+    std::ifstream file(sd_get_u8path(filepath));  // text mode
     if (!file) {
         throw std::runtime_error("Failed to open file: " + filepath);
     }
@@ -274,7 +275,7 @@ std::string load_gpt_oss_vocab_json()
 bool sdtype_load_model(const sd_load_model_inputs inputs) {
     sd_is_quiet = inputs.quiet;
     set_sd_quiet(sd_is_quiet);
-    executable_path = inputs.executable_path;
+    executable_path = sd_get_u8path(inputs.executable_path);
     std::string taesdpath = "";
     LoraMap lora_map;
     for(int i=0;i<inputs.lora_len;++i)
