@@ -2524,8 +2524,10 @@ def sd_get_device_override(deviceid, module=''):
     return result
 
 def sd_load_model(model_filename,vae_filename,t5xxl_filename,clip1_filename,clip2_filename,photomaker_filename,upscaler_filename,audio_vae_filename):
-    global args
+    global args, cached_sd_info
     inputs = sd_load_model_inputs()
+    inputs = set_backend_props(inputs)
+    cached_sd_info = sd_get_info()
     inputs.model_filename = model_filename.encode("UTF-8")
     thds = args.threads
 
@@ -2574,7 +2576,6 @@ def sd_load_model(model_filename,vae_filename,t5xxl_filename,clip1_filename,clip
 
     inputs.img_hard_limit = args.sdclamped
     inputs.img_soft_limit = args.sdclampedsoft
-    inputs = set_backend_props(inputs)
     ret = handle.sd_load_model(inputs)
     return ret
 
@@ -11965,7 +11966,6 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
             friendlysdmodelname = os.path.basename(imgmodel)
             friendlysdmodelname = os.path.splitext(friendlysdmodelname)[0]
             friendlysdmodelname = sanitize_string(friendlysdmodelname)
-            cached_sd_info = sd_get_info()
             loadok = sd_load_model(imgmodel,imgvae,imgt5xxl,imgclip1,imgclip2,imgphotomaker,imgupscaler,imgaudiovae)
             print("Load Image Model OK: " + str(loadok))
             if not loadok:
