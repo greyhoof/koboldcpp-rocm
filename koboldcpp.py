@@ -5254,6 +5254,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             genout = run_blocking()
 
         recvtxt = genout['text']
+        if recvtxt is not None and not isinstance(recvtxt, str):
+            recvtxt = recvtxt.decode("UTF-8", "ignore") if isinstance(recvtxt, bytes) else str(recvtxt)
         prompttokens = genout['prompt_tokens'] if genout['prompt_tokens'] > 0 else 0
         comptokens = genout['completion_tokens'] if genout['completion_tokens'] > 0 else 0
         currfinishreason = "error" if (genout['stopreason'] == -2) else ("length" if (genout['stopreason'] != 1) else "stop")
@@ -5305,10 +5307,12 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     flat = []
                     for obj in tool_calls:
                         if isinstance(obj, list):
-                            flat.extend(obj)
-                        else:
+                            flat.extend(item for item in obj if isinstance(item, dict))
+                        elif isinstance(obj, dict):
                             flat.append(obj)
                     tool_calls = [normalize_tool_call_resp(obj) for obj in flat]
+                    tool_calls = [tc for tc in tool_calls if isinstance(tc, dict) and isinstance(tc.get("function", None), dict) and tc["function"].get("name")]
+                if tool_calls and len(tool_calls)>0:
                     for tc in tool_calls:
                         tcarg = tc.get("function",{}).get("arguments",None)
                         tc["id"] = f"call_{random.randint(10000, 99999)}"
