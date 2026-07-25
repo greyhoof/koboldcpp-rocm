@@ -584,8 +584,7 @@ bool ttstype_load_model(const tts_load_model_inputs inputs)
 
         nthreads = inputs.threads;
 
-        tts_model_params.use_mmap = false;
-        tts_model_params.use_mlock = false;
+        tts_model_params.load_mode = LLAMA_LOAD_MODE_NONE;
         tts_model_params.n_gpu_layers = inputs.gpulayers; //offload if possible
         tts_model_params.split_mode = llama_split_mode::LLAMA_SPLIT_MODE_LAYER;
         int kcpp_parseinfo_maindevice = inputs.kcpp_main_gpu<=0?0:inputs.kcpp_main_gpu;

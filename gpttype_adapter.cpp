@@ -502,9 +502,7 @@ static size_t estimate_draft_autofit_tax_mb(
     llama_model_params draft_model_params = llama_model_default_params();
     llama_context_params draft_ctx_params = llama_context_default_params();
 
-    draft_model_params.use_mmap = base_model_params.use_mmap;
-    draft_model_params.use_mlock = base_model_params.use_mlock;
-    draft_model_params.use_direct_io = base_model_params.use_direct_io;
+    draft_model_params.load_mode = base_model_params.load_mode;
     draft_model_params.n_gpu_layers = has_draft_model ? draft_gpulayers : 0;
     draft_model_params.devices = base_model_params.devices;
     draft_model_params.main_gpu = base_model_params.main_gpu;
@@ -554,8 +552,7 @@ static size_t estimate_draft_autofit_tax_mb(
     {
         llama_model_params draft_probe_params = draft_model_params;
         draft_probe_params.no_alloc = true;
-        draft_probe_params.use_mmap = false;
-        draft_probe_params.use_mlock = false;
+        draft_probe_params.load_mode = LLAMA_LOAD_MODE_NONE;
 
         llama_model * draft_probe = llama_model_load_from_file(spec_model_filename.c_str(), draft_probe_params);
         if(draft_probe != nullptr)
@@ -591,8 +588,7 @@ static size_t estimate_draft_autofit_tax_mb(
     {
         llama_model_params ctx_other_model_params = base_model_params;
         ctx_other_model_params.no_alloc = true;
-        ctx_other_model_params.use_mmap = false;
-        ctx_other_model_params.use_mlock = false;
+        ctx_other_model_params.load_mode = LLAMA_LOAD_MODE_NONE;
 
         ctx_other_model = llama_model_load_from_file(main_model_filename.c_str(), ctx_other_model_params);
         if(ctx_other_model != nullptr)
@@ -923,9 +919,7 @@ static void speculative_decoding_setup(std::string spec_model_filename, llama_co
     llama_model_params draft_model_params = llama_model_default_params();
     llama_context_params draft_ctx_params = llama_context_default_params();
 
-    draft_model_params.use_mmap = base_model_params.use_mmap;
-    draft_model_params.use_mlock = base_model_params.use_mlock;
-    draft_model_params.use_direct_io = base_model_params.use_direct_io;
+    draft_model_params.load_mode = base_model_params.load_mode;
     draft_model_params.n_gpu_layers = draft_gpulayers; //layers offload the speculative model.
     draft_model_params.devices = base_model_params.devices;
     draft_ctx_params.n_ctx = base_ctx_params.n_ctx;
@@ -3235,11 +3229,9 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             // Match llama-server's target rollback slots for speculative verification.
             llama_ctx_params.n_rs_seq = inputs.draft_amount;
         }
-        model_params.use_mmap = inputs.use_mmap;
-        model_params.use_mlock = inputs.use_mlock;
-        model_params.use_direct_io = false; //no direct io for now until stable
+        model_params.load_mode = inputs.use_mlock ? LLAMA_LOAD_MODE_MLOCK : (inputs.use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE);
         model_params.n_gpu_layers = inputs.gpulayers;
-        kcpp_permit_any_repack = (model_params.use_mmap?false:true);
+        kcpp_permit_any_repack = (inputs.use_mmap?false:true);
 
         //set device overrides if needed
         std::vector<ggml_backend_dev_t> devices_override;
