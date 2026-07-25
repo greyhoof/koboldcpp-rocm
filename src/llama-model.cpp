@@ -103,6 +103,7 @@
 #include "models/jina-bert-v2.cpp"
 #include "models/jina-bert-v3.cpp"
 #include "models/kimi-linear.cpp"
+#include "models/laguna.cpp"
 #include "models/lfm2.cpp"
 #include "models/lfm2moe.cpp"
 #include "models/llada-moe.cpp"
@@ -389,6 +390,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_arcee(params);
         case LLM_ARCH_AFMOE:
             return new llama_model_afmoe(params);
+        case LLM_ARCH_LAGUNA:
+            return new llama_model_laguna(params);
         case LLM_ARCH_ERNIE4_5:
             return new llama_model_ernie4_5(params);
         case LLM_ARCH_ERNIE4_5_MOE:
@@ -2688,6 +2691,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_COGVLM:
         case LLM_ARCH_PANGU_EMBED:
         case LLM_ARCH_AFMOE:
+        case LLM_ARCH_LAGUNA:
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:
