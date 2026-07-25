@@ -334,7 +334,7 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
 
     std::vector<TensorStorage> tensor_storages;
     std::string error;
-    if (!read_safetensors_file(file_path, tensor_storages, &error)) {
+    if (!read_safetensors_file(file_path, tensor_storages, &error, &metadata_)) {
         LOG_ERROR("%s", error.c_str());
         return false;
     }
@@ -527,10 +527,17 @@ SDVersion ModelLoader::get_sd_version() {
             return VERSION_MINIT2I;
         }
         if (tensor_storage.name.find("model.diffusion_model.transformer_blocks.0.img_mod.1.weight") != std::string::npos) {
+            auto img_in = tensor_storage_map.find("model.diffusion_model.img_in.weight");
+            if (img_in != tensor_storage_map.end() && img_in->second.ne[0] == 128) {
+                return VERSION_MAGE_FLOW;
+            }
             if (tensor_storage_map.find("model.diffusion_model.time_text_embed.addition_t_embedding.weight") != tensor_storage_map.end()) {
                 return VERSION_QWEN_IMAGE_LAYERED;
             }
             return VERSION_QWEN_IMAGE;
+        }
+        if (tensor_storage.name.find("model.diffusion_model.txt_in.individual_token_refiner.blocks.0.adaLN_modulation.1.weight") != std::string::npos) {
+            return VERSION_HUNYUAN_VIDEO;
         }
         if (tensor_storage.name.find("llm_adapter.blocks.0.cross_attn.q_proj.weight") != std::string::npos) {
             return VERSION_ANIMA;

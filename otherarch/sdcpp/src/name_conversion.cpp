@@ -304,6 +304,12 @@ std::string convert_diffusers_unet_to_original_sd1(std::string name) {
         }
     }
 
+    static const std::vector<std::pair<std::string, std::string>> name_map{
+        {"to_out.weight", "to_out.0.weight"},
+        {"to_out.bias", "to_out.0.bias"},
+    };
+    replace_with_name_map(result, name_map);
+
     return result;
 }
 
@@ -658,6 +664,72 @@ std::string convert_diffusers_dit_to_original_flux(std::string name) {
     return name;
 }
 
+std::string convert_hunyuan_video_to_original_flux(std::string name) {
+    int num_layers        = 54;
+    int num_single_layers = 0;
+    static std::unordered_map<std::string, std::string> hy_name_map;
+
+    if (hy_name_map.empty()) {
+        // --- double transformer blocks ---
+        for (int i = 0; i < num_layers; ++i) {
+            std::string block_prefix = "double_blocks." + std::to_string(i) + ".";
+            std::string dst_prefix   = "double_blocks." + std::to_string(i) + ".";
+
+            hy_name_map[block_prefix + "img_mod.linear"] = dst_prefix + "img_mod.lin";
+            hy_name_map[block_prefix + "txt_mod.linear"] = dst_prefix + "txt_mod.lin";
+
+            // attn
+            hy_name_map[block_prefix + "img_attn_qkv"] = dst_prefix + "img_attn.qkv";
+            hy_name_map[block_prefix + "txt_attn_qkv"] = dst_prefix + "txt_attn.qkv";
+
+            // norm
+            hy_name_map[block_prefix + "img_attn_q_norm.weight"] = dst_prefix + "img_attn.norm.query_norm.scale";
+            hy_name_map[block_prefix + "img_attn_k_norm.weight"] = dst_prefix + "img_attn.norm.key_norm.scale";
+            hy_name_map[block_prefix + "txt_attn_q_norm.weight"] = dst_prefix + "txt_attn.norm.query_norm.scale";
+            hy_name_map[block_prefix + "txt_attn_k_norm.weight"] = dst_prefix + "txt_attn.norm.key_norm.scale";
+
+            // ff
+            hy_name_map[block_prefix + "img_mlp.fc1"] = dst_prefix + "img_mlp.0";
+            hy_name_map[block_prefix + "img_mlp.fc2"] = dst_prefix + "img_mlp.2";
+
+            hy_name_map[block_prefix + "txt_mlp.fc1"] = dst_prefix + "txt_mlp.0";
+            hy_name_map[block_prefix + "txt_mlp.fc2"] = dst_prefix + "txt_mlp.2";
+
+            // output projections
+            hy_name_map[block_prefix + "img_attn_proj"] = dst_prefix + "img_attn.proj";
+            hy_name_map[block_prefix + "txt_attn_proj"] = dst_prefix + "txt_attn.proj";
+        }
+    }
+
+    hy_name_map["time_in.mlp.0"]     = "time_in.in_layer";
+    hy_name_map["time_in.mlp.2"]     = "time_in.out_layer";
+    hy_name_map["time_r_in.mlp.0"]   = "time_r_in.in_layer";
+    hy_name_map["time_r_in.mlp.2"]   = "time_r_in.out_layer";
+    hy_name_map["vector_in.mlp.0"]   = "vector_in.in_layer";
+    hy_name_map["vector_in.mlp.2"]   = "vector_in.out_layer";
+    hy_name_map["guidance_in.mlp.0"] = "guidance_in.in_layer";
+    hy_name_map["guidance_in.mlp.2"] = "guidance_in.out_layer";
+
+    hy_name_map["txt_in.c_embedder.linear_1"] = "txt_in.c_embedder.in_layer";
+    hy_name_map["txt_in.c_embedder.linear_2"] = "txt_in.c_embedder.out_layer";
+
+    hy_name_map["txt_in.t_embedder.mlp.0"] = "txt_in.t_embedder.in_layer";
+    hy_name_map["txt_in.t_embedder.mlp.2"] = "txt_in.t_embedder.out_layer";
+
+    replace_with_prefix_map(name, hy_name_map);
+
+    static const std::vector<std::pair<std::string, std::string>> generic_name_map = {
+        {"_attn_qkv.", "_attn.qkv."},
+        {"_attn_proj.", "_attn.proj."},
+        {"mlp.fc1.", "mlp.0."},
+        {"mlp.fc2.", "mlp.2."},
+        {".modulation.linear.", ".modulation.lin."},
+    };
+    replace_with_name_map(name, generic_name_map);
+
+    return name;
+}
+
 std::string convert_diffusers_dit_to_original_lumina2(std::string name) {
     int num_layers         = 30;
     int num_refiner_layers = 2;
@@ -801,6 +873,8 @@ std::string convert_diffusion_model_name(std::string name, std::string prefix, S
         name = convert_diffusers_dit_to_original_sd3(name);
     } else if (sd_version_is_flux(version) || sd_version_is_flux2(version) || sd_version_is_longcat(version) || sd_version_is_sefi_image(version)) {
         name = convert_diffusers_dit_to_original_flux(name);
+    } else if (sd_version_is_hunyuan_video(version)) {
+        name = convert_hunyuan_video_to_original_flux(name);
     } else if (sd_version_is_z_image(version)) {
         name = convert_diffusers_dit_to_original_lumina2(name);
     } else if (sd_version_is_anima(version)) {
@@ -974,6 +1048,9 @@ std::string convert_diffusers_to_original_wan_vae(std::string name) {
 }
 
 std::string convert_first_stage_model_name(std::string name, std::string prefix, SDVersion version) {
+    if (sd_version_is_hunyuan_video(version) || sd_version_is_mage_flow(version)) {
+        return name;
+    }
     if (sd_version_uses_wan_vae(version)) {
         return convert_diffusers_to_original_wan_vae(name);
     }
@@ -1102,6 +1179,8 @@ std::string convert_sep_to_dot(std::string name) {
         "norm1_context",
         "ff_context",
         "x_embedder",
+        "cross_attn",
+        "output_proj",
     };
 
     // record the positions of underscores that should NOT be replaced
@@ -1206,9 +1285,52 @@ static std::string convert_esrgan_tensor_name(std::string name) {
     return name;
 }
 
+static const std::map<int, std::string>& ip_adapter_index_map(SDVersion version) {
+    static const std::map<int, std::string> sd15_map = {
+        {1, "input_blocks.1.1.transformer_blocks.0"}, {3, "input_blocks.2.1.transformer_blocks.0"}, {5, "input_blocks.4.1.transformer_blocks.0"}, {7, "input_blocks.5.1.transformer_blocks.0"}, {9, "input_blocks.7.1.transformer_blocks.0"}, {11, "input_blocks.8.1.transformer_blocks.0"}, {13, "output_blocks.3.1.transformer_blocks.0"}, {15, "output_blocks.4.1.transformer_blocks.0"}, {17, "output_blocks.5.1.transformer_blocks.0"}, {19, "output_blocks.6.1.transformer_blocks.0"}, {21, "output_blocks.7.1.transformer_blocks.0"}, {23, "output_blocks.8.1.transformer_blocks.0"}, {25, "output_blocks.9.1.transformer_blocks.0"}, {27, "output_blocks.10.1.transformer_blocks.0"}, {29, "output_blocks.11.1.transformer_blocks.0"}, {31, "middle_block.1.transformer_blocks.0"}};
+
+    static std::map<int, std::string> sdxl_map;
+    if (sdxl_map.empty()) {
+        std::vector<std::pair<std::string, int>> order = {
+            {"input_blocks.4.1", 2}, {"input_blocks.5.1", 2}, {"input_blocks.7.1", 10}, {"input_blocks.8.1", 10}, {"output_blocks.0.1", 10}, {"output_blocks.1.1", 10}, {"output_blocks.2.1", 10}, {"output_blocks.3.1", 2}, {"output_blocks.4.1", 2}, {"output_blocks.5.1", 2}, {"middle_block.1", 10}};
+        int idx = 1;
+        for (const auto& [block, depth] : order) {
+            for (int m = 0; m < depth; m++) {
+                sdxl_map[idx] = block + ".transformer_blocks." + std::to_string(m);
+                idx += 2;
+            }
+        }
+    }
+    return sd_version_is_sdxl(version) ? sdxl_map : sd15_map;
+}
+
+static std::string convert_ip_adapter_name(std::string name, SDVersion version) {
+    if (starts_with(name, "image_proj.")) {
+        return "ip_adapter." + name;
+    }
+    if (starts_with(name, "ip_adapter.")) {
+        auto items = split_string(name, '.');
+        if (items.size() < 4) {
+            return name;
+        }
+        int idx        = atoi(items[1].c_str());
+        const auto& mp = ip_adapter_index_map(version);
+        auto blk       = mp.find(idx);
+        if (blk == mp.end()) {
+            return name;
+        }
+        return "model.diffusion_model." + blk->second + ".attn2." + items[2] + "." + items[3];
+    }
+    return name;
+}
+
 std::string convert_tensor_name(std::string name, SDVersion version) {
     if (version == VERSION_ESRGAN) {
         return convert_esrgan_tensor_name(std::move(name));
+    }
+
+    if (starts_with(name, "ip_adapter.") || starts_with(name, "image_proj.")) {
+        return convert_ip_adapter_name(std::move(name), version);
     }
 
     bool is_lora                             = false;
@@ -1335,17 +1457,35 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
 
     replace_with_prefix_map(name, prefix_map);
 
-    if ((sd_version_is_boogu_image(version) || sd_version_is_krea2(version)) && starts_with(name, "text_encoders.llm.visual.")) {
-        name = convert_qwen3_vl_vision_name(std::move(name));
+    if (sd_version_is_boogu_image(version) || sd_version_is_krea2(version) || sd_version_is_mage_flow(version)) {
+        const std::string hf_vision_prefix = "text_encoders.llm.model.visual.";
+        if (starts_with(name, hf_vision_prefix)) {
+            name = "text_encoders.llm.visual." + name.substr(hf_vision_prefix.size());
+        }
+        if (starts_with(name, "text_encoders.llm.visual.")) {
+            name = convert_qwen3_vl_vision_name(std::move(name));
+        }
     }
 
     // diffusion model
     {
+        bool matched = false;
         for (const auto& prefix : diffuison_model_prefix_vec) {
             if (starts_with(name, prefix)) {
-                name = convert_diffusion_model_name(name.substr(prefix.size()), prefix, version);
-                name = prefix + name;
+                name    = convert_diffusion_model_name(name.substr(prefix.size()), prefix, version);
+                name    = prefix + name;
+                matched = true;
                 break;
+            }
+        }
+        if (is_lora && !matched && !diffuison_model_prefix_vec.empty()) {
+            if (starts_with(name, "down_blocks.") || starts_with(name, "up_blocks.") ||
+                starts_with(name, "mid_block.") || starts_with(name, "conv_in.") ||
+                starts_with(name, "conv_out.") || starts_with(name, "time_embedding.") ||
+                starts_with(name, "conv_norm_out.")) {
+                const std::string& canonical_prefix = diffuison_model_prefix_vec.front();
+                name                                = convert_diffusion_model_name(name, canonical_prefix, version);
+                name                                = canonical_prefix + name;
             }
         }
     }

@@ -16,10 +16,11 @@
 #define BOOL_STR(b) ((b) ? "true" : "false")
 
 extern const char* const modes_str[];
-#define SD_ALL_MODES_STR "img_gen, vid_gen, convert, upscale, metadata"
+#define SD_ALL_MODES_STR "img_gen, adetailer, vid_gen, convert, upscale, metadata"
 
 enum SDMode {
     IMG_GEN,
+    ADETAILER,
     VID_GEN,
     CONVERT,
     UPSCALE,
@@ -132,6 +133,8 @@ struct SDContextParams {
     std::string taesd_path;
     std::string esrgan_path;
     std::string control_net_path;
+    std::string ip_adapter_path;
+    std::string motion_module_path;
     std::string embedding_dir;
     std::string photo_maker_path;
     std::string pulid_weights_path;
@@ -186,6 +189,10 @@ struct SDGenerationParams {
     // User-facing input fields.
     std::string prompt;
     std::string negative_prompt;
+    std::string ad_model_path;
+    std::string ad_prompt;
+    std::string ad_negative_prompt;
+    std::string extra_ad_args;
     int clip_skip              = -1;  // <= 0 represents unspecified
     int width                  = -1;
     int height                 = -1;
@@ -194,6 +201,7 @@ struct SDGenerationParams {
     int64_t seed               = 42;
     float strength             = 0.75f;
     float control_strength     = 0.9f;
+    float ip_adapter_strength  = 1.0f;
     bool auto_resize_ref_image = true;
     bool increase_ref_index    = false;
     bool embed_image_metadata  = true;
@@ -202,6 +210,7 @@ struct SDGenerationParams {
     std::string end_image_path;
     std::string mask_image_path;
     std::string control_image_path;
+    std::string ip_adapter_image_path;
     std::vector<std::string> ref_image_paths;
     std::string control_video_path;
 
@@ -226,6 +235,8 @@ struct SDGenerationParams {
     float vace_strength                  = 1.f;
     sd_tiling_params_t vae_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
     std::string extra_tiling_args;
+
+    std::string ref_image_args;
 
     std::string pm_id_images_dir;
     std::string pm_id_embed_path;
@@ -266,6 +277,7 @@ struct SDGenerationParams {
     std::vector<SDImageOwner> ref_images;
     SDImageOwner mask_image;
     SDImageOwner control_image;
+    SDImageOwner ip_adapter_image;
     std::vector<SDImageOwner> pm_id_images;
     std::vector<SDImageOwner> control_frames;
 

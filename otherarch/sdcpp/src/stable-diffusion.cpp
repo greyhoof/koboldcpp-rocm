@@ -24,18 +24,22 @@
 #include "conditioning/conditioner.hpp"
 #include "core/backend_fit.h"
 #include "extensions/generation_extension.h"
+#include "model/adapter/ip_adapter.hpp"
 #include "model/adapter/lora.hpp"
 #include "model/diffusion/anima.hpp"
+#include "model/diffusion/animatediff.hpp"
 #include "model/diffusion/boogu.hpp"
 #include "model/diffusion/control.hpp"
 #include "model/diffusion/ernie_image.hpp"
 #include "model/diffusion/flux.hpp"
 #include "model/diffusion/hidream_o1.hpp"
+#include "model/diffusion/hunyuan.hpp"
 #include "model/diffusion/ideogram4.hpp"
 #include "model/diffusion/krea2.hpp"
 #include "model/diffusion/lens.hpp"
 #include "model/diffusion/lingbot_video.hpp"
 #include "model/diffusion/ltxv.hpp"
+#include "model/diffusion/mage_flow.hpp"
 #include "model/diffusion/minit2i.hpp"
 #include "model/diffusion/mmdit.hpp"
 #include "model/diffusion/model.hpp"
@@ -47,8 +51,10 @@
 #include "model/upscaler/esrgan.hpp"
 #include "model/upscaler/ltx_latent_upscaler.hpp"
 #include "model/vae/auto_encoder_kl.hpp"
+#include "model/vae/hunyuan_vae.hpp"
 #include "model/vae/ltx_audio_vae.hpp"
 #include "model/vae/ltx_vae.hpp"
+#include "model/vae/mage_vae.hpp"
 #include "model/vae/tae.hpp"
 #include "model/vae/vae.hpp"
 #include "model/vae/wan_vae.hpp"
@@ -64,6 +70,10 @@
 
 const char* sd_vae_format_name(enum sd_vae_format_t format);
 static SDVersion sd_vae_format_to_version(enum sd_vae_format_t format, SDVersion fallback);
+
+static bool sd_version_supports_animatediff(SDVersion version) {
+    return version == VERSION_SD1 || version == VERSION_SD1_INPAINT || version == VERSION_SD1_PIX2PIX;
+}
 
 const char* model_version_to_str[] = {
     "SD 1.x",
@@ -93,6 +103,7 @@ const char* model_version_to_str[] = {
     "LingBot Video",
     "Qwen Image",
     "Qwen Image Layered",
+    "Hunyuan Video",
     "Anima",
     "Flux.2",
     "Flux.2 klein",
@@ -109,6 +120,7 @@ const char* model_version_to_str[] = {
     "Ideogram 4",
     "SeFi-Image",
     "Krea2",
+    "Mage Flow",
     "ESRGAN",
 };
 
@@ -139,6 +151,7 @@ static bool sd_version_supports_ref_latent_img_cfg(SDVersion version) {
     return version == VERSION_FLUX ||
            sd_version_is_flux2(version) ||
            sd_version_is_qwen_image(version) ||
+           sd_version_is_mage_flow(version) ||
            sd_version_is_longcat(version) ||
            sd_version_is_z_image(version) ||
            sd_version_is_boogu_image(version);
@@ -211,9 +224,15 @@ public:
     std::shared_ptr<VAE> preview_vae;
     std::shared_ptr<LTXV::LTXAudioVAERunner> audio_vae_model;
     std::shared_ptr<ControlNet> control_net;
+    std::shared_ptr<IPAdapter::IPAdapterRunner> ip_adapter;
+    sd::Tensor<float> ip_adapter_tokens;
+    sd::Tensor<float> ip_adapter_uncond_tokens;
+    float ip_adapter_strength = 1.0f;
     std::vector<std::shared_ptr<GenerationExtension>> generation_extensions;
     std::vector<std::shared_ptr<LoraModel>> runtime_lora_models;
     bool apply_lora_immediately = false;
+    bool animatediff_loaded     = false;
+    int animatediff_num_frames  = 0;
     std::map<std::string, std::shared_ptr<LoraModel>> kcpp_lora_cache;
     bool kcpp_lora_cache_populate = false;
 
@@ -798,7 +817,8 @@ public:
         bool is_boogu = sd_version_is_boogu_image(tempver);
         bool is_krea2 = sd_version_is_krea2(tempver);
         bool is_sefi = sd_version_is_sefi_image(tempver);
-        bool conditioner_is_llm = (is_qwenimg || iszimg || isflux2 || is_ovis || is_anima || is_ernie || is_longcat || is_lens || is_ltx || is_ideogram || is_boogu || is_krea2 || is_sefi);
+        bool is_mageflow = sd_version_is_mage_flow(tempver);
+        bool conditioner_is_llm = (is_qwenimg || iszimg || isflux2 || is_ovis || is_anima || is_ernie || is_longcat || is_lens || is_ltx || is_ideogram || is_boogu || is_krea2 || is_sefi || is_mageflow);
         bool has_llm_vision = (is_qwenimg || is_longcat || is_boogu);
 
         //kcpp qol fallback: if a llm was loaded as t5 by mistake
@@ -1053,12 +1073,29 @@ public:
             }
         }
 
+        if (strlen(SAFE_STR(sd_ctx_params->motion_module_path)) > 0) {
+            LOG_INFO("loading motion module (AnimateDiff) from '%s'", sd_ctx_params->motion_module_path);
+            if (!model_loader.init_from_file(sd_ctx_params->motion_module_path,
+                                             "model.diffusion_model.motion_module.")) {
+                LOG_WARN("loading motion module from '%s' failed", sd_ctx_params->motion_module_path);
+            } else {
+                animatediff_loaded = true;
+            }
+        }
+
         if (strlen(SAFE_STR(sd_ctx_params->control_net_path)) > 0) {
             if (!model_loader.init_from_file(sd_ctx_params->control_net_path)) {
                 LOG_ERROR("init control net model loader from file failed: '%s'", sd_ctx_params->control_net_path);
                 return false;
             } else {
                 use_control_net = true;
+            }
+        }
+
+        if (strlen(SAFE_STR(sd_ctx_params->ip_adapter_path)) > 0) {
+            if (!model_loader.init_from_file(sd_ctx_params->ip_adapter_path)) {
+                LOG_ERROR("init ip-adapter model loader from file failed: '%s'", sd_ctx_params->ip_adapter_path);
+                return false;
             }
         }
 
@@ -1297,6 +1334,18 @@ public:
                                                                       tensor_storage_map,
                                                                       "model.diffusion_model",
                                                                       model_manager);
+            } else if (sd_version_is_hunyuan_video(version)) {
+                cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
+                                                                 tensor_storage_map,
+                                                                 version,
+                                                                 "",
+                                                                 false,
+                                                                 model_manager);
+                diffusion_model  = std::make_shared<Hunyuan::HunyuanVideoRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                                tensor_storage_map,
+                                                                                "model.diffusion_model",
+                                                                                version,
+                                                                                model_manager);
             } else if (sd_version_is_wan(version)) {
                 cond_stage_model = std::make_shared<T5CLIPEmbedder>(backend_for(SDBackendModule::TE),
                                                                     tensor_storage_map,
@@ -1365,6 +1414,17 @@ public:
                                                                           version,
                                                                           model_manager,
                                                                           sd_ctx_params->model_args);
+            } else if (sd_version_is_mage_flow(version)) {
+                cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
+                                                                 tensor_storage_map,
+                                                                 version,
+                                                                 "",
+                                                                 true,
+                                                                 model_manager);
+                diffusion_model  = std::make_shared<MageFlow::MageFlowRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                             tensor_storage_map,
+                                                                             "model.diffusion_model",
+                                                                             model_manager);
             } else if (sd_version_is_longcat(version)) {
                 cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
                                                                  tensor_storage_map,
@@ -1497,12 +1557,39 @@ public:
                 }
             }
 
+            if (strlen(SAFE_STR(sd_ctx_params->ip_adapter_path)) > 0 && clip_vision == nullptr) {
+                if (!ensure_backend_pair(SDBackendModule::CLIP_VISION)) {
+                    return false;
+                }
+                clip_vision = std::make_shared<FrozenCLIPVisionEmbedder>(backend_for(SDBackendModule::CLIP_VISION),
+                                                                         tensor_storage_map,
+                                                                         model_manager);
+                clip_vision->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::CLIP_VISION));
+                if (!register_runner_params("CLIP vision",
+                                            clip_vision,
+                                            SDBackendModule::CLIP_VISION)) {
+                    return false;
+                }
+            }
+
+            if (strlen(SAFE_STR(sd_ctx_params->ip_adapter_path)) > 0) {
+                ip_adapter = std::make_shared<IPAdapter::IPAdapterRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                          tensor_storage_map,
+                                                                          "ip_adapter",
+                                                                          model_manager);
+                if (!register_runner_params("IP-Adapter",
+                                            ip_adapter,
+                                            SDBackendModule::DIFFUSION)) {
+                    return false;
+                }
+            }
+
             if (!ensure_backend_pair(SDBackendModule::VAE)) {
                 return false;
             }
 
             auto create_tae = [&](bool decode_only) -> std::shared_ptr<VAE> {
-                if (sd_version_uses_wan_vae(version) || sd_version_is_ltxav(version)) {
+                if (sd_version_uses_wan_vae(version) || sd_version_is_hunyuan_video(version) || sd_version_is_ltxav(version)) {
                     return std::make_shared<TinyVideoAutoEncoder>(backend_for(SDBackendModule::VAE),
                                                                   tensor_storage_map,
                                                                   "decoder",
@@ -1539,12 +1626,24 @@ public:
                                                          false,
                                                          version,
                                                          model_manager);
-                } else if (sd_version_uses_wan_vae(version)) {
+                } else if (sd_version_is_mage_flow(vae_version)) {
+                    return std::make_shared<MageVAE::MageVAERunner>(backend_for(SDBackendModule::VAE),
+                                                                    tensor_storage_map,
+                                                                    "first_stage_model",
+                                                                    model_manager);
+                } else if (sd_version_uses_hunyuan_video_vae(vae_version)) {
+                    return std::make_shared<Hunyuan::HunyuanVideoVAERunner>(backend_for(SDBackendModule::VAE),
+                                                                            tensor_storage_map,
+                                                                            "first_stage_model",
+                                                                            false,
+                                                                            vae_version,
+                                                                            model_manager);
+                } else if (sd_version_uses_wan_vae(vae_version)) {
                     return std::make_shared<WAN::WanVAERunner>(backend_for(SDBackendModule::VAE),
                                                                tensor_storage_map,
                                                                "first_stage_model",
                                                                false,
-                                                               version,
+                                                               vae_version,
                                                                model_manager);
                 } else {
                     auto model = std::make_shared<AutoEncoderKL>(backend_for(SDBackendModule::VAE),
@@ -1850,8 +1949,10 @@ public:
                     }
                 } else if (sd_version_is_sd3(version) ||
                            sd_version_is_wan(version) ||
+                           sd_version_is_hunyuan_video(version) ||
                            sd_version_is_lingbot_video(version) ||
                            sd_version_is_qwen_image(version) ||
+                           sd_version_is_mage_flow(version) ||
                            version == VERSION_HIDREAM_O1 ||
                            sd_version_is_anima(version) ||
                            sd_version_is_ernie_image(version) ||
@@ -1862,6 +1963,8 @@ public:
                     pred_type = FLOW_PRED;
                     if (sd_version_is_wan(version)) {
                         default_flow_shift = 5.f;
+                    } else if (sd_version_is_hunyuan_video(version)) {
+                        default_flow_shift = 7.f;
                     } else if (sd_version_is_ernie_image(version)) {
                         default_flow_shift = 4.f;
                     } else if (sd_version_is_pid(version)) {
@@ -1870,6 +1973,8 @@ public:
                         default_flow_shift = 1.0f;
                     } else if (sd_version_is_boogu_image(version)) {
                         default_flow_shift = 3.16f;
+                    } else if (sd_version_is_mage_flow(version)) {
+                        default_flow_shift = 6.f;
                     } else {
                         default_flow_shift = 3.f;
                     }
@@ -2265,6 +2370,34 @@ public:
         return output;
     }
 
+    void compute_ip_adapter_tokens(const sd_image_t& image, float strength) {
+        ip_adapter_tokens        = {};
+        ip_adapter_uncond_tokens = {};
+        ip_adapter_strength      = strength;
+        if (ip_adapter == nullptr || clip_vision == nullptr || image.data == nullptr) {
+            return;
+        }
+        auto image_tensor = sd_image_to_tensor(image);
+        auto embed        = get_clip_vision_output(image_tensor, true, -1);
+        if (embed.empty()) {
+            return;
+        }
+        ip_adapter_tokens = ip_adapter->compute(n_threads, embed);
+        if (ip_adapter_tokens.empty()) {
+            LOG_ERROR("IP-Adapter conditional image projection failed");
+            return;
+        }
+        auto uncond_embed        = sd::Tensor<float>::zeros_like(embed);
+        ip_adapter_uncond_tokens = ip_adapter->compute(n_threads, uncond_embed);
+        if (ip_adapter_uncond_tokens.empty()) {
+            LOG_ERROR("IP-Adapter unconditional image projection failed");
+            ip_adapter_tokens = {};
+            return;
+        }
+        LOG_INFO("IP-Adapter: %lld image tokens, strength %.2f",
+                 (long long)ip_adapter_tokens.shape()[1], strength);
+    }
+
     std::vector<float> process_timesteps(const std::vector<float>& timesteps,
                                          const sd::Tensor<float>& init_latent,
                                          const sd::Tensor<float>& denoise_mask,
@@ -2566,7 +2699,7 @@ public:
                              const char* extra_sample_args,
                              const std::vector<float>& sigmas,
                              const std::vector<sd::Tensor<float>>& ref_latents,
-                             bool increase_ref_index,
+                             const RefImageParams& ref_image_params,
                              const sd::Tensor<float>& denoise_mask,
                              const sd::Tensor<float>& vace_context,
                              float vace_strength,
@@ -2698,6 +2831,10 @@ public:
 
             sd::Tensor<float> timesteps_tensor({static_cast<int64_t>(timesteps_vec.size())}, timesteps_vec);
             sd::Tensor<float> guidance_tensor({1}, std::vector<float>{guidance.distilled_guidance});
+            sd::Tensor<float> hunyuan_timestep_r_tensor;
+            if (sd_version_is_hunyuan_video(version) && step + 1 < sigmas.size()) {
+                hunyuan_timestep_r_tensor = sd::Tensor<float>::from_vector({sigmas[step + 1]});
+            }
             sd::Tensor<float> noised_input = x * c_in;
             if (!denoise_mask.empty() && (version == VERSION_WAN2_2_TI2V || sd_version_is_ltxav(version) || sd_version_is_lingbot_video(version))) {
                 noised_input = noised_input * denoise_mask + init_latent * (1.0f - denoise_mask);
@@ -2727,9 +2864,9 @@ public:
             sd_sample::SampleStepCacheDispatcher step_cache(cache_runtime, step, sigma);
             std::vector<sd::Tensor<float>> controls;
             DiffusionParams diffusion_params;
-            diffusion_params.x              = &noised_input;
-            diffusion_params.timesteps      = &timesteps_tensor;
-            diffusion_params.ref_index_mode = Rope::ref_index_mode_from_bool(increase_ref_index);
+            diffusion_params.x                = &noised_input;
+            diffusion_params.timesteps        = &timesteps_tensor;
+            diffusion_params.ref_image_params = ref_image_params;
             sd::guidance::GuidanceInput step_guidance_input;
             step_guidance_input.step          = step;
             step_guidance_input.schedule_size = sigmas.size();
@@ -2749,14 +2886,25 @@ public:
             auto run_condition = [&](const SDCondition& condition,
                                      const sd::Tensor<float>* c_concat_override                 = nullptr,
                                      const std::vector<int>* local_skip_layers                  = nullptr,
-                                     const std::vector<sd::Tensor<float>>* ref_latents_override = nullptr) -> sd::Tensor<float> {
+                                     const std::vector<sd::Tensor<float>>* ref_latents_override = nullptr,
+                                     bool use_uncond_ip                                         = false) -> sd::Tensor<float> {
                 diffusion_params.context     = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
                 diffusion_params.c_concat    = c_concat_override != nullptr ? c_concat_override : (condition.c_concat.empty() ? nullptr : &condition.c_concat);
                 diffusion_params.y           = condition.c_vector.empty() ? nullptr : &condition.c_vector;
                 diffusion_params.ref_latents = ref_latents_override != nullptr ? ref_latents_override : (condition.c_ref_images.empty() ? &ref_latents : &condition.c_ref_images);
 
                 if (sd_version_is_unet(version)) {
-                    diffusion_params.extra = UNetDiffusionExtra{-1, &controls, control_strength};
+                    int nvf = -1;
+                    if (animatediff_loaded && noised_input.dim() >= 4 && noised_input.shape()[3] > 1) {
+                        nvf = static_cast<int>(noised_input.shape()[3]);
+                    }
+                    UNetDiffusionExtra unet_extra{nvf, &controls, control_strength};
+                    const auto& ip_tokens = use_uncond_ip ? ip_adapter_uncond_tokens : ip_adapter_tokens;
+                    if (!ip_tokens.empty()) {
+                        unet_extra.ip_context = &ip_tokens;
+                        unet_extra.ip_scale   = ip_adapter_strength;
+                    }
+                    diffusion_params.extra = unet_extra;
                 } else if (sd_version_is_sd3(version)) {
                     diffusion_params.extra = SkipLayerDiffusionExtra{local_skip_layers};
                 } else if (sd_version_is_flux(version) || sd_version_is_flux2(version) || sd_version_is_longcat(version) || sd_version_is_sefi_image(version)) {
@@ -2768,6 +2916,12 @@ public:
                 } else if (sd_version_is_wan(version)) {
                     diffusion_params.extra = WanDiffusionExtra{vace_context.empty() ? nullptr : &vace_context,
                                                                vace_strength};
+                } else if (sd_version_is_hunyuan_video(version)) {
+                    diffusion_params.extra = HunyuanVideoDiffusionExtra{
+                        &guidance_tensor,
+                        condition.extra_c_crossattns.empty() ? nullptr : &condition.extra_c_crossattns[0],
+                        condition.c_vector.empty() ? nullptr : &condition.c_vector,
+                        hunyuan_timestep_r_tensor.empty() ? nullptr : &hunyuan_timestep_r_tensor};
                 } else if (version == VERSION_HIDREAM_O1) {
                     diffusion_params.extra = HiDreamO1DiffusionExtra{
                         condition.c_input_ids.empty() ? nullptr : &condition.c_input_ids,
@@ -2841,7 +2995,9 @@ public:
                 }
                 uncond_out = run_condition(uncond,
                                            uncond.c_concat.empty() ? nullptr : &uncond.c_concat,
-                                           uncond_skip_layers);
+                                           uncond_skip_layers,
+                                           nullptr,
+                                           true);
                 if (uncond_out.empty()) {
                     return {};
                 }
@@ -2850,7 +3006,8 @@ public:
                 img_uncond_out = run_condition(img_uncond,
                                                img_uncond.c_concat.empty() ? nullptr : &img_uncond.c_concat,
                                                nullptr,
-                                               uncond_without_ref_latents ? &empty_ref_latents : nullptr);
+                                               uncond_without_ref_latents ? &empty_ref_latents : nullptr,
+                                               true);
                 if (img_uncond_out.empty()) {
                     return {};
                 }
@@ -2961,6 +3118,8 @@ public:
                 latent_channel = 128;
             } else if (version == VERSION_WAN2_2_TI2V) {
                 latent_channel = 48;
+            } else if (sd_version_is_hunyuan_video(version)) {
+                latent_channel = 32;
             } else if (version == VERSION_HIDREAM_O1) {
                 latent_channel = 3;
             } else if (version == VERSION_CHROMA_RADIANCE) {
@@ -2972,6 +3131,8 @@ public:
             } else if (sd_version_is_sefi_image(version)) {
                 latent_channel = 144;
             } else if (sd_version_uses_flux2_vae(version)) {
+                latent_channel = 128;
+            } else if (sd_version_is_mage_flow(version)) {
                 latent_channel = 128;
             } else {
                 latent_channel = 16;
@@ -3008,7 +3169,7 @@ public:
         int latent_frames = frames;
         if (sd_version_is_ltxav(version)) {
             latent_frames = ((frames - 1) / 8) + 1;
-        } else if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version)) {
+        } else if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_hunyuan_video(version)) {
             latent_frames = ((frames - 1) / 4) + 1;
         }
         return latent_frames;
@@ -3021,7 +3182,7 @@ public:
         if (sd_version_is_ltxav(version)) {
             return (latent_frames - 1) * 8 + 1;
         }
-        if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version)) {
+        if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_hunyuan_video(version)) {
             return (latent_frames - 1) * 4 + 1;
         }
         return latent_frames;
@@ -3110,6 +3271,127 @@ public:
         return !!flow_denoiser;
     }
 
+    std::string get_default_ref_image_preset(SDVersion version) const {
+        if (sd_version_is_longcat(version)) {
+            return "longcat";
+        } else if (sd_version_is_flux(version)) {
+            return "flux_kontext";
+        } else if (sd_version_is_flux2(version) || sd_version_is_sefi_image(version)) {
+            return "flux2";
+        } else if (version == VERSION_QWEN_IMAGE_LAYERED) {
+            return "qwen_layered";
+        } else if (sd_version_is_qwen_image(version)) {
+            return "qwen";
+        } else if (sd_version_is_mage_flow(version)) {
+            return "mage_flow";
+        } else if (sd_version_is_z_image(version) || sd_version_is_boogu_image(version)) {
+            return "z_image_omni";
+        } else if (sd_version_is_krea2(version)) {
+            // have to make a choice between "krea2_edit" mode (for lbouaraba/krea2edit)
+            // and "krea2_ostris_edit" (for krea2 ostris edit)
+            // since krea2 ostris edit support predates, it should probably be default
+            return "krea2_ostris_edit";
+        } else if (sd_version_is_anima(version)) {
+            return "cosmos_reference";
+        }
+        return "default";
+    }
+
+    RefImageParams resolve_ref_image_params(const char* ref_image_args) const {
+        RefImageParams params;
+        std::string preset_name = get_default_ref_image_preset(version);
+
+        for (const auto& [key, value] : parse_key_value_args(ref_image_args, "reference image args")) {
+            if (key == "preset") {
+                std::string requested_preset_name = value;
+                if (REF_IMAGE_PRESETS.count(requested_preset_name)) {
+                    preset_name = requested_preset_name;
+                } else if (value != "default") {
+                    std::string valid_list;
+                    for (auto const& [name, _] : REF_IMAGE_PRESETS) {
+                        valid_list += (valid_list.empty() ? "" : ", ") + name;
+                    }
+                    LOG_WARN("ignoring invalid reference image preset '%s'. Valid options: [%s]", value.c_str(), valid_list.c_str());
+                }
+                break;
+            }
+        }
+        if (preset_name != "default") {
+            LOG_INFO("Using '%s' preset for reference images", preset_name.c_str());
+            params = REF_IMAGE_PRESETS.at(preset_name);
+        }
+
+        for (const auto& [key, value] : parse_key_value_args(ref_image_args, "reference image args")) {
+            if (key == "pass_to_vlm") {
+                if (!parse_strict_bool(value, params.pass_to_vlm)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else if (key == "pass_to_dit") {
+                if (!parse_strict_bool(value, params.pass_to_dit)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else if (key == "ref_index_mode") {
+                if (value == "fixed") {
+                    params.ref_index_mode = Rope::RefIndexMode::FIXED;
+                } else if (value == "increase") {
+                    params.ref_index_mode = Rope::RefIndexMode::INCREASE;
+                } else if (value == "decrease") {
+                    params.ref_index_mode = Rope::RefIndexMode::DECREASE;
+                } else {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else if (key == "force_ref_timestep_zero") {
+                if (!parse_strict_bool(value, params.force_ref_timestep_zero)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else if (key == "resize_before_vae") {
+                if (!parse_strict_bool(value, params.resize_before_vae)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else if (key == "vae_input_max_pixels") {
+                if (!parse_strict_int(value, params.vae_input_max_pixels)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else if (key == "vlm_resize_mode") {
+                if (value == "longest_side") {
+                    params.vlm_resize_mode = RefImageResizeMode::LONGEST_SIDE;
+                } else if (value == "area") {
+                    params.vlm_resize_mode = RefImageResizeMode::AREA;
+                } else if (value == "none") {
+                    params.vlm_resize_mode = RefImageResizeMode::NONE;
+                } else {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else if (key == "vlm_max_size") {
+                if (!parse_strict_int(value, params.vlm_max_size)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else if (key == "vlm_min_size") {
+                if (!parse_strict_int(value, params.vlm_min_size)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else if (key != "preset" && key != "vlm_size") {
+                LOG_WARN("ignoring unknown reference image arg '%s'", key.c_str());
+            }
+        }
+        for (const auto& [key, value] : parse_key_value_args(ref_image_args, "reference image args")) {
+            if (key == "vlm_size") {
+                int vlm_size;
+                if (!parse_strict_int(value, vlm_size)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                } else {
+                    LOG_INFO("vlm_size override: setting both min and max size to %ld", (long)vlm_size);
+                    params.vlm_min_size = vlm_size;
+                    params.vlm_max_size = vlm_size;
+                }
+                break;
+            }
+        }
+        if (params.force_ref_timestep_zero && !sd_version_is_krea2(version)) {
+            LOG_WARN("force_ref_timestep_zero is only supported by Krea2 architecture for now");
+        }
+        return params;
+    }
 };
 
 /*================================================= SD API ==================================================*/
@@ -3342,6 +3624,8 @@ const char* sd_vae_format_name(enum sd_vae_format_t format) {
             return "sd3";
         case SD_VAE_FORMAT_FLUX2:
             return "flux2";
+        case SD_VAE_FORMAT_WAN:
+            return "wan";
         default:
             return NONE_STR;
     }
@@ -3355,6 +3639,8 @@ static SDVersion sd_vae_format_to_version(enum sd_vae_format_t format, SDVersion
             return VERSION_SD3;
         case SD_VAE_FORMAT_FLUX2:
             return VERSION_FLUX2;
+        case SD_VAE_FORMAT_WAN:
+            return VERSION_WAN2;
         case SD_VAE_FORMAT_AUTO:
         default:
             return fallback;
@@ -3569,20 +3855,22 @@ char* sd_sample_params_to_str(const sd_sample_params_t* sample_params) {
 void sd_img_gen_params_init(sd_img_gen_params_t* sd_img_gen_params) {
     *sd_img_gen_params = {};
     sd_sample_params_init(&sd_img_gen_params->sample_params);
-    sd_img_gen_params->clip_skip         = -1;
-    sd_img_gen_params->ref_images_count  = 0;
-    sd_img_gen_params->width             = 512;
-    sd_img_gen_params->height            = 512;
-    sd_img_gen_params->strength          = 0.75f;
-    sd_img_gen_params->seed              = -1;
-    sd_img_gen_params->batch_count       = 1;
-    sd_img_gen_params->control_strength  = 0.9f;
-    sd_img_gen_params->qwen_image_layers = 3;
-    sd_img_gen_params->circular_x        = false;
-    sd_img_gen_params->circular_y        = false;
-    sd_img_gen_params->pm_params         = {nullptr, 0, nullptr, 20.f};
-    sd_img_gen_params->pulid_params      = {nullptr, 1.0f};
-    sd_img_gen_params->vae_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
+    sd_img_gen_params->clip_skip           = -1;
+    sd_img_gen_params->ref_images_count    = 0;
+    sd_img_gen_params->ref_image_args      = "";
+    sd_img_gen_params->width               = 512;
+    sd_img_gen_params->height              = 512;
+    sd_img_gen_params->strength            = 0.75f;
+    sd_img_gen_params->seed                = -1;
+    sd_img_gen_params->batch_count         = 1;
+    sd_img_gen_params->control_strength    = 0.9f;
+    sd_img_gen_params->ip_adapter_strength = 1.0f;
+    sd_img_gen_params->qwen_image_layers   = 3;
+    sd_img_gen_params->circular_x          = false;
+    sd_img_gen_params->circular_y          = false;
+    sd_img_gen_params->pm_params           = {nullptr, 0, nullptr, 20.f};
+    sd_img_gen_params->pulid_params        = {nullptr, 1.0f};
+    sd_img_gen_params->vae_tiling_params   = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
     sd_cache_params_init(&sd_img_gen_params->cache);
     sd_hires_params_init(&sd_img_gen_params->hires);
 }
@@ -3608,8 +3896,7 @@ char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params) {
              "batch_count: %d\n"
              "qwen_image_layers: %d\n"
              "ref_images_count: %d\n"
-             "auto_resize_ref_image: %s\n"
-             "increase_ref_index: %s\n"
+             "ref_image_args: %s\n"
              "control_strength: %.2f\n"
              "photo maker: {style_strength = %.2f, id_images_count = %d, id_embed_path = %s}\n"
              "VAE tiling: %s (temporal=%s, extra_tiling_args=%s)\n"
@@ -3627,8 +3914,7 @@ char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params) {
              sd_img_gen_params->batch_count,
              sd_img_gen_params->qwen_image_layers,
              sd_img_gen_params->ref_images_count,
-             BOOL_STR(sd_img_gen_params->auto_resize_ref_image),
-             BOOL_STR(sd_img_gen_params->increase_ref_index),
+             SAFE_STR(sd_img_gen_params->ref_image_args),
              sd_img_gen_params->control_strength,
              sd_img_gen_params->pm_params.style_strength,
              sd_img_gen_params->pm_params.id_images_count,
@@ -3697,7 +3983,7 @@ struct sd_ctx_t {
 };
 
 static bool sd_version_supports_video_generation(SDVersion version) {
-    return version == VERSION_SVD || sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_ltxav(version);
+    return version == VERSION_SVD || sd_version_is_wan(version) || sd_version_is_hunyuan_video(version) || sd_version_is_lingbot_video(version) || sd_version_is_ltxav(version);
 }
 
 static bool sd_version_supports_image_generation(SDVersion version) {
@@ -3866,6 +4152,9 @@ SD_API bool sd_ctx_supports_video_generation(const sd_ctx_t* sd_ctx) {
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
         return false;
     }
+    if (sd_ctx->sd->animatediff_loaded && sd_version_supports_animatediff(sd_ctx->sd->version)) {
+        return true;
+    }
     return sd_version_supports_video_generation(sd_ctx->sd->version);
 }
 
@@ -3997,8 +4286,6 @@ struct GenerationRequest {
     float strength                           = 1.f;
     float control_strength                   = 0.f;
     float eta                                = 0.f;
-    bool increase_ref_index                  = false;
-    bool auto_resize_ref_image               = false;
     sd_guidance_params_t guidance            = {};
     sd_guidance_params_t high_noise_guidance = {};
     sd_pm_params_t pm_params                 = {};
@@ -4024,8 +4311,6 @@ struct GenerationRequest {
         strength                    = sd_img_gen_params->strength;
         control_strength            = sd_img_gen_params->control_strength;
         eta                         = sd_img_gen_params->sample_params.eta;
-        increase_ref_index          = sd_img_gen_params->increase_ref_index;
-        auto_resize_ref_image       = sd_img_gen_params->auto_resize_ref_image;
         has_ref_images              = sd_img_gen_params->ref_images_count > 0;
         guidance                    = sd_img_gen_params->sample_params.guidance;
         pm_params                   = sd_img_gen_params->pm_params;
@@ -4774,7 +5059,8 @@ static sd::Tensor<float> ensure_image_tensor_channels(sd::Tensor<float> image, i
 static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd_ctx_t* sd_ctx,
                                                                               const sd_img_gen_params_t* sd_img_gen_params,
                                                                               GenerationRequest* request,
-                                                                              SamplePlan* plan) {
+                                                                              SamplePlan* plan,
+                                                                              const RefImageParams& ref_image_params) {
     int64_t prepare_start_ms = ggml_time_ms();
 
     sd::Tensor<float> init_image_tensor;
@@ -4886,6 +5172,22 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
         }
     }
 
+    if (sd_ctx->sd->animatediff_num_frames > 1 &&
+        init_latent.dim() >= 4 && init_latent.shape()[3] == 1) {
+        int n_frames = sd_ctx->sd->animatediff_num_frames;
+        std::vector<int64_t> shape(init_latent.shape().begin(), init_latent.shape().end());
+        shape[3] = n_frames;
+        if (!init_image_tensor.empty()) {
+            sd::Tensor<float> replicated(shape);
+            for (int f = 0; f < n_frames; ++f) {
+                sd::ops::slice_assign(&replicated, 3, f, f + 1, init_latent);
+            }
+            init_latent = std::move(replicated);
+        } else {
+            init_latent = sd::Tensor<float>(std::move(shape));
+        }
+    }
+
     if (!control_image_tensor.empty()) {
         control_latent = sd_ctx->sd->encode_first_stage(control_image_tensor);
         if (control_latent.empty()) {
@@ -4917,11 +5219,19 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
             continue;
         }
         sd::Tensor<float> ref_latent;
-        if (request->auto_resize_ref_image && !sd_version_is_pid(sd_ctx->sd->version)) {
+        if (ref_image_params.resize_before_vae && !sd_version_is_pid(sd_ctx->sd->version)) {
             LOG_DEBUG("auto resize ref images");
-            int vae_image_size = std::min(1024 * 1024, request->width * request->height);
-            double vae_width   = sqrt(vae_image_size * ref_images[i].shape()[0] / ref_images[i].shape()[1]);
-            double vae_height  = vae_width * ref_images[i].shape()[1] / ref_images[i].shape()[0];
+            double vae_width;
+            double vae_height;
+            if (ref_image_params.resize_vae_to_target) {
+                vae_width  = request->width;
+                vae_height = request->height;
+            } else {
+                int target_pixels  = ref_image_params.vae_input_max_pixels > 0 ? ref_image_params.vae_input_max_pixels : 1024 * 1024;
+                int vae_image_size = std::min(target_pixels, request->width * request->height);
+                vae_width          = sqrt(vae_image_size * ref_images[i].shape()[0] / ref_images[i].shape()[1]);
+                vae_height         = vae_width * ref_images[i].shape()[1] / ref_images[i].shape()[0];
+            }
 
             int factor = sd_version_is_qwen_image(sd_ctx->sd->version) ? 32 : 16;
             vae_height = round(vae_height / factor) * factor;
@@ -5046,25 +5356,31 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
                                                                             const sd_img_gen_params_t* sd_img_gen_params,
                                                                             GenerationRequest* request,
                                                                             SamplePlan* plan,
-                                                                            ImageGenerationLatents* latents) {
+                                                                            ImageGenerationLatents* latents,
+                                                                            const RefImageParams& ref_image_params) {
     ConditionerRunnerDoneOnExit conditioner_runner_done{sd_ctx->sd->cond_stage_model.get()};
 
     ConditionerParams condition_params;
-    condition_params.text       = request->prompt;
-    condition_params.clip_skip  = request->clip_skip;
-    condition_params.width      = request->width;
-    condition_params.height     = request->height;
-    condition_params.ref_images = &latents->ref_images;
+    condition_params.text      = request->prompt;
+    condition_params.clip_skip = request->clip_skip;
+    condition_params.width     = request->width;
+    condition_params.height    = request->height;
+    if (ref_image_params.pass_to_vlm) {
+        condition_params.ref_images = &latents->ref_images;
+    }
+
+    condition_params.ref_image_params = ref_image_params;
 
     sd_ctx->sd->prepare_generation_extensions(request->pm_params,
                                               request->pulid_params,
                                               condition_params,
                                               plan->total_steps);
+    sd_ctx->sd->compute_ip_adapter_tokens(sd_img_gen_params->ip_adapter_image, sd_img_gen_params->ip_adapter_strength);
     int64_t prepare_start_ms         = ggml_time_ms();
     condition_params.zero_out_masked = false;
     auto cond                        = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
                                                                                            condition_params);
-    if (cond.c_concat.empty()) {
+    if (cond.c_concat.empty() && ref_image_params.pass_to_dit) {
         cond.c_concat = latents->concat_latent;  // TODO: optimize
     }
 
@@ -5093,7 +5409,7 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
             uncond                           = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
                                                                                                    condition_params);
         }
-        if (uncond.c_concat.empty()) {
+        if (uncond.c_concat.empty() && ref_image_params.pass_to_dit) {
             uncond.c_concat = latents->concat_latent;  // TODO: optimize
         }
     }
@@ -5111,13 +5427,13 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
             }
             condition_params.text            = request->negative_prompt;
             condition_params.zero_out_masked = zero_out_masked;
+            std::vector<sd::Tensor<float>> empty_ref_images;
             if (use_ref_latent_img_cfg) {
-                std::vector<sd::Tensor<float>> empty_ref_images;
                 condition_params.ref_images = &empty_ref_images;
             }
             img_uncond = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
                                                                              condition_params);
-            if (img_uncond.c_concat.empty()) {
+            if (img_uncond.c_concat.empty() && ref_image_params.pass_to_dit) {
                 img_uncond.c_concat = latents->img_uncond_concat_latent;  // TODO: optimize
             }
         }
@@ -5187,6 +5503,24 @@ static sd_image_t* decode_image_outputs(sd_ctx_t* sd_ctx,
             }
             if (cancelled) {
                 break;
+            }
+        } else if (sd_ctx->sd->animatediff_num_frames > 1 &&
+                   final_latents[i].dim() >= 4 &&
+                   final_latents[i].shape()[3] == sd_ctx->sd->animatediff_num_frames) {
+            int n_frames = sd_ctx->sd->animatediff_num_frames;
+            for (int f = 0; f < n_frames; ++f) {
+                if (sd_ctx->sd->get_cancel_flag() == SD_CANCEL_ALL) {
+                    LOG_ERROR("cancelling latent decodings");
+                    cancelled = true;
+                    break;
+                }
+                sd::Tensor<float> frame_latent = sd::ops::slice(final_latents[i], 3, f, f + 1);
+                sd::Tensor<float> image        = sd_ctx->sd->decode_first_stage(frame_latent);
+                if (image.empty()) {
+                    LOG_ERROR("decode_first_stage failed for AnimateDiff frame %d/%d", f + 1, n_frames);
+                    return nullptr;
+                }
+                decoded_images.push_back(std::move(image));
             }
         } else {
             sd::Tensor<float> image = sd_ctx->sd->decode_first_stage(final_latents[i]);
@@ -5434,13 +5768,16 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
     sd_ctx->sd->apply_loras(sd_img_gen_params->loras, sd_img_gen_params->lora_count);
     apply_circular_axes_to_diffusion(sd_ctx, sd_img_gen_params->circular_x, sd_img_gen_params->circular_y);
 
+    const RefImageParams ref_image_params = sd_ctx->sd->resolve_ref_image_params(sd_img_gen_params->ref_image_args);
+
     ImageVaeAxesGuard axes_guard(sd_ctx, sd_img_gen_params, request);
 
     SamplePlan plan(sd_ctx, sd_img_gen_params, request);
     auto latents_opt = prepare_image_generation_latents(sd_ctx,
                                                         sd_img_gen_params,
                                                         &request,
-                                                        &plan);
+                                                        &plan,
+                                                        ref_image_params);
     if (!latents_opt.has_value()) {
         return false;
     }
@@ -5450,7 +5787,8 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
                                                       sd_img_gen_params,
                                                       &request,
                                                       &plan,
-                                                      &latents);
+                                                      &latents,
+                                                      ref_image_params);
     if (!embeds_opt.has_value()) {
         return false;
     }
@@ -5496,7 +5834,7 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
                                                    plan.extra_sample_args,
                                                    plan.sigmas,
                                                    latents.ref_latents,
-                                                   request.increase_ref_index,
+                                                   ref_image_params,
                                                    latents.denoise_mask,
                                                    sd::Tensor<float>(),
                                                    1.f,
@@ -5617,7 +5955,7 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
                                                             plan.extra_sample_args,
                                                             hires_sigma_sched,
                                                             latents.ref_latents,
-                                                            request.increase_ref_index,
+                                                            ref_image_params,
                                                             hires_denoise_mask,
                                                             sd::Tensor<float>(),
                                                             1.f,
@@ -5818,6 +6156,66 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             int64_t t2 = ggml_time_ms();
             LOG_INFO("encode_first_stage completed, taking %" PRId64 " ms", t2 - t1);
         }
+    }
+
+    if (sd_version_is_hunyuan_video(sd_ctx->sd->version) &&
+        (!start_image.empty() || !end_image.empty())) {
+        LOG_INFO("Hunyuan Video IMG2VID");
+
+        int64_t t1                  = ggml_time_ms();
+        auto concat_latent          = sd_ctx->sd->generate_init_latent(request->width,
+                                                                       request->height,
+                                                                       request->frames,
+                                                                       true);
+        auto encode_condition_frame = [&](const sd::Tensor<float>& image,
+                                          int64_t latent_frame,
+                                          const char* name) -> bool {
+            auto encoded = sd_ctx->sd->encode_first_stage(image.unsqueeze(2));
+            if (encoded.empty()) {
+                LOG_ERROR("failed to encode Hunyuan Video %s conditioning frame", name);
+                return false;
+            }
+            if (encoded.dim() == 4) {
+                encoded.unsqueeze_(2);
+            }
+            if (encoded.dim() != 5 ||
+                encoded.shape()[0] != concat_latent.shape()[0] ||
+                encoded.shape()[1] != concat_latent.shape()[1] ||
+                encoded.shape()[3] != concat_latent.shape()[3]) {
+                LOG_ERROR("invalid Hunyuan Video %s conditioning latent shape", name);
+                return false;
+            }
+            sd::ops::slice_assign(&concat_latent,
+                                  2,
+                                  latent_frame,
+                                  latent_frame + 1,
+                                  sd::ops::slice(encoded, 2, 0, 1));
+            return true;
+        };
+
+        if (!start_image.empty() && !encode_condition_frame(start_image, 0, "start")) {
+            return std::nullopt;
+        }
+        if (!end_image.empty() &&
+            !encode_condition_frame(end_image, concat_latent.shape()[2] - 1, "end")) {
+            return std::nullopt;
+        }
+
+        sd::Tensor<float> concat_mask = sd::zeros<float>({concat_latent.shape()[0],
+                                                          concat_latent.shape()[1],
+                                                          concat_latent.shape()[2],
+                                                          1,
+                                                          1});
+        if (!start_image.empty()) {
+            sd::ops::fill_slice(&concat_mask, 2, 0, 1, 1.0f);
+        }
+        if (!end_image.empty()) {
+            sd::ops::fill_slice(&concat_mask, 2, concat_mask.shape()[2] - 1, concat_mask.shape()[2], 1.0f);
+        }
+        latents.concat_latent = sd::ops::concat(concat_latent, concat_mask, 3);
+
+        int64_t t2 = ggml_time_ms();
+        LOG_INFO("encode_first_stage completed, taking %" PRId64 " ms", t2 - t1);
     }
 
     if (sd_ctx->sd->diffusion_model->get_desc() == "Wan2.1-I2V-14B" ||
@@ -6053,6 +6451,9 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
     condition_params.text            = request.prompt;
     condition_params.zero_out_masked = true;
     condition_params.ref_images      = &latents.ref_images;
+    if (sd_version_is_lingbot_video(sd_ctx->sd->version)) {
+        condition_params.ref_image_params.vlm_resize_mode = RefImageResizeMode::AREA;
+    }
 
     int64_t prepare_start_ms = ggml_time_ms();
     embeds.cond              = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
@@ -6322,6 +6723,48 @@ static bool apply_ltxv_refine_image_conditioning(sd_ctx_t* sd_ctx,
     return true;
 }
 
+static bool generate_animatediff_video(sd_ctx_t* sd_ctx,
+                                       const sd_vid_gen_params_t* sd_vid_gen_params,
+                                       sd_image_t** frames_out,
+                                       int* num_frames_out) {
+    int n_frames = sd_vid_gen_params->video_frames;
+    if (n_frames < 1) {
+        LOG_ERROR("AnimateDiff: --video-frames must be >= 1");
+        return false;
+    }
+    if (n_frames > 32) {
+        LOG_WARN("AnimateDiff motion modules have a 32-frame positional-encoding context; capping to 32");
+        n_frames = 32;
+    }
+
+    sd_img_gen_params_t img_gen_params;
+    sd_img_gen_params_init(&img_gen_params);
+    img_gen_params.loras             = sd_vid_gen_params->loras;
+    img_gen_params.lora_count        = sd_vid_gen_params->lora_count;
+    img_gen_params.prompt            = sd_vid_gen_params->prompt;
+    img_gen_params.negative_prompt   = sd_vid_gen_params->negative_prompt;
+    img_gen_params.clip_skip         = sd_vid_gen_params->clip_skip;
+    img_gen_params.width             = sd_vid_gen_params->width;
+    img_gen_params.height            = sd_vid_gen_params->height;
+    img_gen_params.sample_params     = sd_vid_gen_params->sample_params;
+    img_gen_params.strength          = sd_vid_gen_params->strength;
+    img_gen_params.init_image        = sd_vid_gen_params->init_image;
+    img_gen_params.seed              = sd_vid_gen_params->seed;
+    img_gen_params.batch_count       = 1;
+    img_gen_params.control_strength  = 1.0f;
+    img_gen_params.vae_tiling_params = sd_vid_gen_params->vae_tiling_params;
+    img_gen_params.cache             = sd_vid_gen_params->cache;
+    img_gen_params.hires             = sd_vid_gen_params->hires;
+    img_gen_params.qwen_image_layers = 0;
+    img_gen_params.circular_x        = sd_vid_gen_params->circular_x;
+    img_gen_params.circular_y        = sd_vid_gen_params->circular_y;
+
+    sd_ctx->sd->animatediff_num_frames = n_frames;
+    bool ok                            = generate_image(sd_ctx, &img_gen_params, frames_out, num_frames_out);
+    sd_ctx->sd->animatediff_num_frames = 0;
+    return ok;
+}
+
 SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            const sd_vid_gen_params_t* sd_vid_gen_params,
                            sd_image_t** frames_out,
@@ -6336,12 +6779,20 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
     if (audio_out != nullptr) {
         *audio_out = nullptr;
     }
-
-    sd_ctx->sd->reset_cancel_flag();
-
     if (num_frames_out != nullptr) {
         *num_frames_out = 0;
     }
+
+    if (sd_ctx->sd->animatediff_loaded && sd_version_supports_animatediff(sd_ctx->sd->version)) {
+        LOG_INFO("AnimateDiff dispatch: %d frames, %dx%d",
+                 sd_vid_gen_params->video_frames, sd_vid_gen_params->width, sd_vid_gen_params->height);
+        return generate_animatediff_video(sd_ctx, sd_vid_gen_params, frames_out, num_frames_out);
+    }
+
+    sd_ctx->sd->reset_cancel_flag();
+
+    const RefImageParams ref_image_params;
+
     int64_t t0                    = ggml_time_ms();
     sd_ctx->sd->vae_tiling_params = sd_vid_gen_params->vae_tiling_params;
     apply_circular_axes_to_diffusion(sd_ctx, sd_vid_gen_params->circular_x, sd_vid_gen_params->circular_y);
@@ -6431,7 +6882,7 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                                                            plan.high_noise_extra_sample_args,
                                                            high_noise_sigmas,
                                                            std::vector<sd::Tensor<float>>{},
-                                                           false,
+                                                           ref_image_params,
                                                            latents.denoise_mask,
                                                            latents.vace_context,
                                                            request.vace_strength,
@@ -6473,7 +6924,7 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                                                         plan.extra_sample_args,
                                                         plan.sigmas,
                                                         std::vector<sd::Tensor<float>>{},
-                                                        false,
+                                                        ref_image_params,
                                                         latents.denoise_mask,
                                                         latents.vace_context,
                                                         request.vace_strength,
@@ -6622,7 +7073,7 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                                             plan.extra_sample_args,
                                             hires_sigma_sched,
                                             std::vector<sd::Tensor<float>>{},
-                                            false,
+                                            ref_image_params,
                                             hires_denoise_mask,
                                             sd::Tensor<float>(),
                                             hires_request.vace_strength,
