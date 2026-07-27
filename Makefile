@@ -299,21 +299,6 @@ endif
 HCC         := $(ROCM_PATH)/llvm/bin/clang
 HCXX        := $(ROCM_PATH)/llvm/bin/clang++
 endif
-ifdef GGML_HIP_FORCE_ROCWMMA_FATTN_GFX12
-HIPFLAGS   += -DGGML_HIP_ROCWMMA_FATTN_GFX12
-CFLAGS     += -DGGML_HIP_ROCWMMA_FATTN_GFX12
-CXXFLAGS   += -DGGML_HIP_ROCWMMA_FATTN_GFX12
-endif
-ifdef LLAMA_NO_WMMA
-HIPFLAGS   += -DGGML_HIP_NO_ROCWMMA_FATTN
-else
-DETECT_ROCWMMA := $(shell find -L /opt/rocm/include /usr/include -type f -name rocwmma.hpp 2>/dev/null | head -n 1)
-ifdef DETECT_ROCWMMA
-HIPFLAGS   += -DGGML_HIP_ROCWMMA_FATTN -I$(dir $(DETECT_ROCWMMA))
-else
-HIPFLAGS   += -DGGML_HIP_NO_ROCWMMA_FATTN
-endif
-endif
 
 HIPFLAGS   += -DGGML_USE_HIP -DGGML_HIP_NO_VMM -DGGML_USE_CUDA $(shell $(ROCM_PATH)/bin/hipconfig -C)
 HIPLDFLAGS    += -L$(ROCM_PATH)/lib -Wl,-rpath=$(ROCM_PATH)/lib
