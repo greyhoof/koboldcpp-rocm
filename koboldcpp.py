@@ -273,6 +273,7 @@ class load_model_inputs(ctypes.Structure):
                 ("visionmaxtokens", ctypes.c_int),
                 ("use_mmap", ctypes.c_bool),
                 ("use_mlock", ctypes.c_bool),
+                ("no_host", ctypes.c_bool),
                 ("use_mtp", ctypes.c_bool),
                 ("use_smartcontext", ctypes.c_bool),
                 ("use_contextshift", ctypes.c_bool),
@@ -1969,6 +1970,7 @@ def load_model(model_filename):
     inputs.blasthreads = args.blasthreads
     inputs.use_mmap = args.usemmap
     inputs.use_mlock = args.usemlock
+    inputs.no_host = True
     inputs.use_mtp = args.usemtp
     inputs.lora_filename = "".encode("UTF-8")
     inputs.lora_multiplier = args.loramult
