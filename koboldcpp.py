@@ -4077,6 +4077,28 @@ def strip_oaicontent_of_media(oaicontent):
         return outarr
     return oaicontent
 
+def get_base64_from_media_data(data):
+    if isinstance(data, str) and data.startswith("data:") and "," in data:
+        return data.split(",", 1)[1]
+    return data
+
+def sweep_media_from_mcpcontent(mcpcontentstr):
+    images = []
+    try:
+        if isinstance(mcpcontentstr, str):
+            mcp_pl = json.loads(mcpcontentstr)
+            if isinstance(mcp_pl, dict) and isinstance(mcp_pl.get("content",None),list):
+                for item in mcp_pl.get("content",[]):
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type","")=="image":
+                        data = get_base64_from_media_data(item.get("data",""))
+                        if data:
+                            images.append(data)
+    except Exception:
+        pass
+    return images
+
 def strip_mcpcontent_of_media(mcpcontentstr):
     try:
         if isinstance(mcpcontentstr, str):
@@ -4086,7 +4108,7 @@ def strip_mcpcontent_of_media(mcpcontentstr):
             if isinstance(mcp_pl, dict) and isinstance(mcp_pl.get("content",None),list):
                 pl_arr = mcp_pl.get("content",[])
                 for idx in range(len(pl_arr)):
-                    if pl_arr[idx].get("type","")=="image" and pl_arr[idx].get("data","")!="":
+                    if isinstance(pl_arr[idx], dict) and pl_arr[idx].get("type","")=="image" and pl_arr[idx].get("data","")!="":
                         pl_arr[idx]["data"] = "(base64 data attached)"
                         pl_modified = True
                 if pl_modified:
@@ -4128,7 +4150,10 @@ def determine_tool_json_to_use(genparams, curr_ctx, assistant_message_start, is_
         for message in reversed_messages:
             if message["role"] == "tool":
                 toolrespstr = message["content"]
-                # toolrespstr = strip_mcpcontent_of_media(toolrespstr)
+                if isinstance(toolrespstr, str):
+                    toolrespstr = strip_mcpcontent_of_media(toolrespstr)
+                else:
+                    toolrespstr = strip_oaicontent_of_media(toolrespstr)
                 tool_call_chunk.append(toolrespstr)
             else:
                 break
@@ -4244,20 +4269,13 @@ def sweep_media_from_messages(messages_array):
                 elif item.get("type") == "image": #handle mcp image content blocks in a list
                     data = item.get("data", "")
                     if data:
-                        images.append(data.split(",", 1)[1] if data.startswith("data:") else data)
+                        images.append(get_base64_from_media_data(data))
                 elif item.get("type") == "input_audio":
                     data = item.get("input_audio", {}).get("data")
                     if data:
                         audio.append(data)
         elif message.get("role", "")=="tool" and isinstance(curr_content, str): #handle mcp returned images
-            try:
-                mcp_pl = json.loads(curr_content)
-                if isinstance(mcp_pl, dict) and isinstance(mcp_pl.get("content",None),list):
-                    pl_arr = mcp_pl.get("content",[])
-                    if len(pl_arr)>0 and pl_arr[0].get("type","")=="image" and pl_arr[0].get("data","")!="":
-                        images.append(pl_arr[0].get("data",""))
-            except Exception:
-                pass
+            images.extend(sweep_media_from_mcpcontent(curr_content))
         imgs_ollama = message.get("images", None)
         if imgs_ollama:
             for img in imgs_ollama:
@@ -4460,7 +4478,8 @@ ws ::= | " " | "\n" [ \t]{0,20}
                                 messages_string += "\n(Made a function call)\n"
                         pass  # do nothing
                     elif isinstance(curr_content, str):
-                        if latest_turn_was_tool and message_index < len(messages_array):
+                        if latest_turn_was_tool:
+                            images_added.extend(sweep_media_from_mcpcontent(curr_content))
                             curr_content = strip_mcpcontent_of_media(curr_content)
                         messages_string += curr_content
                     elif isinstance(curr_content, list): #is an array
@@ -4471,6 +4490,12 @@ ws ::= | " " | "\n" [ \t]{0,20}
                                 elif item['type']=="image_url":
                                     if 'image_url' in item and item['image_url'] and item['image_url']['url'] and item['image_url']['url'].startswith("data:image"):
                                         images_added.append(item['image_url']['url'].split(",", 1)[1])
+                                        attachedimgid += 1
+                                        messages_string += f"\n(Attached Image {attachedimgid})\n"
+                                elif item['type']=="image":
+                                    data = get_base64_from_media_data(item.get("data", ""))
+                                    if data:
+                                        images_added.append(data)
                                         attachedimgid += 1
                                         messages_string += f"\n(Attached Image {attachedimgid})\n"
                                 elif item['type']=="input_audio":
