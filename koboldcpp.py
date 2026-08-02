@@ -4262,6 +4262,8 @@ def sweep_media_from_messages(messages_array):
         curr_content = message.get("content", None)
         if isinstance(curr_content, list):
             for item in curr_content:
+                if not isinstance(item, dict):
+                    continue
                 if item.get("type") == "image_url":
                     url = item.get("image_url", {}).get("url", "")
                     if url.startswith("data:image"):
@@ -4485,20 +4487,21 @@ ws ::= | " " | "\n" [ \t]{0,20}
                     elif isinstance(curr_content, list): #is an array
                         for item in curr_content:
                             if isinstance(item, dict):
-                                if item['type']=="text":
+                                item_type = item.get("type", "")
+                                if item_type=="text":
                                         messages_string += item['text']
-                                elif item['type']=="image_url":
+                                elif item_type=="image_url":
                                     if 'image_url' in item and item['image_url'] and item['image_url']['url'] and item['image_url']['url'].startswith("data:image"):
                                         images_added.append(item['image_url']['url'].split(",", 1)[1])
                                         attachedimgid += 1
                                         messages_string += f"\n(Attached Image {attachedimgid})\n"
-                                elif item['type']=="image":
+                                elif item_type=="image":
                                     data = get_base64_from_media_data(item.get("data", ""))
                                     if data:
                                         images_added.append(data)
                                         attachedimgid += 1
                                         messages_string += f"\n(Attached Image {attachedimgid})\n"
-                                elif item['type']=="input_audio":
+                                elif item_type=="input_audio":
                                     if 'input_audio' in item and item['input_audio'] and item['input_audio']['data']:
                                         audio_added.append(item['input_audio']['data'])
                                         attachedaudid += 1
