@@ -161,16 +161,17 @@ static bool is_vid_model = false;
 static bool remove_limits = false;
 
 struct gendata_st {
-    int status;
-    int step;
-    double step_time;
+    int status = 0;
+    int step = 0;
+    double step_time = 0.0;
     std::string preview;
 };
 
 struct {
     std::mutex mux;
     std::chrono::steady_clock::time_point start_time;
-    int steps;
+    int steps = 0;
+    bool preview_requested = false;
     gendata_st gendata;
 } geninfo;
 
@@ -574,7 +575,7 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
         }
     }
 
-    sd_set_preview_callback(step_callback, PREVIEW_PROJ, 1, true, false, nullptr);
+    sd_set_preview_callback(step_callback, PREVIEW_PROJ, 1, false, false, nullptr);
 
     if (sddebugmode) {
         // the default progress bar would become intermingled with the debug log
@@ -1028,8 +1029,12 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
 {
     struct CleanupInfoOnExit {
         ~CleanupInfoOnExit() {
-            std::lock_guard<std::mutex> lock(geninfo.mux);
-            geninfo.gendata.status = 0;
+            {
+                std::lock_guard<std::mutex> lock(geninfo.mux);
+                geninfo.gendata.status = 0;
+                geninfo.preview_requested = false;
+            }
+            sd_set_preview_callback(step_callback, PREVIEW_PROJ, 1, false, false, nullptr);
         }
     } cleanup_info_on_exit;
 
@@ -1041,9 +1046,12 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
     {
         std::lock_guard<std::mutex> lock(geninfo.mux);
         geninfo.start_time = std::chrono::steady_clock::now();
-        geninfo.gendata.status = 1;
         geninfo.steps = inputs.sample_steps;
+        geninfo.preview_requested = false;
+        geninfo.gendata = {};
+        geninfo.gendata.status = 1;
     }
+    sd_set_preview_callback(step_callback, PREVIEW_PROJ, 1, false, false, nullptr);
 
     sd_image_t * results = nullptr;
     int generated_num_results = 0;
@@ -1730,6 +1738,15 @@ static inline double get_time_delta(const std::chrono::steady_clock::time_point&
 
 static void step_callback(int step, int frame_count, sd_image_t* image, bool is_noisy, void* data)
 {
+    {
+        std::lock_guard<std::mutex> lock(geninfo.mux);
+        if (!geninfo.preview_requested) {
+            return;
+        }
+        geninfo.preview_requested = false;
+    }
+    sd_set_preview_callback(step_callback, PREVIEW_PROJ, 1, false, false, nullptr);
+
     gendata_st gendata;
     gendata.status = 2;
     if (frame_count == 1) {
@@ -1737,8 +1754,12 @@ static void step_callback(int step, int frame_count, sd_image_t* image, bool is_
     } else {
         uint8_t * out_data = nullptr;
         size_t out_len = 0;
-        create_gif_buf_from_sd_images_msf(image, frame_count, 16, &out_data,&out_len);
-        gendata.preview = kcpp_base64_encode(out_data, out_len);
+        if (create_gif_buf_from_sd_images_msf(image, frame_count, 16, &out_data,&out_len) == 0 && out_data && out_len > 0) {
+            gendata.preview = kcpp_base64_encode(out_data, out_len);
+        }
+        if (out_data) {
+            free(out_data);
+        }
     }
     gendata.step = step;
     gendata.step_time = get_time_delta(geninfo.start_time);
@@ -1747,6 +1768,15 @@ static void step_callback(int step, int frame_count, sd_image_t* image, bool is_
     if (step == geninfo.steps)
         gendata.status = 3;
     geninfo.gendata = gendata;
+}
+
+void sdtype_request_ongoing_generation_preview()
+{
+    std::lock_guard<std::mutex> lock(geninfo.mux);
+    if (geninfo.gendata.status != 0) {
+        geninfo.preview_requested = true;
+        sd_set_preview_callback(step_callback, PREVIEW_PROJ, 1, true, false, nullptr);
+    }
 }
 
 sd_generation_outputs sdtype_upscale(const sd_upscale_inputs inputs)
@@ -1843,14 +1873,16 @@ sd_info_outputs sdtype_get_info()
 
 sd_info_outputs sdtype_get_ongoing_generation_info()
 {
-    double elapsed_time;
-    int steps;
+    double elapsed_time = 0.0;
+    int steps = 0;
     gendata_st gendata;
     {
         std::lock_guard<std::mutex> lock(geninfo.mux);
         gendata = geninfo.gendata;
-        elapsed_time = get_time_delta(geninfo.start_time);
         steps = geninfo.steps;
+        if (gendata.status != 0) {
+            elapsed_time = get_time_delta(geninfo.start_time);
+        }
     }
 
     nlohmann::json j;
@@ -1868,7 +1900,7 @@ sd_info_outputs sdtype_get_ongoing_generation_info()
         j["status"] = "idle";
     j["preview"] = gendata.preview;
 
-    static std::string recent_info;
+    static thread_local std::string recent_info;
     recent_info = j.dump();
     sd_info_outputs output;
     output.status = 0;

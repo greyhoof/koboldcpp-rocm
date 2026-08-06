@@ -1003,6 +1003,8 @@ def init_library():
     handle.sd_abort_generation.restype = None
     handle.sd_get_ongoing_generation_info.argtypes = []
     handle.sd_get_ongoing_generation_info.restype = sd_info_outputs
+    handle.sd_request_ongoing_generation_preview.argtypes = []
+    handle.sd_request_ongoing_generation_preview.restype = None
     handle.whisper_load_model.argtypes = [whisper_load_model_inputs]
     handle.whisper_load_model.restype = ctypes.c_bool
     handle.whisper_generate.argtypes = [whisper_generation_inputs]
@@ -2979,10 +2981,25 @@ def sd_get_ongoing_generation_info():
         try:
             return json.loads(info.data)
         except Exception:
-            print("An error occurred while decoding sd ongoig generation info")
+            print("An error occurred while decoding sd ongoing generation info")
     else:
-        print("An error occurred while getting sd ongoig generation info")
+        print("An error occurred while getting sd ongoing generation info")
     return {}
+
+def parse_query_bool(parsed_dict, key, default=False):
+    value = parsed_dict.get(key, [default])
+    if isinstance(value, list):
+        value = value[0] if value else default
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    value = str(value).strip().lower()
+    if value in ('1', 'true', 'yes', 'on'):
+        return True
+    if value in ('0', 'false', 'no', 'off'):
+        return False
+    return default
 
 def build_a1111_progress_response(
     status: str,
@@ -3061,12 +3078,14 @@ def build_a1111_progress_response(
     }
 
 def a1111_progress_response(preview=False):
+    if preview:
+        handle.sd_request_ongoing_generation_preview()
     status = sd_get_ongoing_generation_info()
     result = build_a1111_progress_response(
         status.get('status', 0),
         status.get('step', 0),
         status.get('steps', 1),
-        status.get('step_time', 1),
+        status.get('elapsed_time', 0),
         preview and status.get('preview') or None)
     return result
 
@@ -6584,7 +6603,7 @@ Change Mode<br>
             parsed_url = urllib.parse.urlparse(self.path)
             parsed_dict = urllib.parse.parse_qs(parsed_url.query)
             genkey = parsed_dict.get('genkey', [''])[0]
-            skip_current_image = bool(parsed_dict.get('skip_current_image', False))
+            skip_current_image = parse_query_bool(parsed_dict, 'skip_current_image')
             # with no auth, reveal status without preview image
             auth = bool(genkey and genkey==currgenimgkey)
             info = a1111_progress_response(auth and not skip_current_image)
@@ -7731,6 +7750,7 @@ Change Mode<br>
                         self.end_headers(content_type='application/json')
                         self.wfile.write(genresp)
                     except Exception as ex:
+                        currgenimgkey = ''
                         utfprint(ex,1)
                         print("Generate Image: The response could not be sent, maybe connection was terminated?")
                         time.sleep(0.2) #short delay
