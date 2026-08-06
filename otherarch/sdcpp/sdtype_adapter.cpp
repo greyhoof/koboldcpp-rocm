@@ -309,7 +309,7 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     int lora_apply_mode = LORA_APPLY_AT_RUNTIME;
     bool lora_dynamic = false;
     bool lora_cache = false;
-    if(inputs.lora_apply_mode >= 0 && inputs.lora_apply_mode <= 2) {
+    if(inputs.lora_apply_mode >= 1 && inputs.lora_apply_mode <= 2) {
         lora_apply_mode = inputs.lora_apply_mode;
     }
     else {
