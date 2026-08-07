@@ -172,6 +172,7 @@ struct {
     std::chrono::steady_clock::time_point start_time;
     int steps = 0;
     bool preview_requested = false;
+    bool preview_enabled = false;
     gendata_st gendata;
 } geninfo;
 
@@ -293,14 +294,26 @@ std::string load_gpt_oss_vocab_json()
 static void progress_callback(int step, int steps, float time, void* data)
 {
     (void) data;
-    if(sd_is_quiet) return;
+    bool enable_preview = false;
+    {
+        std::lock_guard<std::mutex> lock(geninfo.mux);
+        if (geninfo.preview_requested && !geninfo.preview_enabled) {
+            geninfo.preview_enabled = true;
+            enable_preview = true;
+        }
+    }
+    if (enable_preview) {
+        sd_set_preview_callback(step_callback, PREVIEW_PROJ, 1, true, false, nullptr);
+    }
+
+    if(sd_is_quiet || step == 0) return;
     const char* unit = "s/it";
     float speed = time;
     if (speed < 1.0f && speed > 0.f) {
         speed = 1.0f / speed;
         unit  = "it/s";
     }
-    printf("Generating image: %d/%d steps, %.2f%s\n", step, steps, speed, unit);
+    printf("\rGenerating image: %d/%d steps, %.2f%s%s", step, steps, speed, unit, step == steps ? "\n" : "");
     fflush(stdout);
 }
 
@@ -577,10 +590,7 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
 
     sd_set_preview_callback(step_callback, PREVIEW_PROJ, 1, false, false, nullptr);
 
-    if (sddebugmode) {
-        // the default progress bar would become intermingled with the debug log
-        sd_set_progress_callback(progress_callback, nullptr);
-    }
+    sd_set_progress_callback(progress_callback, nullptr);
 
     return true;
 }
@@ -1033,6 +1043,7 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
                 std::lock_guard<std::mutex> lock(geninfo.mux);
                 geninfo.gendata.status = 0;
                 geninfo.preview_requested = false;
+                geninfo.preview_enabled = false;
             }
             sd_set_preview_callback(step_callback, PREVIEW_PROJ, 1, false, false, nullptr);
         }
@@ -1048,6 +1059,7 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         geninfo.start_time = std::chrono::steady_clock::now();
         geninfo.steps = inputs.sample_steps;
         geninfo.preview_requested = false;
+        geninfo.preview_enabled = false;
         geninfo.gendata = {};
         geninfo.gendata.status = 1;
     }
@@ -1744,6 +1756,7 @@ static void step_callback(int step, int frame_count, sd_image_t* image, bool is_
             return;
         }
         geninfo.preview_requested = false;
+        geninfo.preview_enabled = false;
     }
     sd_set_preview_callback(step_callback, PREVIEW_PROJ, 1, false, false, nullptr);
 
@@ -1775,7 +1788,6 @@ void sdtype_request_ongoing_generation_preview()
     std::lock_guard<std::mutex> lock(geninfo.mux);
     if (geninfo.gendata.status != 0) {
         geninfo.preview_requested = true;
-        sd_set_preview_callback(step_callback, PREVIEW_PROJ, 1, true, false, nullptr);
     }
 }
 
