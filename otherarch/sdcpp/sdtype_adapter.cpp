@@ -319,7 +319,7 @@ static void progress_callback(int step, int steps, float time, void* data)
     {
         printf("\n");
     }
-    printf("\rGenerating image: %d/%d steps, %.2f %s\033[K%s", step, steps, speed, unit, step == steps ? "\n" : "");
+    printf("\rGenerating image: %d/%d steps, %.2f %s\033[K%s", step, steps, speed, unit, (step == steps || sddebugmode==1) ? "\n" : "");
     fflush(stdout);
 }
 
