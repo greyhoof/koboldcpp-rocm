@@ -11,6 +11,7 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
+#include "llama-kv-cache-msa.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
@@ -2213,6 +2214,28 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             {
                 res = nullptr;
             } break;
+        case LLM_ARCH_MINIMAX_M3:
+            {
+                // sparse (MSA) layers carry an indexer key cache, but leading dense layers do not
+                llama_kv_cache::layer_filter_cb filter_idx =
+                    [&](int32_t il) { return (uint32_t) il >= hparams.n_layer_dense_lead; };
+
+                res = new llama_kv_cache_msa(
+                        *this,
+                        params.type_k,
+                        params.type_v,
+                        !cparams.flash_attn,
+                        cparams.offload_kqv,
+                        cparams.kv_unified,
+                        cparams.n_ctx_seq,
+                        cparams.n_seq_max,
+                        1,
+                        hparams.n_swa,
+                        hparams.swa_type,
+                        nullptr,
+                        filter_idx,
+                        nullptr);
+            } break;
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_DEEPSEEK32:
             {
@@ -2243,10 +2266,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 } else {
                     // Main context: DSA cache for the trunk layers only - the nextn
                     // layer(s) are never attended by the trunk graph.
-                    llama_kv_cache::layer_filter_cb filter = nullptr;
+                    llama_kv_cache::layer_filter_cb filter_mla = nullptr;
                     if (hparams.n_layer_nextn > 0) {
-                        filter = [&](uint32_t il) { return il < hparams.n_layer(); };
+                        filter_mla = [&](uint32_t il) { return il < hparams.n_layer(); };
                     }
+                    llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return il < hparams.n_layer() && (arch != LLM_ARCH_GLM_DSA || hparams.is_indexer_full(il)); };
 
                     res = new llama_kv_cache_dsa(
                             *this,
@@ -2260,7 +2284,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             1,
                             hparams.n_swa,
                             hparams.swa_type,
-                            filter,
+                            filter_mla,
+                            filter_lid,
                             nullptr);
                 }
             } break;
@@ -2984,7 +3009,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_DUPLICATED     (llama_model_loader::TENSOR_DUPLICATED),
     TENSOR_NOT_REQUIRED   (llama_model_loader::TENSOR_NOT_REQUIRED),
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
-    TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL) {}
+    TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
+    TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);

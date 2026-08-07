@@ -14,6 +14,7 @@
 #include "llama-kv-cache-dsa.cpp"
 #include "llama-kv-cache-dsv4.cpp"
 #include "llama-kv-cache-iswa.cpp"
+#include "llama-kv-cache-msa.cpp"
 #include "llama-memory-hybrid.cpp"
 #include "llama-memory-hybrid-iswa.cpp"
 #include "llama-memory-recurrent.cpp"
