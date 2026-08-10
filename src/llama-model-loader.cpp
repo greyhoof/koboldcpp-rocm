@@ -1269,7 +1269,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return ret;
     }
 
-    LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
+    // LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
     const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
     if (cur == NULL) {
         return NULL;

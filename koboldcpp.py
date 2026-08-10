@@ -46,8 +46,8 @@ import queue
 num_server_threads = 40
 sampler_order_max = 7
 tensor_split_max = 16
-images_max = 48
-audio_max = 48
+images_max = 64
+audio_max = 64
 bias_min_value = -100.0
 bias_max_value = 100.0
 logprobs_max = 10
