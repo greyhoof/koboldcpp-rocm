@@ -91,6 +91,7 @@
 #include "models/gptneox.cpp"
 #include "models/granite-hybrid.cpp"
 #include "models/granite-moe.cpp"
+#include "models/granite-switch.cpp"
 #include "models/granite.cpp"
 #include "models/grok.cpp"
 #include "models/grovemoe.cpp"
@@ -376,6 +377,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_granite(params);
         case LLM_ARCH_GRANITE_MOE:
             return new llama_model_granite_moe(params);
+        case LLM_ARCH_GRANITE_SWITCH:
+            return new llama_model_granite_switch(params);
         case LLM_ARCH_MINICPM:
             return new llama_model_minicpm(params);
         case LLM_ARCH_GRANITE_HYBRID:
@@ -2054,6 +2057,7 @@ void llama_model::print_info() const {
                 arch == LLM_ARCH_GRANITE ||
                 arch == LLM_ARCH_GRANITE_MOE ||
                 arch == LLM_ARCH_GRANITE_HYBRID ||
+                arch == LLM_ARCH_GRANITE_SWITCH ||
                 arch == LLM_ARCH_NEMOTRON_H_MOE) {
             LLAMA_LOG_INFO("%s: f_embedding_scale     = %f\n", __func__, hparams.f_embedding_scale);
             LLAMA_LOG_INFO("%s: f_residual_scale      = %f\n", __func__, hparams.f_residual_scale);
@@ -2738,6 +2742,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GRANITE:
         case LLM_ARCH_GRANITE_MOE:
         case LLM_ARCH_GRANITE_HYBRID:
+        case LLM_ARCH_GRANITE_SWITCH:
         case LLM_ARCH_CHAMELEON:
         case LLM_ARCH_BAILINGMOE:
         case LLM_ARCH_NEO_BERT:
