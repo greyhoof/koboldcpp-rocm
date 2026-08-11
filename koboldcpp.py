@@ -184,6 +184,7 @@ zenity_recent_dir = os.getcwd()
 zenity_permitted = True
 default_rpc_port = 5551
 thinkformats = [{"start":"<|channel|>analysis<|message|>","end":"<|start|>assistant<|channel|>final<|message|>"},
+                {"start":" to=self<|message|>","end":"<|eom|><|start|>assistant"},
                 {"start":"<think>","end":"</think>"},
                 {"start":"<seed:think>","end":"</seed:think>"},
                 {"start":"<|START_THINKING|>","end":"<|END_THINKING|>"},
@@ -200,7 +201,49 @@ tool_call_pairs = [ #third element is optional str to match in chat template bef
     ("<|tool_call_start|>", "<|tool_call_end|>", "CONTINUE_FINAL_MESSAGE_TAG", True), #lfm2.5
     ("<tool_calls>", "</tool_calls>", "[BEGIN FINAL RESPONSE]", True), #apriel
     ("<|START_ACTION|>", "<|END_ACTION|>", "<|START_OF_TURN_TOKEN|>", True), #cohere
+    ("<atem:function_calls>", "</atem:function_calls>", "<|eom|>", True), #muse glimmer
 ]
+
+address_header_formats = [
+    {
+        "required": ["<|start|>assistant", " to=", "<|message|>", "<|eom|>"],
+        "pattern": r'(?s)(?:^|<\|start\|>assistant)\s*to=[^\s<]+<\|message\|>',
+        "tail_start_pattern": r'(?:^|<\|start\|>assistant)\s*to=[^\s<]*$',
+        "tail_message_pattern": r'(?:^|<\|start\|>assistant)\s*to=[^\s<]*',
+        "tail_message_tag": "<|message|>",
+    },
+]
+
+def active_address_header_formats():
+    global cached_chat_template
+    tmpl = cached_chat_template or ""
+    return [fmt for fmt in address_header_formats if all(item in tmpl for item in fmt["required"])]
+
+def strip_address_headers(text):
+    if not text:
+        return text
+    for fmt in active_address_header_formats():
+        text = re.sub(fmt["pattern"], '', text)
+    return text
+
+def split_address_header_tail(text, stream_done=False):
+    if not text or stream_done:
+        return text, ""
+    tail = ""
+    for fmt in active_address_header_formats():
+        start_match = re.search(fmt["tail_start_pattern"], text)
+        msg_tail = fmt["tail_message_tag"]
+        for n in range(1, len(msg_tail)):
+            prefix = msg_tail[:n]
+            marker = re.search(fmt["tail_message_pattern"] + re.escape(prefix) + r'$', text)
+            if marker and len(text[marker.start():]) > len(tail):
+                tail = text[marker.start():]
+        if start_match and len(text[start_match.start():]) > len(tail):
+            tail = text[start_match.start():]
+    if tail:
+        return text[:-len(tail)], tail
+    return text, ""
+
 deprecated_keys = {
     "hordeconfig",
     "sdconfig",
@@ -3671,6 +3714,28 @@ def coerce_tool_argtypes(tool_calls: list, tool_list: list) -> list:
 def toolcall_to_normalized_json(text,start_tag,end_tag,required_match_txt): #convert weird formats into standard tool call json
     global cached_chat_template
     text = text.strip()
+    def parse_muse_glimmer(text: str) -> str:
+        results = []
+        for invoke in re.finditer(
+            r'<atem:invoke\s+name=["\']?([^"\'>\s]+)["\']?>(.*?)</atem:invoke>',
+            text, re.DOTALL
+        ):
+            fn_name = invoke.group(1).strip()
+            params = {}
+            for p in re.finditer(
+                r'<atem:parameter\s+name=["\']?([^"\'>\s]+)["\']?>(.*?)</atem:parameter>',
+                invoke.group(2), re.DOTALL
+            ):
+                val = p.group(2)
+                try:
+                    params[p.group(1).strip()] = json.loads(val)
+                except Exception:
+                    params[p.group(1).strip()] = val
+            results.append({"name": fn_name, "arguments": params})
+        if not results:
+            return text
+        return json.dumps(results) if len(results) > 1 else json.dumps(results[0])
+
     def parse_qwen35(text: str) -> str:
         fn_match = re.search(r"<function=(.*?)>", text)
         if not fn_match:
@@ -3852,6 +3917,9 @@ def toolcall_to_normalized_json(text,start_tag,end_tag,required_match_txt): #con
 
     if "<invoke " in text: #minimax
         return parse_minimax(text)
+
+    if "<atem:invoke " in text: #muse glimmer
+        return parse_muse_glimmer(text)
 
     if '<｜tool▁sep｜>' in text: #deepseek
         return parse_deepseek_r1_sep(text)
@@ -5555,6 +5623,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     recvtxt = None
                     currfinishreason = "tool_calls"
                     utfprint(f"\nExecute Toolcall: {json.dumps(tool_calls)}",1)
+        if recvtxt:
+            recvtxt = strip_address_headers(recvtxt)
 
         modelNameToReturn = friendlymodelname
         if autoswapmode and textName is not None:
@@ -5797,6 +5867,13 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                     if sindex != -1 and trim_str!="":
                                         tokenStr = tokenStr[:sindex]
 
+                            tokenStr, address_header_tail = split_address_header_tail(tokenStr, streamDone)
+                            if address_header_tail:
+                                tokenReserve += address_header_tail
+                                if tokenStr == "":
+                                    await asyncio.sleep(async_sleep_short)
+                                    continue
+
                         sync_potential_toolcall_splitmatch = ""
                         if tokenStr!="" or streamDone:
                             if (api_format == 4 or api_format == 7 or api_format == 9) and using_openai_tools and tool_segment_tag and not streamDone and not genparams.get("sync_toolcall_potential_triggered", False) and tool_segment_tag not in tokenStr:
@@ -5843,7 +5920,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                             if pair["end"] in out2:
                                                 out2 = out2.replace(pair["end"], "")
                                             if out2:
-                                                delta['content'] = out2
+                                                delta['content'] = strip_address_headers(out2)
                                             break
                                     if not foundend:
                                         # Still thinking - swallow extraneous start tags from THIS pair only
@@ -5880,7 +5957,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                                 delta['reasoning_content'] = out2_think
                                                 # Append anything after the end tag to the content part
                                                 if out2_content:
-                                                    delta['content'] = delta.get('content', '') + out2_content
+                                                    delta['content'] = delta.get('content', '') + strip_address_headers(out2_content)
                                             matched_start = True
                                             break
                                     # Condition C: No start tag found, just normal text
@@ -5890,10 +5967,10 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                         # Only swallow stray end tags if we've already locked in a pair
                                         if len(thinkpairs) == 1 and thinkpairs[0]["end"] in cleaned:
                                             cleaned = cleaned.replace(thinkpairs[0]["end"], "")
-                                        delta['content'] = cleaned
+                                        delta['content'] = strip_address_headers(cleaned)
                                 encap_first_loop = False
                             else:
-                                delta['content'] = tokenStr
+                                delta['content'] = strip_address_headers(tokenStr)
 
                             if genparams.get("sync_toolcall_potential_triggered",False) and delta: # if sync_toolcall_potential_triggered, buffer up the impending content chunk for tools in fakestreaming, in case toolcalls fail
                                 ec = genparams.get("sync_toolcall_extra_content","")

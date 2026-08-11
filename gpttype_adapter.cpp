@@ -5107,7 +5107,27 @@ std::string gpttype_parse_chat_tool_calls(const std::string & generated_text,
         parser_params.parse_tool_calls = true;
         parser_params.parser.load(chat_params.parser);
 
-        common_chat_msg parsed = common_chat_parse(generated_text, is_partial, parser_params);
+        ggml_log_callback currlogger = nullptr;
+        void * curruserdat = nullptr;
+        int oldverbosity = common_log_get_verbosity_thold();
+        llama_log_get(&currlogger, &curruserdat);
+        llama_log_set(log_callback_off, nullptr);
+        common_log_set_verbosity_thold(GGML_LOG_LEVEL_NONE);
+
+        common_chat_msg parsed;
+        try
+        {
+            parsed = common_chat_parse(generated_text, is_partial, parser_params);
+        }
+        catch(...)
+        {
+            llama_log_set(currlogger, curruserdat);
+            common_log_set_verbosity_thold(oldverbosity);
+            throw;
+        }
+
+        llama_log_set(currlogger, curruserdat);
+        common_log_set_verbosity_thold(oldverbosity);
         if(parsed.tool_calls.empty())
         {
             return "";
