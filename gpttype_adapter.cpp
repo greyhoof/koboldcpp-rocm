@@ -16,6 +16,7 @@
 #include "otherarch.h"
 #include "llama.h"
 #include <vector>
+#include <sstream>
 #include <map>
 #include <cstdint>
 #include <string>
@@ -452,10 +453,11 @@ bool allExtendedUnicode(const std::string& str) {
     return true;
 }
 
-void print_fitted_params(const llama_model_params & mparams, const llama_context_params & cparams)
+std::string get_fitted_params_str(const llama_model_params & mparams, const llama_context_params & cparams)
 {
-    std::cout << "-c "    << cparams.n_ctx;
-    std::cout << " -ngl " << mparams.n_gpu_layers;
+    std::ostringstream out;
+    out << "-c "    << cparams.n_ctx;
+    out << " -ngl " << mparams.n_gpu_layers;
     size_t nd = llama_max_devices();
     while (nd > 1 && mparams.tensor_split[nd - 1] == 0.0f) {
         nd--;
@@ -463,25 +465,25 @@ void print_fitted_params(const llama_model_params & mparams, const llama_context
     if (nd > 1) {
         for (size_t id = 0; id < nd; id++) {
             if (id == 0) {
-                std::cout << " -ts ";
+                out << " -ts ";
             }
             if (id > 0) {
-                std::cout << ",";
+                out << ",";
             }
-            std::cout << mparams.tensor_split[id];
+            out << mparams.tensor_split[id];
         }
     }
     const size_t ntbo = llama_max_tensor_buft_overrides();
     for (size_t itbo = 0; itbo < ntbo && mparams.tensor_buft_overrides[itbo].pattern != nullptr; itbo++) {
         if (itbo == 0) {
-            std::cout << " -ot ";
+            out << " -ot ";
         }
         if (itbo > 0) {
-            std::cout << ",";
+            out << ",";
         }
-        std::cout << mparams.tensor_buft_overrides[itbo].pattern << "=" << ggml_backend_buft_name(mparams.tensor_buft_overrides[itbo].buft);
+        out << mparams.tensor_buft_overrides[itbo].pattern << "=" << ggml_backend_buft_name(mparams.tensor_buft_overrides[itbo].buft);
     }
-    std::cout << "\n";
+    return out.str();
 }
 
 static size_t estimate_draft_autofit_tax_mb(
@@ -3482,8 +3484,11 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
                 llama_log_set(currlogger, curruserdat);
                 common_log_set_verbosity_thold(oldverbosity);
             }
-            printf("Autofit Success: %d, Autofit Result: ",success);
-            print_fitted_params(model_params,llama_ctx_params);
+            common_log_flush(common_log_main());
+            fflush(stderr);
+            const std::string fitted_params = get_fitted_params_str(model_params,llama_ctx_params);
+            printf("Autofit Success: %d, Autofit Result: %s\n",success,fitted_params.c_str());
+            fflush(stdout);
             if(!success)
             {
                 //revert to previous
