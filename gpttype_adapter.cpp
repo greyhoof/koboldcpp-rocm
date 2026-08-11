@@ -507,6 +507,7 @@ static size_t estimate_draft_autofit_tax_mb(
     draft_model_params.devices = base_model_params.devices;
     draft_model_params.main_gpu = base_model_params.main_gpu;
     draft_model_params.split_mode = llama_split_mode::LLAMA_SPLIT_MODE_LAYER;
+    draft_model_params.load_mtp = true;
 
     draft_ctx_params.n_ctx = base_ctx_params.n_ctx;
     draft_ctx_params.offload_kqv = base_ctx_params.offload_kqv;
@@ -922,6 +923,7 @@ static void speculative_decoding_setup(std::string spec_model_filename, llama_co
     draft_model_params.load_mode = base_model_params.load_mode;
     draft_model_params.n_gpu_layers = draft_gpulayers; //layers offload the speculative model.
     draft_model_params.devices = base_model_params.devices;
+    draft_model_params.load_mtp = true;
     draft_ctx_params.n_ctx = base_ctx_params.n_ctx;
     draft_ctx_params.offload_kqv = base_ctx_params.offload_kqv;
     draft_model_params.main_gpu = base_model_params.main_gpu;
@@ -3232,6 +3234,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         model_params.load_mode = inputs.use_mlock ? LLAMA_LOAD_MODE_MLOCK : (inputs.use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE);
         model_params.n_gpu_layers = inputs.gpulayers;
         model_params.no_host = inputs.no_host;
+        model_params.load_mtp = inputs.use_mtp;
         kcpp_permit_any_repack = (inputs.use_mmap?false:true);
 
         //set device overrides if needed
