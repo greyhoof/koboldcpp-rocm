@@ -4623,6 +4623,10 @@ ws ::= | " " | "\n" [ \t]{0,20}
                     copied_jinja_kwargs.update(user_chat_template_kwargs)
                 if "reasoning_effort" in genparams and genparams["reasoning_effort"] is not None:
                     copied_jinja_kwargs["reasoning_effort"] = genparams["reasoning_effort"]
+                if "enable_thinking" in copied_jinja_kwargs and not copied_jinja_kwargs["enable_thinking"]:
+                    copied_jinja_kwargs["reasoning_strength"] = "none"
+                elif "reasoning_effort" in copied_jinja_kwargs and copied_jinja_kwargs["reasoning_effort"]:
+                    copied_jinja_kwargs["reasoning_strength"] = copied_jinja_kwargs["reasoning_effort"]
                 jinja_output = format_jinja(messages_array,jinjatools,copied_jinja_kwargs)
             if jinja_output:
                 messages_string = jinja_output

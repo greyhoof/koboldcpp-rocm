@@ -5881,6 +5881,12 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                 end = "[/THINK]";
                 budget_exceeded = "\n(Reasoning budget exceeded)\nTime to respond now.\n[/THINK]";
                 break;
+            case llm_arch::LLM_ARCH_MUSE_GLIMMER:
+                start = " to=self<|message|>";
+                end = "<|eom|>";
+                budget_exceeded = "\n(Reasoning budget exceeded)\nTime to respond now.\n<|eom|>";
+                expected_start_tokens = 3;
+                break;
             default:
                 break;
         }
