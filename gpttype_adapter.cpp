@@ -238,6 +238,13 @@ static inline void log_callback_off(ggml_log_level level, const char* text, void
     return;
 }
 
+static inline void kcpp_flush_log_output()
+{
+    common_log_flush(common_log_main());
+    fflush(stdout);
+    fflush(stderr);
+}
+
 static common_speculative_type speculative_draft_type_from_model(const llama_model * model)
 {
     if(model == nullptr)
@@ -1072,7 +1079,9 @@ static int32_t kcpp_decode_main_and_spec(llama_context * main_ctx, llama_batch b
         }
         if(!common_speculative_process(draft_spec, batch))
         {
+            kcpp_flush_log_output();
             printf("\nERROR: Speculative state update failed!\n");
+            fflush(stdout);
             return -1;
         }
     }
@@ -1140,7 +1149,9 @@ static speculative_draft_result speculative_decoding_eval_chunk(llama_context * 
     const int32_t decode_status = kcpp_decode_main_and_spec(main_ctx, batch.batch);
     if(decode_status != 0)
     {
+        kcpp_flush_log_output();
         printf("\nERROR: Speculative verification failed! (code:%d)\n", decode_status);
+        fflush(stdout);
         return results;
     }
 
@@ -6656,8 +6667,13 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     evalres = draft_results.draft_success;
                     if(debugmode==1 && !is_quiet)
                     {
+                        if(!evalres)
+                        {
+                            kcpp_flush_log_output();
+                        }
                         std::string draftedtoks = get_tok_vec_str(draft_results.draftids);
                         printf("\nDrafted %d Tokens: [%s]\n",draft_results.drafted_amount,draftedtoks.c_str());
+                        fflush(stdout);
                     }
                 }
             }
@@ -6728,7 +6744,9 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
 
             if (!evalres)
             {
+                kcpp_flush_log_output();
                 fprintf(stderr, "\nFailed to predict at token position %d! Check your context buffer sizes!\n",n_past);
+                fflush(stderr);
                 media_composite_image_signature = ""; //force invalidate
                 output.text = nullptr;
                 output.status = 0;
@@ -7008,6 +7026,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                 if (startedsampling && allow_regular_prints)
                 {
                     printf("\rGenerating (%d / %d tokens)", (kcpp_data->n_predict - remaining_tokens), kcpp_data->n_predict);
+                    fflush(stdout);
                 }
                 if(debugmode==1 && !is_quiet && top_picks_history.size()>0)
                 {
