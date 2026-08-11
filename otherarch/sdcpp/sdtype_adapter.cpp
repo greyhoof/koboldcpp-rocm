@@ -312,12 +312,12 @@ static void progress_callback(int step, int steps, float time, void* data)
     const char* phase = "Encoding";
     {
         std::lock_guard<std::mutex> lock(geninfo.mux);
-        if (geninfo.preview_requested && !geninfo.preview_enabled) {
+        if (geninfo.gendata.status == 2 && geninfo.preview_requested && !geninfo.preview_enabled) {
             geninfo.preview_enabled = true;
             set_preview_images(2);
         }
-        /* progress_callback is also called for model loading and VAE encoding,
-        so ignore the step count unless step_callback signals we are diffusing */
+        /* Once diffusion has started, use progress_callback for step counts
+        because img2img and custom schedules can change the effective total. */
         if (geninfo.gendata.status == 2) {
             /* adjust the max step count (may change for img2img) */
             geninfo.steps = steps;
@@ -1771,6 +1771,29 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
 
 static void step_callback(int step, int frame_count, sd_image_t* image, bool is_noisy, void* data)
 {
+    double step_time = get_time_delta(geninfo.start_time);
+
+    bool should_encode_preview = false;
+    {
+        std::lock_guard<std::mutex> lock(geninfo.mux);
+        if (geninfo.gendata.status <= 1) {
+            geninfo.gendata.status = 2;
+            if (geninfo.preview_requested && !geninfo.preview_enabled) {
+                geninfo.preview_enabled = true;
+                set_preview_images(2);
+            } else {
+                set_preview_images(0);
+            }
+        }
+        geninfo.gendata.step = step;
+        geninfo.gendata.step_time = step_time;
+        should_encode_preview = !is_noisy && geninfo.preview_requested;
+    }
+
+    if (!should_encode_preview) {
+        return;
+    }
+
     std::string preview;
     if (image != nullptr) {
         if (frame_count == 1) {
@@ -1786,23 +1809,16 @@ static void step_callback(int step, int frame_count, sd_image_t* image, bool is_
             }
         }
     }
-    double step_time = get_time_delta(geninfo.start_time);
 
-    std::lock_guard<std::mutex> lock(geninfo.mux);
-    if (geninfo.gendata.status <= 1) {
-        geninfo.gendata.status = 2;
-        if (geninfo.preview_requested && !geninfo.preview_enabled) {
-            geninfo.preview_enabled = true;
-        }
-        if (geninfo.preview_enabled) {
-            set_preview_images(2);
-        } else {
-            set_preview_images(0);
-        }
+    {
+        std::lock_guard<std::mutex> lock(geninfo.mux);
+        geninfo.preview_requested = false;
+        geninfo.preview_enabled = false;
+        geninfo.gendata.step = step;
+        geninfo.gendata.step_time = step_time;
+        geninfo.gendata.preview = preview;
+        set_preview_images(0);
     }
-    geninfo.gendata.step = step;
-    geninfo.gendata.step_time = step_time;
-    geninfo.gendata.preview = preview;
 }
 
 void sdtype_request_ongoing_generation_preview()
@@ -1920,23 +1936,21 @@ sd_info_outputs sdtype_get_ongoing_generation_info()
     }
 
     nlohmann::json j;
-    if (gendata.status == 0) {
+    j["steps"] = steps;
+    j["elapsed_time"] = elapsed_time;
+    j["step"] = gendata.step;
+    j["step_time"] = gendata.step_time;
+    if (gendata.status == 1)
+        j["status"] = "conditioning";
+    else if (gendata.status == 2)
+        j["status"] = "diffusing";
+    else if (gendata.status == 3)
+        j["status"] = "decoding";
+    else if (gendata.status == 0)
         j["status"] = "idle";
-    } else {
-        if (gendata.status == 1)
-            j["status"] = "conditioning";
-        else if (gendata.status == 2)
-            j["status"] = "diffusing";
-        else if (gendata.status == 3)
-            j["status"] = "decoding";
-        else
-            j["status"] = "UNKNOWN";
-        j["steps"] = steps;
-        j["elapsed_time"] = elapsed_time;
-        j["step"] = gendata.step;
-        j["step_time"] = gendata.step_time;
-        j["preview"] = gendata.preview;
-    }
+    else
+        j["status"] = "UNKNOWN";
+    j["preview"] = gendata.preview;
 
     static thread_local std::string recent_info;
     recent_info = j.dump();
