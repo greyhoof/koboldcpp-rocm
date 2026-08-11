@@ -132,7 +132,7 @@ static llama_v3_context * llama_ctx_v3 = nullptr;
 static llama_context * llama_ctx_v4 = nullptr;
 static llama_context * draft_ctx = nullptr; //will remain null if speculative is unused
 static common_speculative * draft_spec = nullptr; // llama.cpp speculative state for draft model / MTP drafting
-static bool draft_is_mtp = false;
+static bool draft_is_mtp = false; // true for MTP/DFLASH/DSPARK paths that verify multiple target logits
 static bool mtp_uses_spec_checkpoint = false;
 static common_prompt_checkpoint mtp_spec_ckpt;
 static llama_context * guidance_ctx = nullptr; //for classifier free guidance, will be null if unused
@@ -236,6 +236,33 @@ inline bool LogitsDuplicated(std::vector<float> & arr1, std::vector<float> & arr
 
 static inline void log_callback_off(ggml_log_level level, const char* text, void*) {
     return;
+}
+
+static common_speculative_type speculative_draft_type_from_model(const llama_model * model)
+{
+    if(model == nullptr)
+    {
+        return COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE;
+    }
+
+    if(model->arch == LLM_ARCH_DFLASH)
+    {
+        return model->dspark_markov_w1 != nullptr ? COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK : COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+    }
+
+    if(model->hparams.n_layer_nextn > 0)
+    {
+        return COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+    }
+
+    return COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE;
+}
+
+static bool speculative_draft_type_verifies_all_logits(common_speculative_type type)
+{
+    return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP
+        || type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
+        || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
 }
 
 static inline void string_trim_whitespace(std::string & s) {
@@ -540,7 +567,7 @@ static size_t estimate_draft_autofit_tax_mb(
 
     const char * estimate_model_path = has_draft_model ? spec_model_filename.c_str() : main_model_filename.c_str();
     bool measure_model_bytes = true;
-    bool draft_is_mtp_estimate = !has_draft_model && use_mtp;
+    common_speculative_type draft_spec_type_estimate = !has_draft_model && use_mtp ? COMMON_SPECULATIVE_TYPE_DRAFT_MTP : COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE;
 
     //mute logs for the fitting stuff first
     auto oldverbosity = common_log_get_verbosity_thold();
@@ -560,7 +587,7 @@ static size_t estimate_draft_autofit_tax_mb(
         llama_model * draft_probe = llama_model_load_from_file(spec_model_filename.c_str(), draft_probe_params);
         if(draft_probe != nullptr)
         {
-            draft_is_mtp_estimate = draft_probe->hparams.n_layer_nextn > 0;
+            draft_spec_type_estimate = speculative_draft_type_from_model(draft_probe);
             llama_model_free(draft_probe);
         }
     }
@@ -609,7 +636,7 @@ static size_t estimate_draft_autofit_tax_mb(
         }
     }
 
-    if(draft_is_mtp_estimate)
+    if(draft_spec_type_estimate == COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
     {
         draft_ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         draft_ctx_params.n_seq_max = base_ctx_params.n_seq_max;
@@ -962,14 +989,25 @@ static void speculative_decoding_setup(std::string spec_model_filename, llama_co
         draft_is_mtp = false;
         return;
     }
-    draft_is_mtp = draftmodel && draftmodel->hparams.n_layer_nextn > 0;
-    if(draft_is_mtp)
+    const common_speculative_type draft_spec_type = speculative_draft_type_from_model(draftmodel);
+    draft_is_mtp = speculative_draft_type_verifies_all_logits(draft_spec_type);
+    if(draft_spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
     {
         printf("Detected MTP draft head, using llama.cpp MTP speculative decoding.\n");
         draft_ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         draft_ctx_params.ctx_other = main_ctx;
         draft_ctx_params.n_rs_seq = speculative_chunk_amt;
         draft_ctx_params.n_outputs_max = base_ctx_params.n_seq_max; //draft-mtp generates tokens autoregressively (1 output per sequence per decode, looped up to n_max); cap outputs at n_seq instead of letting it default to n_batch, which sized the draft sampling buffer at n_batch*n_vocab (~2GB on large-vocab models like Gemma)
+    }
+    else if(draft_spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
+    {
+        printf("Detected DSpark draft model, using llama.cpp DSpark speculative decoding.\n");
+        draft_ctx_params.ctx_other = main_ctx;
+    }
+    else if(draft_spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
+    {
+        printf("Detected DFlash draft model, using llama.cpp DFlash speculative decoding.\n");
+        draft_ctx_params.ctx_other = main_ctx;
     }
     draft_ctx = llama_init_from_model(draftmodel, draft_ctx_params);
     if(draft_ctx == NULL)
@@ -1014,7 +1052,7 @@ static void speculative_decoding_setup(std::string spec_model_filename, llama_co
 
         if(draft_ctx && draft_is_mtp)
         {
-            speculative_state_setup(main_ctx, draft_ctx_params, draft_gpulayers, COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+            speculative_state_setup(main_ctx, draft_ctx_params, draft_gpulayers, draft_spec_type);
         }
         else if(draft_ctx)
         {
