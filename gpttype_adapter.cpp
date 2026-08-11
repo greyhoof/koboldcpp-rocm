@@ -133,6 +133,7 @@ static llama_context * llama_ctx_v4 = nullptr;
 static llama_context * draft_ctx = nullptr; //will remain null if speculative is unused
 static common_speculative * draft_spec = nullptr; // llama.cpp speculative state for draft model / MTP drafting
 static bool draft_is_mtp = false; // true for MTP/DFLASH/DSPARK paths that verify multiple target logits
+static common_speculative_type draft_spec_type_active = COMMON_SPECULATIVE_TYPE_NONE;
 static bool mtp_uses_spec_checkpoint = false;
 static common_prompt_checkpoint mtp_spec_ckpt;
 static llama_context * guidance_ctx = nullptr; //for classifier free guidance, will be null if unused
@@ -269,6 +270,12 @@ static bool speculative_draft_type_verifies_all_logits(common_speculative_type t
 {
     return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP
         || type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
+        || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+}
+
+static bool speculative_draft_type_needs_preprocess_kv_rollback(common_speculative_type type)
+{
+    return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
         || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
 }
 
@@ -907,6 +914,7 @@ static bool speculative_state_setup(llama_context * main_ctx, const llama_contex
         llama_free(draft_ctx);
         draft_ctx = nullptr;
         draft_is_mtp = false;
+        draft_spec_type_active = COMMON_SPECULATIVE_TYPE_NONE;
         return false;
     }
 
@@ -917,8 +925,10 @@ static bool speculative_state_setup(llama_context * main_ctx, const llama_contex
         llama_free(draft_ctx);
         draft_ctx = nullptr;
         draft_is_mtp = false;
+        draft_spec_type_active = COMMON_SPECULATIVE_TYPE_NONE;
         return false;
     }
+    draft_spec_type_active = type;
     return true;
 }
 
@@ -1073,7 +1083,8 @@ static int32_t kcpp_decode_main_and_spec(llama_context * main_ctx, llama_batch b
     const int32_t decode_status = llama_decode(main_ctx, batch);
     if(decode_status == 0 && draft_spec)
     {
-        if(draft_ctx && llama_get_ctx_other(draft_ctx) != main_ctx && batch.n_tokens > 0 && batch.n_seq_id[0] > 0)
+        if(draft_ctx && batch.n_tokens > 0 && batch.n_seq_id[0] > 0 &&
+            (llama_get_ctx_other(draft_ctx) != main_ctx || speculative_draft_type_needs_preprocess_kv_rollback(draft_spec_type_active)))
         {
             llama_memory_seq_rm(llama_get_memory(draft_ctx), batch.seq_id[0][0], batch.pos[0], -1);
         }
@@ -3053,6 +3064,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
     }
     draft_ctx = nullptr;
     draft_is_mtp = false;
+    draft_spec_type_active = COMMON_SPECULATIVE_TYPE_NONE;
     mtp_uses_spec_checkpoint = false;
     mtp_spec_ckpt.clear();
     guidance_ctx = nullptr;
