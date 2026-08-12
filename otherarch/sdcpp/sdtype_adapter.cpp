@@ -1787,7 +1787,7 @@ static void step_callback(int step, int frame_count, sd_image_t* image, bool is_
         }
         geninfo.gendata.step = step;
         geninfo.gendata.step_time = step_time;
-        should_encode_preview = !is_noisy && geninfo.preview_requested;
+        should_encode_preview = !is_noisy && geninfo.preview_enabled;
     }
 
     if (!should_encode_preview) {
@@ -1812,12 +1812,9 @@ static void step_callback(int step, int frame_count, sd_image_t* image, bool is_
 
     {
         std::lock_guard<std::mutex> lock(geninfo.mux);
-        geninfo.preview_requested = false;
-        geninfo.preview_enabled = false;
         geninfo.gendata.step = step;
         geninfo.gendata.step_time = step_time;
         geninfo.gendata.preview = preview;
-        set_preview_images(0);
     }
 }
 
