@@ -31,6 +31,7 @@
 #include "ggml-cpp.h"
 #include "ggml-backend.h"
 #include "gguf.h"
+#include "build-info.h"
 
 #include <algorithm>
 #include <cassert>
@@ -133,6 +134,10 @@ bool llama_supports_rpc(void) {
         ggml_backend_load_all();
     }
     return ggml_backend_reg_by_name("RPC") != nullptr;
+}
+
+const char * llama_version(void) {
+    return LLAMA_VERSION;
 }
 
 void llama_backend_init(void) {
