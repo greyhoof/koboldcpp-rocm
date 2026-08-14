@@ -1128,7 +1128,9 @@ static speculative_draft_result speculative_decoding_eval_chunk(llama_context * 
     common_speculative_draft(draft_spec);
     if(drafted_ids.empty())
     {
+        kcpp_flush_log_output();
         printf("\nERROR: Draft model produced no draft tokens!\n");
+        fflush(stdout);
         return results;
     }
 
