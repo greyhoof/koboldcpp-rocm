@@ -5028,7 +5028,7 @@ ws ::= | " " | "\n" [ \t]{0,20}
                     prompt = replace_last_in_string(prompt,"{{[OUTPUT]}}",assistant_message_gen)
                 elif "{{[OUTPUT]}}" in memory:
                     memory = replace_last_in_string(memory,"{{[OUTPUT]}}",assistant_message_gen)
-                elif assistant_message_start and prompt.rstrip().endswith(assistant_message_start):
+                elif assistant_message_start and not assistant_message_gen.endswith(assistant_message_start) and prompt.rstrip().endswith(assistant_message_start):
                     prompt = replace_last_in_string(prompt, assistant_message_start, assistant_message_gen)
             if "{{[INPUT_END]}}" in prompt or "{{[OUTPUT_END]}}" in prompt:
                 prompt = prompt.replace("{{[INPUT]}}", user_message_start)
