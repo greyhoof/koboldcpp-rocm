@@ -389,8 +389,6 @@ endif()
 # Build libraries
 #
 
-add_subdirectory(vendor/hash)
-
 add_library(ggml
             ggml/src/ggml.c
             ggml/include/ggml.h
@@ -497,12 +495,22 @@ add_library(common2
             otherarch/llmutils.h
             common/reasoning-budget.cpp
             common/reasoning-budget.h
+            vendor/hash/hash.cpp
+            vendor/hash/hash.h
+            vendor/hash/sha256/sha256.c
+            vendor/hash/sha256/sha256.h
             tools/mtmd/mtmd-audio.cpp
             tools/mtmd/mtmd-audio.h)
-target_include_directories(common2 PUBLIC . ./ggml/include ./ggml/src ./ggml/src/ggml-cpu ./include ./otherarch ./otherarch/tools ./vendor/stb ./vendor/nlohmann ./vendor ./otherarch/sdcpp ./otherarch/sdcpp/thirdparty ./tools ./common)
+target_include_directories(common2 PUBLIC . ./ggml/include ./ggml/src ./ggml/src/ggml-cpu ./include ./otherarch ./otherarch/tools ./vendor/stb ./vendor/nlohmann ./vendor ./vendor/hash ./otherarch/sdcpp ./otherarch/sdcpp/thirdparty ./tools ./common)
 target_compile_features(common2 PUBLIC cxx_std_17) # don't bump
-target_link_libraries(common2 PRIVATE ggml vendor-hash ${LLAMA_EXTRA_LIBS})
+target_link_libraries(common2 PRIVATE ggml ${LLAMA_EXTRA_LIBS})
 set_target_properties(common2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if (CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+    set(KCPP_HASH_NO_WARN_FLAG /w)
+else()
+    set(KCPP_HASH_NO_WARN_FLAG -w)
+endif()
+set_source_files_properties(vendor/hash/sha256/sha256.c PROPERTIES COMPILE_OPTIONS ${KCPP_HASH_NO_WARN_FLAG})
 
 add_library(sdtype_adapter
             otherarch/sdcpp/sdtype_adapter.cpp
