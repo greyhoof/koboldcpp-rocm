@@ -10106,7 +10106,7 @@ def show_gui():
                             gpu_choice_var.set(str(opt))
                             break
 
-        elif ("noavx2" in mydict and "usecpu" in mydict and mydict["usecpu"] and mydict["noavx2"]) or ("failsafe" in mydict and mydict["failsafe"]):
+        elif ("failsafe" in mydict and mydict["failsafe"]):
             if failsafe_option is not None:
                 runopts_var.set(failsafe_option)
         elif "noavx2" in mydict and mydict["noavx2"]:
