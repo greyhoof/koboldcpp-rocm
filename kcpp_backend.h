@@ -10,9 +10,6 @@
 // Metal backend aliases
 #define KCPP_BACKENDS_METAL "metal|mtl"
 
-// backends that support tensor split
-#define KCPP_BACKENDS_TENSOR_SPLIT "cuda|rocm|vulkan"
-
 // backends that support blas
 #define KCPP_BACKENDS_BLAS "blas|cuda|rocm|vulkan|sycl"
 
