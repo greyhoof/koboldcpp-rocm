@@ -594,7 +594,7 @@ set_target_properties(gpttype_adapter PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if (LLAMA_CUBLAS)
     set(TARGET koboldcpp_cublas)
-    add_library(${TARGET} SHARED expose.cpp expose.h)
+    add_library(${TARGET} SHARED expose.cpp expose.h kcpp_backend.cpp kcpp_backend.h)
     target_include_directories(${TARGET} PUBLIC . ./ggml/include ./ggml/src ./ggml/src/ggml-cpu ./include ./otherarch ./otherarch/tools ./vendor/stb ./vendor/nlohmann ./vendor ./otherarch/sdcpp ./otherarch/sdcpp/thirdparty ./tools ./common)
     target_compile_features(${TARGET} PUBLIC cxx_std_17) # don't bump
     set_target_properties(${TARGET} PROPERTIES PREFIX "")
@@ -614,7 +614,7 @@ endif()
 
 if (LLAMA_HIPBLAS)
     set(TARGET koboldcpp_hipblas)
-    add_library(${TARGET} SHARED expose.cpp expose.h)
+    add_library(${TARGET} SHARED expose.cpp expose.h kcpp_backend.cpp kcpp_backend.h)
     target_include_directories(${TARGET} PUBLIC . ./ggml/include ./ggml/src ./ggml/src/ggml-cpu ./include ./otherarch ./otherarch/tools ./vendor/stb ./vendor/nlohmann ./vendor ./otherarch/sdcpp ./otherarch/sdcpp/thirdparty ./tools ./common)
     target_compile_features(${TARGET} PUBLIC cxx_std_17) # don't bump
     set_target_properties(${TARGET} PROPERTIES PREFIX "")
