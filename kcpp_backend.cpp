@@ -70,6 +70,27 @@ ggml_backend_dev_t kcpp_backend_get_device(int index)
     }
 }
 
+ggml_backend_dev_t kcpp_backend_get_gpu_device(int index)
+{
+    if (index < 0) {
+        return get_ggml_main_device();
+    }
+
+    size_t gpu_index = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            if (gpu_index == (size_t) index) {
+                return dev;
+            }
+            ++gpu_index;
+        }
+    }
+
+    return nullptr;
+}
+
 // this is similar to sd_backend_is, except:
 // - if no backend is provided, checks the first ggml device (should be equivalent to a compile-time check)
 // - tests a |-separated list of backend/device name prefixes

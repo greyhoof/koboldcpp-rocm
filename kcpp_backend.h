@@ -20,6 +20,7 @@
 int kcpp_backend_check(const char* name_list, ggml_backend_t backend = nullptr);
 
 ggml_backend_dev_t kcpp_backend_get_device(int index);
+ggml_backend_dev_t kcpp_backend_get_gpu_device(int index);
 
 // per-backend aux functions
 

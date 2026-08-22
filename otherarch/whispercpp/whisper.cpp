@@ -1216,9 +1216,9 @@ static ggml_backend_t whisper_backend_init(const whisper_context_params & params
     ggml_backend_t backend_gpu = NULL;
 
     if (params.use_gpu) {
-        auto device = kcpp_backend_get_device(params.gpu_device);
+        auto device = kcpp_backend_get_gpu_device(params.gpu_device);
         if (!device) {
-            WHISPER_LOG_ERROR("%s: couldn't get device %d\n", __func__, params.gpu_device);
+            WHISPER_LOG_ERROR("%s: couldn't get GPU device %d\n", __func__, params.gpu_device);
         } else {
             WHISPER_LOG_INFO("%s: using backend %s\n", __func__, ggml_backend_dev_name(device));
             backend_gpu = ggml_backend_dev_init(device, nullptr);
