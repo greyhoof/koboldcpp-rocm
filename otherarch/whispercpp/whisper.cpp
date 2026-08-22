@@ -1070,7 +1070,7 @@ static uint32_t whisper_kv_cache_get_padding(const struct whisper_context & wctx
         return 1u;
     }
 
-    if (kcpp_backend_check("mtl", wctx.backend)) {
+    if (kcpp_backend_check(KCPP_BACKENDS_METAL, wctx.backend)) {
         return 32u;
     }
 
@@ -1225,7 +1225,7 @@ static ggml_backend_t whisper_backend_init(const whisper_context_params & params
             if (!backend_gpu) {
                 WHISPER_LOG_ERROR("%s: ggml_backend_dev_init() failed\n", __func__);
             } else {
-                if (kcpp_backend_check("mtl", backend_gpu) && !kcpp_backend_metal_supports_family(backend_gpu, 7)) {
+                if (kcpp_backend_check(KCPP_BACKENDS_METAL, backend_gpu) && !kcpp_backend_metal_supports_family(backend_gpu, 7)) {
                     WHISPER_LOG_ERROR("%s: Metal GPU does not support family 7 - falling back to CPU\n", __func__);
                     ggml_backend_free(backend_gpu);
                     backend_gpu = NULL;
@@ -1861,7 +1861,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
         whisper_context & wctx,
           whisper_state & wstate) {
 
-    auto ggml_mul_mat = kcpp_backend_check("mtl", wctx.backend)
+    auto ggml_mul_mat = kcpp_backend_check(KCPP_BACKENDS_METAL, wctx.backend)
                         ? ggml_mul_mat_pad
                         : ggml_mul_mat_original;
 
@@ -2111,7 +2111,7 @@ static struct ggml_cgraph * whisper_build_graph_cross(
         whisper_context & wctx,
           whisper_state & wstate) {
 
-    auto ggml_mul_mat = kcpp_backend_check("mtl", wctx.backend)
+    auto ggml_mul_mat = kcpp_backend_check(KCPP_BACKENDS_METAL, wctx.backend)
                         ? ggml_mul_mat_pad
                         : ggml_mul_mat_original;
 
@@ -2303,7 +2303,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                     bool   save_alignment_heads_QKs,
                     bool   worst_case) {
 
-    auto ggml_mul_mat = kcpp_backend_check("mtl", wctx.backend)
+    auto ggml_mul_mat = kcpp_backend_check(KCPP_BACKENDS_METAL, wctx.backend)
                         ? ggml_mul_mat_pad
                         : ggml_mul_mat_original;
 
@@ -6565,7 +6565,7 @@ WHISPER_API int whisper_bench_ggml_mul_mat(int n_threads) {
 
 WHISPER_API const char * whisper_bench_ggml_mul_mat_str(int n_threads) {
 
-    auto ggml_mul_mat = kcpp_backend_check("mtl")
+    auto ggml_mul_mat = kcpp_backend_check(KCPP_BACKENDS_METAL)
                         ? ggml_mul_mat_pad
                         : ggml_mul_mat_original;
 

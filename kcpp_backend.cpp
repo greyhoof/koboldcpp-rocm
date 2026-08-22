@@ -33,7 +33,7 @@ static bool has_any_prefix(const std::string& str, const std::string& prefixes, 
     size_t end = prefixes.find(delimiter);
     while (start != std::string::npos) {
         std::string prefix = prefixes.substr(start, end - start);
-        if (str.rfind(prefix, 0) == 0) {
+        if (!prefix.empty() && str.rfind(prefix, 0) == 0) {
             return true;
         }
         if (end == std::string::npos) {
@@ -63,13 +63,16 @@ ggml_backend_dev_t kcpp_backend_get_device(int index)
            return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         }
     } else {
+        if ((size_t) index >= ggml_backend_dev_count()) {
+            return nullptr;
+        }
         return ggml_backend_dev_get((size_t)index);
     }
 }
 
 // this is similar to sd_backend_is, except:
 // - if no backend is provided, checks the first ggml device (should be equivalent to a compile-time check)
-// - tests a |-separated list of device names
+// - tests a |-separated list of backend/device name prefixes
 int kcpp_backend_check(const char* name, ggml_backend_t backend)
 {
     std::string loname = to_lowercase(name);
@@ -88,7 +91,7 @@ int kcpp_backend_check(const char* name, ggml_backend_t backend)
             const char * devname = "vulkan";
 
             #elif defined(GGML_USE_METAL)
-            const char * devname = "mtl";
+            const char * devname = "metal";
 
             #elif defined(GGML_USE_HIP)
             const char * devname = "rocm";
@@ -107,19 +110,23 @@ int kcpp_backend_check(const char* name, ggml_backend_t backend)
             #endif
 
             if (devname != nullptr) {
-                return has_any_prefix(devname, name, '|');
+                return has_any_prefix(devname, loname, '|');
             }
         }
 
         dev = get_ggml_main_device();
     } else {
+        std::string lo_backend_name = to_lowercase(ggml_backend_name(backend));
+        if (has_any_prefix(lo_backend_name, loname, '|')) {
+            return true;
+        }
         dev = ggml_backend_get_device(backend);
     }
     if (!dev) {
         return false;
     }
     std::string lo_dev_name = to_lowercase(ggml_backend_dev_name(dev));
-    return has_any_prefix(lo_dev_name, name, '|');
+    return has_any_prefix(lo_dev_name, loname, '|');
 }
 
 bool kcpp_backend_metal_supports_family(ggml_backend_t backend, int family)
@@ -155,7 +162,7 @@ void kcpp_backend_cuda_ggmlv3_set_tensor_split(const float * tensor_split)
 void kcpp_backend_cuda_ggmlv3_transform_tensor(void * data, struct ggml_v3_tensor * tensor)
 {
     #if defined(GGML_USE_CUDA)
-    ggml_v3_cuda_transform_tensor(tensor->data, tensor);
+    ggml_v3_cuda_transform_tensor(data, tensor);
     #endif
 }
 

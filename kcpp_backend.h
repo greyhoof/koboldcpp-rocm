@@ -7,6 +7,9 @@
 // backends with GGML_USE_CUDA
 #define KCPP_BACKENDS_USE_CUDA "cuda|rocm"
 
+// Metal backend aliases
+#define KCPP_BACKENDS_METAL "metal|mtl"
+
 // backends that support tensor split
 #define KCPP_BACKENDS_TENSOR_SPLIT "cuda|rocm|vulkan"
 

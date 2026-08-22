@@ -525,11 +525,10 @@ std::string get_fitted_params_str(const llama_model_params & mparams, const llam
 
 static bool has_tensor_split(const float* ratios, int num_ratios, ggml_backend_t backend = nullptr)
 {
-    if(kcpp_backend_check(KCPP_BACKENDS_TENSOR_SPLIT, backend)) {
-        for (int i = 0; i < tensor_split_max; ++i) {
-            if (ratios[i] != 0.0f) {
-                return true;
-            }
+    const int ratios_count = std::min(num_ratios, tensor_split_max);
+    for (int i = 0; i < ratios_count; ++i) {
+        if (ratios[i] != 0.0f) {
+            return true;
         }
     }
     return false;
@@ -2979,7 +2978,7 @@ static void connect_rpc_servers(const std::string & servers) {
 
 mtmd_context_params init_mtmd_ctx_params(bool mmproj_cpu, bool dryrun)
 {
-    if(kcpp_backend_check("mtl")) {
+    if(kcpp_backend_check(KCPP_BACKENDS_METAL)) {
         if(file_format_meta.model_architecture == llm_arch::LLM_ARCH_QWEN2VL || file_format_meta.model_architecture == llm_arch::LLM_ARCH_GEMMA3)
         {
             mmproj_cpu = true;
@@ -2990,7 +2989,7 @@ mtmd_context_params init_mtmd_ctx_params(bool mmproj_cpu, bool dryrun)
         }
     }
     llama_flash_attn_type mtmd_fa = (kcpp_data->flash_attn?LLAMA_FLASH_ATTN_TYPE_ENABLED:LLAMA_FLASH_ATTN_TYPE_DISABLED);
-    if(kcpp_backend_check("cuda")) {
+    if(kcpp_backend_check(KCPP_BACKENDS_USE_CUDA)) {
         mtmd_fa = LLAMA_FLASH_ATTN_TYPE_DISABLED; //kcpp: disabled in 1.102.2 as some headsizes break on turing
     }
     if(mmproj_cpu)

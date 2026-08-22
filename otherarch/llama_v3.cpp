@@ -1255,7 +1255,7 @@ static void llama_v3_model_load_internal(
             ctx_size +
             mmapped_size - vram_weights; // weights in VRAM not in memory
 
-        if (llama_v3_use_allocator()){
+        if (llama_v3_use_scratch()){
         mem_required +=
             blasbatchmul*MEM_REQ_SCRATCH0_3(hparams.n_ctx).at(model.type) +
             blasbatchmul*MEM_REQ_SCRATCH1_3().at(model.type) +
@@ -1815,15 +1815,15 @@ static bool llama_v3_eval_internal(
     const int64_t n_embd      = hparams.n_embd;
     const int64_t n_vocab     = hparams.n_vocab;
 
-#ifdef LLAMA_V3_USE_ALLOCATOR
-    ggml_v3_allocr_reset(lctx.alloc);
-#endif
+    if (llama_v3_use_allocator()) {
+        ggml_v3_allocr_reset(lctx.alloc);
+    }
 
     ggml_v3_cgraph * gf = llama_v3_build_graph(lctx, tokens, embd, n_tokens, n_past);
 
-#ifdef LLAMA_V3_USE_ALLOCATOR
-    ggml_v3_allocr_alloc_graph(lctx.alloc, gf);
-#endif
+    if (llama_v3_use_allocator()) {
+        ggml_v3_allocr_alloc_graph(lctx.alloc, gf);
+    }
 
     // LLAMA_V3_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_v3_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
 
@@ -3377,8 +3377,7 @@ struct llama_v3_context * llama_v3_new_context_with_model(
             ctx->embedding.resize(hparams.n_embd);
         }
 
-#ifdef LLAMA_V3_USE_ALLOCATOR
-        {
+        if (llama_v3_use_allocator()) {
             static const size_t tensor_alignment = 32;
             // the compute buffer is used to store the tensor and graph structs, while the allocator buffer is used for the tensor data
             ctx->buf_compute.resize(ggml_v3_tensor_overhead()*GGML_V3_MAX_NODES + ggml_v3_graph_overhead());
@@ -3410,10 +3409,9 @@ struct llama_v3_context * llama_v3_new_context_with_model(
             ctx->buf_alloc.resize(alloc_size);
             ctx->alloc = ggml_v3_allocr_new(ctx->buf_alloc.addr, ctx->buf_alloc.size, tensor_alignment);
 
+        } else {
+            ctx->buf_compute.resize(blasbatchmul*MEM_REQ_EVAL_3().at(ctx->model.type) + ggml_v3_graph_overhead());
         }
-#else
-        ctx->buf_compute.resize(blasbatchmul*MEM_REQ_EVAL_3().at(ctx->model.type) + ggml_v3_graph_overhead());
-#endif
 
         if (llama_v3_use_scratch()) {
         ctx->buf_scratch[0].resize(blasbatchmul*MEM_REQ_SCRATCH0_3(hparams.n_ctx).at(ctx->model.type));
