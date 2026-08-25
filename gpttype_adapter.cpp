@@ -3517,7 +3517,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             }
             fit_params_target[0] = taxmb*1024*1024;
             bool success = (common_fit_params(kcpp_data->model_filename.c_str(), &model_params, &llama_ctx_params,
-            tensor_split_temp, tenos.data(), fit_params_target.data(), kcpp_data->n_ctx,
+            tensor_split_temp, tenos.data(), fit_params_target.data(), kcpp_data->n_ctx, nullptr,
             dospam?GGML_LOG_LEVEL_DEBUG:GGML_LOG_LEVEL_NONE)==0);
             if(!dospam)
             {
