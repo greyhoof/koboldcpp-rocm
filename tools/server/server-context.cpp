@@ -35,8 +35,6 @@
 #include <windows.h>
 #endif
 
-using json = nlohmann::ordered_json;
-
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -657,14 +655,14 @@ struct server_slot {
             res["n_prompt_tokens_processed"] = stats.n_prompt_processed;
             res["n_prompt_tokens_cache"]     = stats.n_prompt_cached;
             res["params"] = ptask->params.to_json(only_metrics);
-            res["next_token"] = {
+            res["next_token"] = json::array({
                 {
                     {"has_next_token", has_next_token},
                     {"has_new_line",   has_new_line},
                     {"n_remain",       n_remaining()},
                     {"n_decoded",      stats.n_gen},
                 }
-            };
+            });
 
             if (!only_metrics) {
                 res["prompt"] = ptask->tokens.detokenize(ctx_tgt, true);
@@ -860,8 +858,10 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
-    int trace = 0;
-    int slots_debug = 0;
+    int trace = 0;        // env: LLAMA_TRACE
+    int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
+    int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
+
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
@@ -1246,6 +1246,15 @@ private:
 
             if (slots_debug) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_DEBUG = %d\n", slots_debug);
+            }
+        }
+
+        {
+            const char * LLAMA_SERVER_SLOTS_N_DIFF = getenv("LLAMA_SERVER_SLOTS_N_DIFF");
+            slots_n_diff = LLAMA_SERVER_SLOTS_N_DIFF ? atoi(LLAMA_SERVER_SLOTS_N_DIFF) : 0;
+
+            if (slots_n_diff) {
+                SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
             }
         }
 
@@ -3181,8 +3190,8 @@ private:
                                 // when the prompt prefix does not match, print the tokens around the mismatch
                                 // this is useful for debugging prompt caching
                                 if (slots_debug) {
-                                    const int np0 = std::max<int>(n_past - 4, 0);
-                                    const int np1 = std::min<int>(n_past + 6, std::min(slot.prompt.tokens.size(), slot.task->tokens.size()));
+                                    const int np0 = std::max<int>(n_past - slots_n_diff, 0);
+                                    const int np1 = std::min<int>(n_past + slots_n_diff + 2, std::min(slot.prompt.tokens.size(), slot.task->tokens.size()));
 
                                     std::stringstream ss0;
                                     std::stringstream ss1;
@@ -4165,7 +4174,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
 
         // message delimiters for checkpointing
-        auto delimiters = common_chat_msg_delimiters_parse(json_value(data, "message_delimiters", json::array()));
+        json delims = json_value(data, "message_delimiters", json::array());
+        auto delimiters = common_chat_msg_delimiters_parse(delims);
         delimiters.tokenize(ctx_server.vocab);
 
         for (size_t i = 0; i < inputs.size(); i++) {
@@ -4428,8 +4438,8 @@ static json get_res_model_info(const server_context_meta & meta) {
 static json get_res_models(const server_context_meta & meta) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
-    return {
-        {"models", {
+    return json{
+        {"models", json::array({
             {
                 {"name",  meta.model_name},
                 {"model", meta.model_name},
@@ -4438,23 +4448,23 @@ static json get_res_models(const server_context_meta & meta) {
                 {"digest", ""}, // dummy value, llama.cpp does not support managing model file's hash
                 {"type", "model"},
                 {"description", ""},
-                {"tags", {""}},
-                {"capabilities", meta.has_mtmd ? json({"completion","multimodal"}) : json({"completion"})},
+                {"tags", json::array({""})},
+                {"capabilities", meta.has_mtmd ? json::array({"completion","multimodal"}) : json::array({"completion"})},
                 {"parameters", ""},
                 {"details", {
                     {"parent_model", ""},
                     {"format", "gguf"},
                     {"family", ""},
-                    {"families", {""}},
+                    {"families", json::array({""})},
                     {"parameter_size", ""},
                     {"quantization_level", ""}
                 }}
             }
-        }},
+        })},
         {"object", "list"},
-        {"data", {
+        {"data", json::array({
             get_res_model_info(meta),
-        }}
+        })}
     };
 }
 
@@ -4990,7 +5000,7 @@ void server_routes::init_routes() {
 
         std::string content;
         if (body.count("tokens") != 0) {
-            const llama_tokens tokens = body.at("tokens");
+            const llama_tokens tokens = body.at("tokens").get<llama_tokens>();
             content = tokens_to_str(ctx_server.vocab, tokens);
         }
 
@@ -5297,7 +5307,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
 
     int embd_normalize = params.embd_normalize;
     if (body.count("embd_normalize") != 0) {
-        embd_normalize = body.at("embd_normalize");
+        embd_normalize = body.at("embd_normalize").get<int>();
         if (meta->pooling_type == LLAMA_POOLING_TYPE_NONE) {
             SRV_DBG("embd_normalize is not supported by pooling type %d, ignoring it\n", meta->pooling_type);
         }

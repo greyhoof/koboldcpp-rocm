@@ -5107,7 +5107,7 @@ std::string gpttype_parse_chat_tool_calls(const std::string & generated_text,
             return "";
         }
 
-        json tools = json::parse(tools_json);
+        common_json tools = common_json::parse(tools_json);
         if(!tools.is_array() || tools.empty())
         {
             return "";
@@ -5135,7 +5135,7 @@ std::string gpttype_parse_chat_tool_calls(const std::string & generated_text,
 
         if(!chat_template_kwargs_json.empty())
         {
-            json kwargs = json::parse(chat_template_kwargs_json);
+            common_json kwargs = common_json::parse(chat_template_kwargs_json);
             if(kwargs.is_object())
             {
                 for(const auto & item : kwargs.items())
@@ -5181,7 +5181,7 @@ std::string gpttype_parse_chat_tool_calls(const std::string & generated_text,
             return "";
         }
 
-        json tool_calls = parsed.to_json_oaicompat().value("tool_calls", json::array());
+        common_json tool_calls = parsed.to_json_oaicompat().value("tool_calls", common_json::array());
         return tool_calls.dump();
     }
     catch(const std::exception & e)
