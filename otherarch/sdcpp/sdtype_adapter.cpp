@@ -1076,7 +1076,6 @@ void sdtype_abort_generation() {
         geninfo.preview_requested = false;
         geninfo.preview_enabled = false;
     }
-    set_preview_images(0);
     sd_cancel_generation(sd_ctx, SD_CANCEL_ALL);
 }
 
