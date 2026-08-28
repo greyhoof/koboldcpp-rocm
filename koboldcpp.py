@@ -962,6 +962,11 @@ def init_library():
     dir_path = getdirpath()
     abs_path = getabspath()
 
+    if os.name == 'posix' and "GGML_METAL_PATH_RESOURCES" not in os.environ:
+        metal_resource_path = os.path.join(dir_path, "kernels")
+        if os.path.isdir(metal_resource_path):
+            os.environ["GGML_METAL_PATH_RESOURCES"] = dir_path
+
     #add all potential paths
     if os.name=='nt':
         os.add_dll_directory(dir_path)
