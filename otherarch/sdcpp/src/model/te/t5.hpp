@@ -12,11 +12,13 @@
 
 #include "core/ggml_extend.hpp"
 #include "model_loader.h"
+#include "model_manager.h"
 #include "tokenizers/t5_unigram_tokenizer.h"
 
 struct T5Config {
     int64_t num_layers      = 24;
     int64_t model_dim       = 4096;
+    int64_t inner_dim       = 4096;
     int64_t ff_dim          = 10240;
     int64_t num_heads       = 64;
     int64_t vocab_size      = 32128;
@@ -25,12 +27,66 @@ struct T5Config {
     static T5Config detect_from_weights(const String2TensorStorage& tensor_storage_map,
                                         const std::string& prefix,
                                         bool is_umt5 = false) {
-        (void)tensor_storage_map;
-        (void)prefix;
         T5Config config;
         if (is_umt5) {
             config.vocab_size         = 256384;
             config.relative_attention = false;
+        }
+        auto find_tensor = [&](const std::string& suffix) -> const TensorStorage* {
+            auto it = tensor_storage_map.find(prefix + "." + suffix);
+            if (it != tensor_storage_map.end()) {
+                return &it->second;
+            }
+            it = tensor_storage_map.find(prefix + suffix);
+            if (it != tensor_storage_map.end()) {
+                return &it->second;
+            }
+            return nullptr;
+        };
+
+        if (const TensorStorage* shared = find_tensor("shared.weight")) {
+            if (shared->n_dims == 2) {
+                config.vocab_size = shared->ne[1];
+                config.model_dim  = shared->ne[0];
+            }
+        }
+        if (const TensorStorage* q = find_tensor("encoder.block.0.layer.0.SelfAttention.q.weight")) {
+            if (q->n_dims == 2) {
+                config.model_dim  = q->ne[0];
+                int64_t inner_dim = q->ne[1];
+                config.inner_dim  = inner_dim;
+                // Flan-T5/T5 uses d_kv=64 for common sizes.
+                if (inner_dim % 64 == 0) {
+                    config.num_heads = inner_dim / 64;
+                }
+            }
+        }
+        if (const TensorStorage* wi = find_tensor("encoder.block.0.layer.1.DenseReluDense.wi_0.weight")) {
+            if (wi->n_dims == 2) {
+                config.model_dim = wi->ne[0];
+                config.ff_dim    = wi->ne[1];
+            }
+        }
+        int64_t detected_layers = 0;
+        for (const auto& [name, _] : tensor_storage_map) {
+            std::string base = prefix;
+            if (!base.empty() && base.back() != '.') {
+                base += ".";
+            }
+            std::string layer_prefix = base + "encoder.block.";
+            if (!starts_with(name, layer_prefix)) {
+                continue;
+            }
+            size_t pos = layer_prefix.size();
+            size_t dot = name.find('.', pos);
+            if (dot == std::string::npos) {
+                continue;
+            }
+            int64_t layer   = atoi(name.substr(pos, dot - pos).c_str());
+            detected_layers = std::max(detected_layers, layer + 1);
+        }
+        if (detected_layers > 0) {
+            config.num_layers = detected_layers;
         }
         return config;
     }
@@ -303,7 +359,7 @@ public:
         : config(config) {
         blocks["encoder"] = std::shared_ptr<GGMLBlock>(new T5Stack(config.num_layers,
                                                                    config.model_dim,
-                                                                   config.model_dim,
+                                                                   config.inner_dim,
                                                                    config.ff_dim,
                                                                    config.num_heads,
                                                                    config.relative_attention));
@@ -334,11 +390,11 @@ struct T5Runner : public GGMLRunner {
     std::vector<int> relative_position_bucket_vec;
 
     T5Runner(ggml_backend_t backend,
-             ggml_backend_t params_backend,
              const String2TensorStorage& tensor_storage_map,
              const std::string prefix,
-             bool is_umt5 = false)
-        : GGMLRunner(backend, params_backend),
+             bool is_umt5                                        = false,
+             std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+        : GGMLRunner(backend, weight_manager),
           config(T5Config::detect_from_weights(tensor_storage_map, prefix, is_umt5)) {
         model = T5(config);
         model.init(params_ctx, tensor_storage_map, prefix);
@@ -394,11 +450,14 @@ struct T5Runner : public GGMLRunner {
 
     sd::Tensor<float> compute(const int n_threads,
                               const sd::Tensor<int32_t>& input_ids,
-                              const sd::Tensor<float>& attention_mask) {
+                              const sd::Tensor<float>& attention_mask,
+                              bool auto_free           = true,
+                              bool free_compute_buffer = true,
+                              bool free_compute_params = true) {
         auto get_graph = [&]() -> ggml_cgraph* {
             return build_graph(input_ids, attention_mask);
         };
-        return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, true), 3);
+        return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, auto_free, free_compute_buffer, free_compute_params), 3);
     }
 
     static std::vector<int> _relative_position_bucket(const std::vector<int>& relative_position,
@@ -474,22 +533,15 @@ struct T5Embedder {
     T5Runner model;
 
     T5Embedder(ggml_backend_t backend,
-               ggml_backend_t params_backend,
-               const String2TensorStorage& tensor_storage_map = {},
-               const std::string prefix                       = "",
-               bool is_umt5                                   = false)
-        : model(backend, params_backend, tensor_storage_map, prefix, is_umt5), tokenizer(is_umt5) {
+               const String2TensorStorage& tensor_storage_map      = {},
+               const std::string prefix                            = "",
+               bool is_umt5                                        = false,
+               std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+        : model(backend, tensor_storage_map, prefix, is_umt5, weight_manager), tokenizer(is_umt5) {
     }
 
     void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string prefix) {
         model.get_param_tensors(tensors, prefix);
-    }
-
-    bool alloc_params_buffer() {
-        if (!model.alloc_params_buffer()) {
-            return false;
-        }
-        return true;
     }
 
     std::tuple<std::vector<int>, std::vector<float>, std::vector<float>> tokenize(std::string text,
@@ -576,7 +628,8 @@ struct T5Embedder {
         ggml_backend_t backend    = sd_backend_cpu_init();
         ggml_type model_data_type = GGML_TYPE_F16;
 
-        ModelLoader model_loader;
+        auto model_manager        = std::make_shared<ModelManager>();
+        ModelLoader& model_loader = model_manager->loader();
         if (!model_loader.init_from_file_and_convert_name(file_path)) {
             LOG_ERROR("init model loader from file failed: '%s'", file_path.c_str());
             return;
@@ -589,19 +642,16 @@ struct T5Embedder {
             }
         }
 
-        std::shared_ptr<T5Embedder> t5 = std::make_shared<T5Embedder>(backend, backend, tensor_storage_map, "", true);
+        std::shared_ptr<T5Embedder> t5 = std::make_shared<T5Embedder>(backend, tensor_storage_map, "", true, model_manager);
 
-        if (!t5->alloc_params_buffer()) {
-            LOG_ERROR("t5 params buffer allocation failed");
-            return;
-        }
-        std::map<std::string, ggml_tensor*> tensors;
-        t5->get_param_tensors(tensors, "");
-
-        bool success = model_loader.load_tensors(tensors);
-
-        if (!success) {
-            LOG_ERROR("load tensors from model loader failed");
+        if (!model_manager->register_runner_params("T5 test",
+                                                   *t5,
+                                                   "",
+                                                   ModelManager::ResidencyMode::ParamBackend,
+                                                   backend,
+                                                   backend) ||
+            !model_manager->validate_registered_tensors()) {
+            LOG_ERROR("register t5 tensors with model manager failed");
             return;
         }
 

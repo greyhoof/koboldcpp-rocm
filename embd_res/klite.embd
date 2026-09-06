@@ -12,7 +12,7 @@ Current version indicated by LITEVER below.
 -->
 <head>
 	<script id="init-config">
-	const LITEVER = 338;
+	const LITEVER = 343;
 	const urlParams = new URLSearchParams(window.location.search);
 	var localflag = urlParams.get('local'); //this will be replaced automatically in embedded kcpp
 	const STORAGE_PREFIX = (localflag?"e_":"")+"kaihordewebui_";
@@ -1676,6 +1676,50 @@ Current version indicated by LITEVER below.
 		left:unset;
 		right:0px;
 	}
+
+	#groupselectcontainer .menutext {
+		overflow-x: auto;
+		padding-left: 10px;
+		padding-right: 10px;
+	}
+	.groupchatselect-table {
+		width: max-content;
+		min-width: 100%;
+		margin: 8px auto;
+	}
+	.groupchatselect-table th,
+	.groupchatselect-table td {
+		padding: 2px 6px;
+	}
+	.groupchatselect-table td:first-child {
+		max-width: 260px;
+		overflow-wrap: anywhere;
+		text-align: center;
+	}
+	.groupchat-inline-action {
+		max-width: 260px;
+		margin: 0px auto;
+		cursor: pointer;
+		justify-content: center;
+		overflow-wrap: anywhere;
+	}
+	#groupchataestheticcontainer {
+		justify-content: center;
+	}
+	.nspopup.groupchataestheticpopup {
+		width: fit-content;
+		min-width: min(270px, calc(100vw - 32px));
+		max-width: calc(100vw - 32px);
+		margin-top: 0px;
+	}
+	#groupchataestheticcontainer .menutext {
+		text-align: left;
+		padding: 10px 14px 4px 14px;
+	}
+	#groupchataestheticcontainer .settinglabel {
+		min-width: min(250px, calc(100vw - 60px));
+	}
+
 	.popupbg {
 		position: fixed;
 		top: 0;
@@ -2577,7 +2621,17 @@ Current version indicated by LITEVER below.
 	.instruct-settings-input input { width:44px; height:20px; }
 	#code-block-background-colorselector, #code-block-foreground-colorselector { text-align: center; margin: 0px 5px; }
 	#you-text-colorselector, #you-speech-colorselector, #you-action-colorselector, #AI-text-colorselector, #AI-speech-colorselector, #AI-action-colorselector { text-align: center; margin: 0px 5px; }
-	#you-bubble-colorselector, #AI-bubble-colorselector, #you-portrait, #AI-portrait { text-align: center; margin: 0px 10px; border-radius: 1rem; padding: 1px 6px; }
+	#you-bubble-colorselector, #AI-bubble-colorselector, #you-portrait, #AI-portrait, #groupchat-portrait { text-align: center; margin: 0px 10px; border-radius: 1rem; padding: 1px 6px; }
+	#groupchat-portrait { cursor: pointer; }
+	#groupchat_aesthetic_avatar {
+		width: 64px;
+		height: 64px;
+		margin: 0px auto 8px auto;
+		background-size: cover;
+		background-position: center;
+		border: 1px solid var(--theme_color_border);
+		border-radius: 6px;
+	}
 	@media screen and (max-width: 780px) {
 		#aesthetic_text_preview_panel { display: none; }
 	}
@@ -4057,6 +4111,8 @@ Current version indicated by LITEVER below.
 	var poll_interval_multiplayer = 1000; //every 1s
 	var poll_interval_chunked_tts = 300;
 	var max_branches = 8;
+	var randomness_max_size = 500;
+	var randomness_allow_newlines = false;
 
 	var horde_base_url = "https://aihorde.net"
 	var horde_perf_endpoint = horde_base_url + "/api/v2/status/performance";
@@ -4185,15 +4241,15 @@ Current version indicated by LITEVER below.
 	const ALLTALK_ID = 4;
 	const OAI_TTS_ID = 5;
 
-	const HD_RES_PX = 768;
-	const VHD_RES_PX = 960;
-	const NO_HD_RES_PX = 512;
-	const PREVIEW_RES_PX = 200;
-	const AVATAR_PX = 384;
-	const SAVE_SLOTS = 12;
-	const SCENARIO_SLOTS = 6;
-	const num_regex_rows = 4;
-	const default_websearch_template = "### New Task:\nFrom above text, rephrase the search engine query \"{{QUERY}}\" as a single short phrase (for search engines) using proper nouns, references and names to avoid ambiguity.\n\n### Rephrased Search Query Created:\n";
+	var HD_RES_PX = 768;
+	var VHD_RES_PX = 960;
+	var NO_HD_RES_PX = 512;
+	var PREVIEW_RES_PX = 200;
+	var AVATAR_PX = 384;
+	var SAVE_SLOTS = 12;
+	var SCENARIO_SLOTS = 6;
+	var num_regex_rows = 4;
+	var default_websearch_template = "### New Task:\nFrom above text, rephrase the search engine query \"{{QUERY}}\" as a single short phrase (for search engines) using proper nouns, references and names to avoid ambiguity.\n\n### Rephrased Search Query Created:\n";
 
 	//all configurable globals
 	var unique_uid = "LITE_UID_"+(Math.floor(100000 + Math.random() * 900000)).toString();
@@ -4393,6 +4449,7 @@ Current version indicated by LITEVER below.
 		chat_context_mod: true, //extra injection for chat mode
 		chatname: "User", //name to use in chat
 		chatopponent: defaultchatopponent,
+		groupchat_data: {}, //persistent metadata for groupchat characters. key is a hash of the bot character name
 		instruct_starttag: "{{[INPUT]}}",
 		instruct_endtag: "{{[OUTPUT]}}",
 		instruct_systag: "{{[SYSTEM]}}",
@@ -4411,6 +4468,7 @@ Current version indicated by LITEVER below.
 		tts_mode: 0, //0 is disabled
 		xtts_voice: "female_calm",
 		kcpp_tts_voice: "kobo",
+		oai_tts_model: "tts-1",
 		oai_tts_voice: "alloy",
 		wb_tts_choice: 0,
 		kcpp_tts_json: "",
@@ -4478,6 +4536,8 @@ Current version indicated by LITEVER below.
 		show_nametags: true,
 		enable_tool_use: false,
 		tools_auto_exec: false,
+		custom_tools: [], //array of custom tools (with source code)
+		custom_tools_AI_enabled: false,
 		corsproxy_mcp: false,
 		kcpp_mcp_bridge: true,
 		cached_mcp_tools: {}, //key is url, value is tools array
@@ -4519,7 +4579,7 @@ Current version indicated by LITEVER below.
 		second_ep_url:"",
 
 		max_context_length: (localflag?12288:6144),
-		max_length: (localflag?1536:768),
+		max_length: (localflag?2048:768),
 		last_maxctx: 0,
 		auto_ctxlen: true,
 		auto_genamt: true,
@@ -4583,7 +4643,9 @@ Current version indicated by LITEVER below.
 		saved_comfy_bearer_token: true,
 		saved_xtts_url: true,
 		generate_images_mode: true,
-		saved_mcp_urls: true
+		saved_mcp_urls: true,
+		custom_tools: true,
+		custom_tools_AI_enabled: true
 	};
 
 	const defaultsettings = JSON.parse(JSON.stringify(localsettings));
@@ -4818,6 +4880,15 @@ Current version indicated by LITEVER below.
 		"user_end":"",
 		"assistant_start":"[/INST]",
 		"assistant_end":"</s>",
+	},
+	{
+		"name":"Muse Glimmer",
+		"system_start": "<|start|>system<|message|>",
+		"system_end": "<|eot|>",
+		"user_start": "<|start|>user<|message|>",
+		"user_end": "<|eot|>",
+		"assistant_start": "<|start|>assistant to=user<|message|>",
+		"assistant_end": "<|eot|>"
 	},
 	{
 		"name":"Phi-3 Mini",
@@ -5304,7 +5375,7 @@ Current version indicated by LITEVER below.
 
 	function preserve_protected_fields(source) {
 		const out = {};
-		for (const key in PROTECTED_FIELDS) {
+		for (let key in PROTECTED_FIELDS) {
 			if (source[key] !== undefined) {
 			out[key] = source[key];
 			}
@@ -5958,6 +6029,44 @@ Current version indicated by LITEVER below.
 	{
 		return "["+(new Date().toLocaleTimeString([], {year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit'}))+"]";
 	}
+	function get_thinking_boundary_regex()
+	{
+		let raw_boundary_tags = [
+			get_instructstartplaceholder(),
+			get_instructendplaceholder(),
+			get_instructsysplaceholder(),
+			get_instructstartplaceholder_end(),
+			get_instructendplaceholder_end(),
+			get_instructsysplaceholder_end()
+		];
+		let boundary_tags = [];
+		for(let i=0;i<raw_boundary_tags.length;++i)
+		{
+			let tag = raw_boundary_tags[i];
+			if(tag)
+			{
+				if(boundary_tags.indexOf(tag)==-1)
+				{
+					boundary_tags.push(tag);
+				}
+				tag = tag.trim();
+				if(tag && boundary_tags.indexOf(tag)==-1)
+				{
+					boundary_tags.push(tag);
+				}
+			}
+		}
+		if(boundary_tags.length==0)
+		{
+			return "";
+		}
+		return `(?:${boundary_tags.map(function(tag) { return escapeRegExp(tag); }).join("|")})`;
+	}
+	function get_thinking_content_regex()
+	{
+		const boundary = get_thinking_boundary_regex();
+		return boundary ? `(?:(?!${boundary})[\\s\\S])*?` : `[\\s\\S]*?`;
+	}
 	function get_thinking_regex()
 	{
 		if(!localsettings.start_thinking_tag || !localsettings.stop_thinking_tag)
@@ -5966,7 +6075,7 @@ Current version indicated by LITEVER below.
 		}
 		const safeStart = escapeRegExp(localsettings.start_thinking_tag);
 		const safeStop = escapeRegExp(localsettings.stop_thinking_tag);
-		return `${safeStart}([\\s\\S]*?)${safeStop}`;
+		return `${safeStart}(${get_thinking_content_regex()})${safeStop}`;
 	}
 	function get_orphaned_thinking_regex(tag)
 	{
@@ -5976,7 +6085,7 @@ Current version indicated by LITEVER below.
 		}
 		const safeStart = escapeRegExp(get_instructendplaceholder());
 		const safeStop = escapeRegExp(tag);
-		return `${safeStart}([\\s\\S]*?)${safeStop}`;
+		return `${safeStart}(${get_thinking_content_regex()})${safeStop}`;
 	}
 
 	function remove_all_instruct_tags(text)
@@ -6089,19 +6198,21 @@ Current version indicated by LITEVER below.
 			if (lowerinputtxt.includes("\{\{pick") || lowerinputtxt.includes("\{\{random") || lowerinputtxt.includes("\{\{roll"))
 			{
 				let stablereg = "";
+				let randomness_content = "[^}" + (randomness_allow_newlines ? "" : "\\n") + "]";
+				let randomness_range = "{1," + randomness_max_size + "}";
 				if(!isgametext)
 				{
-					inputtxt = inputtxt.replace(/\{\{roll\s?:?:?([^\}\n]{1,500})\}\}/gi, function (m,matchValue) {
+					inputtxt = inputtxt.replace(RegExp("\\{\\{roll\\s?:?:?(" + randomness_content + randomness_range + ")\\}\\}","gi"), function (m,matchValue) {
 						return dicenotation(matchValue, 0);
 					});
-					inputtxt = inputtxt.replace(/\{\{random\s?:?:?([^\}\n]{1,500})\}\}/gi, function (m,listString) {
+					inputtxt = inputtxt.replace(RegExp("\\{\\{random\\s?:?:?(" + randomness_content + randomness_range + ")\\}\\}","gi"), function (m,listString) {
 						return pickfromlist(listString,0);
 					});
-					stablereg = /\{\{(pick)\s?:?:?([^\}\n]{1,500})\}\}/gi;
+					stablereg = RegExp("\\{\\{(pick)\\s?:?:?(" + randomness_content + randomness_range + ")\\}\\}","gi");
 				}
 				else
 				{
-					stablereg = /\{\{(pick|random|roll)\s?:?:?([^\}\n]{1,500})\}\}/gi;
+					stablereg = RegExp("\\{\\{(pick|random|roll)\\s?:?:?(" + randomness_content + randomness_range + ")\\}\\}","gi");
 				}
 
 				let countmap = (persistent_countmap?persistent_countmap:new Map());
@@ -6193,20 +6304,21 @@ Current version indicated by LITEVER below.
 				}
 			}
 
-			// now fix final assist tag with an assist gen tag if applicable
-			replaceDone = false;
-			let memoryEtIndex = memory.lastIndexOf(et);
-			let promptEtIndex = prompt.lastIndexOf(et);
-			if(prompt && promptEtIndex!=-1 && localsettings.instruct_gentag)
-			{
-				prompt = replaceLast(prompt,et,localsettings.instruct_gentag.replaceAll("\\n", "\n"));
-				replaceDone = true;
-			}
-			if(!replaceDone && memory && memoryEtIndex!=-1 && localsettings.instruct_gentag)
-			{
-				memory = replaceLast(memory,et,localsettings.instruct_gentag.replaceAll("\\n", "\n"));
-				replaceDone = true;
-			}
+		}
+
+		// now fix final assist tag with an assist gen tag if applicable
+		let replaceDone = false;
+		let memoryEtIndex = memory.lastIndexOf(et);
+		let promptEtIndex = prompt.lastIndexOf(et);
+		if(prompt && promptEtIndex!=-1 && localsettings.instruct_gentag)
+		{
+			prompt = replaceLast(prompt,et,localsettings.instruct_gentag.replaceAll("\\n", "\n"));
+			replaceDone = true;
+		}
+		if(!replaceDone && memory && memoryEtIndex!=-1 && localsettings.instruct_gentag)
+		{
+			memory = replaceLast(memory,et,localsettings.instruct_gentag.replaceAll("\\n", "\n"));
+			replaceDone = true;
 		}
 
 		return {"memory":memory,"prompt":prompt};
@@ -7181,6 +7293,7 @@ Current version indicated by LITEVER below.
 				else if (dch.message) {
 					synchro_polled_response = dch.message.content;
 					let reasoningtxt = "";
+					let has_called_tools = (dch.message.tool_calls && dch.message.tool_calls.length>0);
 					if(dch.message.reasoning_content!=null && dch.message.reasoning_content!="") //vllm compat
 					{
 						reasoningtxt = dch.message.reasoning_content;
@@ -7191,17 +7304,17 @@ Current version indicated by LITEVER below.
 					}
 					if(reasoningtxt!="")
 					{
-						if(dch.message.content==null)
+						if(dch.message.content==null && !has_called_tools)
 						{
 							synchro_polled_response = reasoningtxt;
 						}
 						else
 						{
-							synchro_polled_response = `${localsettings.start_thinking_tag}${reasoningtxt}${localsettings.stop_thinking_tag}${dch.message.content}`;
+							synchro_polled_response = `${localsettings.start_thinking_tag}${reasoningtxt}${localsettings.stop_thinking_tag}${dch.message.content?dch.message.content:''}`;
 						}
 					}
 
-					if(dch.message.tool_calls && dch.message.tool_calls.length>0)
+					if(has_called_tools)
 					{
 						synchro_polled_resptoolcalls = dch.message.tool_calls;
 						if(!synchro_polled_response)
@@ -7709,7 +7822,7 @@ Current version indicated by LITEVER below.
 		const codeContainer = btn.parentElement.querySelector('pre code');
 		let innercode = codeContainer.innerText;
 		//remove common language descriptiors from the start
-		let langsmatched = ["matlab","jsonc","powershell","ps1","haskell","hs","vbnet","vb","apache","apacheconf","makefile","mk","ini","protobuf","proto","typescript","tsx","markdown","md","mkdown","mkd","python","py","javascript","js","jsx","html","xhtml","xml","css","json","typescript","ts","tsx","bash","sh","zsh","java","csharp","cs","c","h","cpp","hpp","php","sql","ruby","rb","go","golang","kotlin","kt","swift","rust","rs","r","dart","scala","dockerfile","docker","yaml","yml","ini","toml","perl","pl","shell","console","powershell","ps1","lua","typescript","ts"];
+		let langsmatched = ["matlab","jsonc","powershell","ps1","haskell","hs","vbnet","vb","apache","apacheconf","makefile","mk","ini","protobuf","proto","typescript","tsx","markdown","md","mkdown","mkd","python","py","javascript","js","jsx","html","xhtml","xml","css","json","typescript","ts","tsx","bash","sh","zsh","java","csharp","cs","c","h","cpp","hpp","php","sql","ruby","rb","go","golang","kotlin","kt","swift","rust","rs","r","dart","scala","dockerfile","docker","yaml","yml","ini","toml","perl","pl","shell","console","powershell","ps1","lua","typescript","ts","patch","diff"];
 		for(let i = 0; i < langsmatched.length; ++i) {
 			let matcher = langsmatched[i]+"\n";
 			if (innercode.startsWith(matcher)) {
@@ -8192,6 +8305,701 @@ Current version indicated by LITEVER below.
 		});
 	}
 
+	var trusted_custom_tools = {}; //Functions are only evaluated when actually called (by user or AI)
+	var customtools_snapshot = null; //Temp UI editor
+	function customtools_empty_parameters()
+	{
+		return {type:"object",properties:{},additionalProperties:false};
+	}
+	function customtools_clone(value)
+	{
+		return JSON.parse(JSON.stringify(value));
+	}
+	function customtool_is_valid_name(name)
+	{
+		return (typeof name==="string" && /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(name));
+	}
+	function customtool_is_valid_param_name(name)
+	{
+		return (typeof name==="string" && /^[$A-Z_a-z][$0-9A-Z_a-z]*$/.test(name));
+	}
+	function customtool_is_async(tool)
+	{
+		return (tool && tool.parameters && tool.parameters.additionalProperties && tool.parameters.additionalProperties.asynchronous);
+	}
+	function customtool_get_parameters(tool)
+	{
+		if(!tool || !tool.parameters || typeof tool.parameters!=="object" || Array.isArray(tool.parameters) || tool.parameters.type!=="object" || !tool.parameters.properties || typeof tool.parameters.properties!=="object" || Array.isArray(tool.parameters.properties))
+		{
+			return null;
+		}
+		return tool.parameters.properties;
+	}
+	function customtool_schema_error(tool)
+	{
+		let params = customtool_get_parameters(tool);
+		if(params===null)
+		{
+			return "Parameters must be a JSON schema object with type:\"object\" and a properties object.";
+		}
+		let names = Object.keys(params);
+		for(let i=0;i<names.length;++i)
+		{
+			let nam = names[i];
+			if(!customtool_is_valid_param_name(nam))
+			{
+				return "Parameter name is not a valid Javascript function argument: "+nam;
+			}
+			let prop = params[nam];
+			if(!prop || typeof prop!=="object" || Array.isArray(prop))
+			{
+				return "Parameter "+nam+" must be an object.";
+			}
+			if(prop.type && !["string","number","boolean","integer","null","array","object"].includes(prop.type))
+			{
+				return "Unsupported parameter type for "+nam+": "+prop.type;
+			}
+		}
+		if(tool.parameters.required && (!Array.isArray(tool.parameters.required) || !tool.parameters.required.every(nam => typeof nam==="string" && params.hasOwnProperty(nam))))
+		{
+			return "Required parameters must be an array of defined parameter names.";
+		}
+		return "";
+	}
+	function customtool_normalize(tool)
+	{
+		let typetemplate = {name:"string",description:"string",parameters:"object",functionBody:"string",userCallable:"boolean"};
+		if(!is_obj_with_types(tool,typetemplate,false))
+		{
+			throw new Error("Object is not a custom tool");
+		}
+		let clean = filter_obj_by_keys(tool,Object.keys(typetemplate));
+		if(!customtool_is_valid_name(clean.name))
+		{
+			throw new Error("Invalid tool name: "+clean.name);
+		}
+		let schemaerr = customtool_schema_error(clean);
+		if(schemaerr)
+		{
+			throw new Error(schemaerr);
+		}
+		return clean;
+	}
+	function customtools_sanitize_list(tools)
+	{
+		if(!Array.isArray(tools))
+		{
+			return [];
+		}
+		let clean_tools = [];
+		let seen_names = {};
+		for(let i=0;i<tools.length;++i)
+		{
+			try {
+				let clean = customtool_normalize(tools[i]);
+				let lowername = clean.name.toLowerCase();
+				if(!seen_names[lowername])
+				{
+					seen_names[lowername] = true;
+					clean_tools.push(clean);
+				}
+			} catch(e) {
+				console.log("Skipping invalid custom tool: "+(e.message || String(e)));
+			}
+		}
+		return clean_tools;
+	}
+	function customtools_capture_user_callable()
+	{
+		if(!customtools_snapshot)
+		{
+			return;
+		}
+		for(let i=0;i<customtools_snapshot.length;++i)
+		{
+			let box = document.getElementById("customtool_"+i);
+			if(box)
+			{
+				customtools_snapshot[i].userCallable = (box.checked?true:false);
+			}
+		}
+	}
+	function show_customtools()
+	{
+		let enable_custom_tools_AI;
+		if(customtools_snapshot===null) //open fresh popup
+		{
+			customtools_snapshot = customtools_clone(customtools_sanitize_list(localsettings.custom_tools));
+			enable_custom_tools_AI = localsettings.custom_tools_AI_enabled;
+		}
+		else //refresh already open popup
+		{
+			let ai_box = document.getElementById("enable_custom_tools_AI");
+			enable_custom_tools_AI = (ai_box && ai_box.checked?true:false);
+		}
+		hide_popups();
+		document.getElementById("customtoolscontainer").classList.remove("hidden");
+		let ct = `Here, you can define your own custom tools using Javascript <b>Function</b> code.<br><br><span class='color_red'>Caution: These tools will have full access to your story and API keys, so only enable third-party tools that you trust!</span><br><div><span>Let AI Use Custom Tools? (Requires Toolcalling Enabled) </span><input type='checkbox' id='enable_custom_tools_AI' style='vertical-align: top;' ${enable_custom_tools_AI?'checked':''}></div><br>You can call selected tools with slash command syntax in the prompt submission box, e.g.<br><i>/toolname parameter1 parameter2 ... parameterN</i>.<br><br>Want to get started? <a href='#' class='color_blueurl' onclick='simplecustomtoolsexample()'>Click here</a> to load some simple example tools.<br><br><div><button type="button" class="btn btn-primary widelbtn" onclick="load_customtools_from_file()">Load Tools from JSON</button> <button type="button" class="btn btn-primary widelbtn" onclick="export_customtools_to_file()">Export Tools to JSON</button></div>`;
+
+		if(customtools_snapshot.length>0)
+		{
+			ct += `<table class="tools-table"><thead><tr>`
+				+`<th>Tool Name</th>`
+				+`<th style="text-align:center;">Edit</th>`
+				+`<th style="text-align:center;">/Call</th>`
+				+`<th style="text-align:center;">Del.</th>`
+				+`</tr></thead><tbody>`;
+
+			for (let i=0; i<customtools_snapshot.length; ++i){
+				let toolidx = i;
+				let tool = customtools_snapshot[i];
+				let desc = tool.description ? tool.description.substr(0,180) : "No description";
+				ct += `<tr><td class="tools-info"><div class="tool-title">${escape_html(tool.name)}</div><div class="tool-description">${escape_html(desc)}</div></td>`;
+				ct += `<td style="text-align:center; vertical-align:middle;"><button title="Edit Tool" type="button" class="btn btn-primary widelbtn" onclick="edit_customtool(${toolidx})">+</button></td>`;
+				ct += `<td class="tools-checkbox" style="text-align:center; vertical-align:middle;"><input type="checkbox" title="Make Tool Callable With Slash Syntax" id="customtool_${toolidx}" ${(tool.userCallable?"checked":"")}></td>`;
+				ct += `<td style="text-align:center; vertical-align:middle;"><button title="Delete Tool" type="button" class="btn btn-primary widelbtn" onclick="customtools_capture_user_callable(); customtools_snapshot.splice(${toolidx},1); show_customtools();">X</button></td></tr>`;
+			}
+			ct += `</tbody></table>`;
+		}
+		else
+		{
+			ct += "<hr /><br><p><i>No custom tools defined.</i></p><br>";
+		}
+		ct += `<div><button title="Add a New Custom Tool" type="button" class="btn btn-primary widelbtn" style="margin:8px;" onclick="edit_customtool(${customtools_snapshot.length})">Add a New Custom Tool</button></div>`;
+
+		document.getElementById("customtoolsitems").innerHTML = ct;
+	}
+	function customtools_done(save)
+	{
+		if(save)
+		{
+			customtools_capture_user_callable();
+			let customtools_edited = false;
+			customtools_snapshot.forEach(tool => {
+				if(tool.tmp_edited){
+					customtools_edited = true;
+					delete tool["tmp_edited"];
+				}
+			});
+			if(customtools_edited){
+				trusted_custom_tools = {};
+			}
+			localsettings.custom_tools = customtools_snapshot;
+			localsettings.custom_tools_AI_enabled = (document.getElementById("enable_custom_tools_AI").checked?true:false);
+		}
+		customtools_snapshot = null;
+		document.getElementById("customtoolscontainer").classList.add("hidden");
+		hide_popups();
+	}
+	function simplecustomtoolsexample()
+	{
+		customtools_snapshot = [
+			{name:"mult",description:"Multiply two numbers",parameters:{type:"object",properties:{a:{type:"number"},b:{type:"number",default:"42"}},required:["a"],additionalProperties:false},functionBody:"return a*b;",userCallable:true},
+			{name:"set_nostalgia_theme",description:"Sets the user's interface to the Nostalgia theme.",parameters:{type:"object",properties:{},additionalProperties:false},functionBody:"document.getElementById('colortheme').value = localsettings.colortheme = 1;\ntoggle_theme_colors();",userCallable:true},
+			{name:"critic_agent",description:"Independently reviews the input text.",parameters:{type:"object",properties:{inputtxt:{type:"string"}},required:["inputtxt"],additionalProperties:{asynchronous:true}},functionBody:"return fetch(\n\tapply_proxy_url(custom_kobold_endpoint + kobold_custom_gen_endpoint),\n\t{\n\t\tmethod: 'POST',\n\t\theaders: get_kobold_header(),\n\t\tbody: JSON.stringify({\n\t\t\t'prompt': get_instruct_starttag(false) + 'Scrutinize the following text, and identify one area for improvement:\\n\"\"\"\\n' + inputtxt + '\\n\"\"\"' + get_instruct_endtag(false) + 'Here is a brief critique:\\n',\n\t\t\t'max_length': 512,\n\t\t\t'temperature': localsettings.temperature,\n\t\t\t'quiet': false\n\t\t})\n\t}\n).then(x => x.json())\n.then((resp) => resp.results[0].text);",userCallable:false}
+		];
+		show_customtools();
+	}
+	function export_customtools_to_file()
+	{
+		customtools_capture_user_callable();
+		let exported = customtools_snapshot.map(tool => filter_obj_by_keys(tool,["name","description","parameters","functionBody","userCallable"]));
+		saveFileGeneric("custom_tools",JSON.stringify(exported),"application/json");
+	}
+	function load_customtools_from_file()
+	{
+		promptUserForLocalFile((fileDetails) => {
+			try
+			{
+				let { file, fileName, ext, content, plaintext } = fileDetails;
+				let filecontent = JSON.parse(plaintext);
+				if(filecontent && (typeof filecontent==="object") && filecontent.hasOwnProperty("savedsettings")){
+					//assume it's a kai file
+					filecontent = filecontent.savedsettings.custom_tools;
+				}
+				if(!Array.isArray(filecontent)){
+					throw new Error("Custom tools file must contain an array");
+				}
+				//else assume it's an exported array
+				let has_unknown_attributes = false;
+				let clean_tools = [];
+				let seen_names = {};
+				for (let i = 0; i < filecontent.length; ++i) {
+					let clean = customtool_normalize(filecontent[i]);
+
+					has_unknown_attributes =
+						has_unknown_attributes || (Object.keys(filecontent[i]).length > 5);
+
+					let lowername = clean.name.toLowerCase();
+
+					if (seen_names[lowername]) {
+						throw new Error("Duplicate tool name: " + clean.name);
+					}
+
+					seen_names[lowername] = true;
+					clean_tools.push(clean);
+				}
+				if(has_unknown_attributes){ //for security, we destroy them (but alert the user)
+					msgbox("Warning: Found unknown attributes in your custom tools JSON (not imported).","Custom Tools Import Warning");
+				}
+				customtools_snapshot = clean_tools;
+				show_customtools();
+			}
+			catch (e) {
+				msgbox("Custom Tools File Import Failed: "+e);
+				return;
+			}
+		});
+	}
+	function is_obj_with_types(inp, typObj, strict=true) //check if inp is an object with typed fields specified by typObj
+	{
+	return inp && (typeof inp==="object") && !Array.isArray(inp) &&
+		Object.keys(typObj).map(k => {return inp.hasOwnProperty(k) && (typeof inp[k]===typObj[k])}).every(Boolean) &&
+		(!strict || Object.keys(inp).length===Object.keys(typObj).length); //if strict, then no other fields are allowed
+	}
+	function filter_obj_by_keys(obj,keys)
+	{
+		let filteredObj = {};
+		for (let k of keys){
+			filteredObj[k] = obj[k];
+		}
+		return filteredObj;
+	}
+	function edit_customtool(idx=null) //we stash the working tmptool at the end of the customtools_snapshot array
+	{
+		if(document.getElementById("customtooleditcontainer").classList.contains("hidden"))
+		{
+			customtools_capture_user_callable();
+			let tool = (customtools_snapshot.length===idx) ?
+				{name:"", description:"", parameters:customtools_empty_parameters(), functionBody:"",userCallable:false} :
+				customtools_clone(filter_obj_by_keys(customtools_snapshot[idx],["name","description","parameters","functionBody","userCallable"]));
+			tool.tmp_origidx = idx;
+			customtools_snapshot.push(tool);
+
+			document.getElementById("customtooleditcontainer").classList.remove("hidden");
+			document.getElementById("customtooleditor_name").value = tool.name;
+			document.getElementById("customtooleditor_description").value = tool.description;
+			let paramsjsonstr = JSON.stringify(tool.parameters);
+			document.getElementById("customtooleditor_parametersjson").value = paramsjsonstr;
+			document.getElementById("customtooleditor_functionbody").value = tool.functionBody;
+			document.getElementById("customtooleditor_asynchronous").checked = customtool_is_async(tool);
+			try { //check if parameters JSON can be completely reconstructed from the template
+			document.getElementById("customtooleditor_editparametersjsondirectly").checked = (JSON.stringify(customtooleditor_templated_json(false))!==paramsjsonstr);
+			} catch (e) {
+				document.getElementById("customtooleditor_editparametersjsondirectly").checked = true;
+			}
+			customtooleditor_parameters_toggle();
+		}
+
+		let tool = customtools_snapshot[customtools_snapshot.length-1];
+		let toolargs = Object.keys(tool.parameters.properties);
+		let ctep = "<hr /><p><i>This tool has no parameters.</i></p>";
+		if(toolargs.length)
+		{
+			let selectable_types = ["string","number","boolean","integer","null","array","object"]; //"function"
+			ctep = `<table class="groupchatselect-table">`
+					+`<thead><tr>`
+					+`<th style="text-align:center;">Name </th>`
+					+`<th style="text-align:center;">Type</th>`
+					+`<th style="text-align:center;">Default Value</th>`
+					+`<th style="text-align:center;">Delete</th>`
+					+`</tr></thead><tbody>`;
+			for( let i=0; i<toolargs.length; ++i){
+					let argidx = i;
+					let name = toolargs[i];
+					let hasdefault = tool.parameters.properties[name].hasOwnProperty("default");
+					ctep += `<tr><td><input class="menuinput_inline" type="text" value="${escape_html(name)}" id="customtooleditor_arg${argidx+1}_name"></td>`
+						+`<td><select class="form-control" id="customtooleditor_arg${argidx+1}_type">`;
+					selectable_types.forEach(typ => { ctep += `<option value="${typ}" ${(tool.parameters.properties[name].type===typ)?'selected':''}>${typ}</option>`; });
+					ctep += `</select></td>`
+					+`<td>Set Default?  <input type="checkbox" title="Set Default Value?" id="customtooleditor_arg${argidx+1}_hasdefault" onchange="customtooleditor_argdefault_toggle(${argidx})" ${hasdefault?'checked':''}><br><input class="menuinput_inline ${hasdefault?'':'hidden'}" style="width: 100px;" type="text" value="${hasdefault?escape_html(String(tool.parameters.properties[name].default)):''}" id="customtooleditor_arg${argidx+1}_default" placeholder="(Empty)"></td>`
+					+`<td><button title="Delete Parameter" type="button" class="btn btn-primary widelbtn" onclick="customtooleditor_modifyparams(${argidx})">X</button></td></tr>`;
+			}
+			ctep += `</tbody></table>`;
+		}
+		ctep += `<div class="ui-settings-inline color_blueurl groupchat-inline-action" onclick="customtooleditor_modifyparams(${toolargs.length})">Add Parameter</div>`;
+		document.getElementById("customtooleditor_parameterstemplatecontainer").innerHTML = ctep;
+	}
+	function customtooleditor_templated_json(usetemplate=true) //returns a parameters JSON object, or an error string
+	{
+		let newparams = {type:"object",properties:{}};
+		let newrequired = [];
+		let toolprops = customtools_snapshot[customtools_snapshot.length-1].parameters.properties;
+		for(let i=0; i<Object.keys(toolprops).length; ++i){
+			let newname = usetemplate ? document.getElementById("customtooleditor_arg"+(i+1)+"_name").value : Object.keys(toolprops)[i];
+			if(!newname){
+				return "Error: Parameter "+(i+1)+" is empty";
+			}
+			if(!customtool_is_valid_param_name(newname)){
+				return "Error: Parameter "+(i+1)+" is not a valid Javascript function argument";
+			}
+			if(newparams.properties.hasOwnProperty(newname)){
+				return "Error: Duplicate parameter name: "+newname;
+			}
+			let newprop = {type:(usetemplate? document.getElementById("customtooleditor_arg"+(i+1)+"_type").value : toolprops[newname].type)};
+			if(usetemplate? document.getElementById("customtooleditor_arg"+(i+1)+"_hasdefault").checked : toolprops[newname].hasOwnProperty("default")){
+				newprop["default"] = (usetemplate? document.getElementById("customtooleditor_arg"+(i+1)+"_default").value : toolprops[newname].default);
+			} else {
+				newrequired.push(newname);
+			}
+			newparams.properties[newname] = newprop;
+		}
+		if(newrequired.length){
+			newparams.required = newrequired;
+		}
+		newparams.additionalProperties = (usetemplate?(document.getElementById("customtooleditor_asynchronous").checked ?{asynchronous:true}:false):customtools_snapshot[customtools_snapshot.length-1].parameters.additionalProperties);
+		return newparams;
+	}
+	function customtooleditor_modifyparams(argidx) //adding or deleting a parameter triggers a form redraw
+	{
+		let newparams = customtooleditor_templated_json();
+		if(typeof newparams==="string"){
+			msgbox(newparams);
+			return;
+		}
+		let tool = customtools_snapshot[customtools_snapshot.length-1];
+		let toolargs = Object.keys(tool.parameters.properties);
+		if(argidx < toolargs.length){ //delete this param
+			delete newparams.properties[toolargs[argidx]];
+		} else { //add a new param
+			let freshname = "arg"+(toolargs.length+1);
+			while(toolargs.includes(freshname)){ freshname += "_"; }
+			newparams.properties[freshname] = {type:"string"};
+			if(!newparams.required) {
+				newparams = {type:"object",properties:newparams.properties,required:[],additionalProperties:newparams.additionalProperties};
+			}
+			newparams.required.push(freshname);
+		}
+		tool.parameters = newparams;
+		edit_customtool();
+	}
+	function customtooleditor_parameters_toggle()
+	{
+		if(document.getElementById("customtooleditor_editparametersjsondirectly").checked){
+			document.getElementById("customtooleditor_parametersjsoncontainer").classList.remove("hidden");
+			document.getElementById("customtooleditor_parameterstemplatecontainer").classList.add("hidden");
+		} else {
+			document.getElementById("customtooleditor_parameterstemplatecontainer").classList.remove("hidden");
+			document.getElementById("customtooleditor_parametersjsoncontainer").classList.add("hidden");
+		}
+	}
+	function customtooleditor_argdefault_toggle(idx)
+	{
+		if(document.getElementById("customtooleditor_arg"+(idx+1)+"_hasdefault").checked){
+			document.getElementById("customtooleditor_arg"+(idx+1)+"_default").classList.remove("hidden");
+		} else {
+			document.getElementById("customtooleditor_arg"+(idx+1)+"_default").classList.add("hidden");
+		}
+	}
+	function customtooleditor_done(save)
+	{
+		if(save)
+		{
+			let newname = document.getElementById("customtooleditor_name").value;
+			if(!newname)
+			{
+				msgbox("Tool name cannot be empty!");
+				return;
+			}
+			if(!customtool_is_valid_name(newname))
+			{
+				msgbox("Tool name must start with a letter or underscore, and may contain letters, numbers, underscores, or hyphens.");
+				return;
+			}
+			let namematch = customtools_snapshot.findIndex(tool => tool.name.toLowerCase()===newname.toLowerCase());
+			let idx = customtools_snapshot[customtools_snapshot.length-1].tmp_origidx;
+			if(![-1,customtools_snapshot.length-1,idx].includes(namematch))
+			{
+				msgbox("Duplicate tool names are not allowed!");
+				return;
+			}
+			let newparameters = document.getElementById("customtooleditor_editparametersjsondirectly").checked;
+			if(newparameters)
+			{
+				try
+				{
+					newparameters = JSON.parse(document.getElementById("customtooleditor_parametersjson").value);
+					if(!newparameters || (typeof newparameters !== "object"))
+					{
+						msgbox("Must specify a parameters JSON object!");
+						return;
+					}
+					let schemaerr = customtool_schema_error({parameters:newparameters});
+					if(schemaerr)
+					{
+						msgbox(schemaerr);
+						return;
+					}
+				} catch(e) {
+					msgbox("Error parsing parameters JSON: "+e.message);
+					return;
+				}
+			}
+			else
+			{
+				newparameters = customtooleditor_templated_json();
+				if(typeof newparameters==="string") //Error
+				{
+					msgbox(newparameters);
+					return;
+				}
+			}
+
+			let tool = customtools_snapshot[idx];
+			if(tool.name!==newname)
+			{
+				tool.name = newname;
+				tool["tmp_edited"] = true;
+			}
+			if(tool.description!==document.getElementById("customtooleditor_description").value)
+			{
+				tool.description = document.getElementById("customtooleditor_description").value;
+			}
+			if(JSON.stringify(tool.parameters)!==JSON.stringify(newparameters))
+			{
+				tool.parameters = newparameters;
+				tool["tmp_edited"] = true;
+			}
+			if(tool.functionBody!==document.getElementById("customtooleditor_functionbody").value)
+			{
+				tool.functionBody = document.getElementById("customtooleditor_functionbody").value;
+				tool["tmp_edited"] = true;
+			}
+			if(idx===customtools_snapshot.length-1) //newly added tool
+			{
+				delete tool["tmp_origidx"];
+				tool["tmp_edited"] = true;
+				customtools_snapshot.push(null); //push a dummy value to get popped
+			}
+		}
+		customtools_snapshot.pop(); //clear the working tmptool
+		document.getElementById("customtooleditcontainer").classList.add("hidden");
+		show_customtools();
+	}
+
+	function parse_slash_command(tool, senttext) //simple domain-specific language, returns args object or string error
+	{
+		let toolprops = customtool_get_parameters(tool);
+		if(toolprops===null){
+			return "Error parsing slash command (/"+tool.name+"): invalid tool parameters";
+		}
+		let toolparams = Object.keys(toolprops);
+		let sentargs = {};
+		if(tool.name.length+1>=senttext.length){
+			return sentargs;
+		}
+		let paramidx = -1;
+		let currarg = "";
+		let currstack = []; //tracks nesting depth, empty=toplevel
+		let inquotes = false;
+		for(let i=tool.name.length+1; i<senttext.length; ++i){
+			let ch = senttext[i]; //next char
+			let stacktop = currstack.length?currstack[currstack.length-1]:'';
+			if(inquotes) //handle string content, then continue next char
+			{
+				currarg += ch;
+				if(ch==='\\' && i+1<senttext.length){ //escape next char
+					currarg += senttext[++i];
+				} else if(ch===stacktop) { //end quotes
+					currstack.pop();
+					inquotes = false;
+				}
+				continue;
+			}
+			if(ch==='=' && !currstack.length) //handle named parameters, then continue next char
+			{
+				paramidx = toolparams.indexOf(currarg);
+				if(paramidx===-1 && /^[\[{]/.test(currarg)){
+					return "Sorry, slash commands (/"+tool.name+") do not support destructuring ("+currarg+"). Please supply your parameters explicitly.";
+				}
+				currarg = "";
+				continue;
+			}
+			if(/[,\s]/.test(ch) && !currstack.length) //handle inter-argument separators, then continue next char
+			{
+				if(ch===',' || currarg.length) //end of argument
+				{
+					if(paramidx===-1){ //no named parameter, assign to the next available one
+						paramidx = toolparams.findIndex(nam => !sentargs.hasOwnProperty(nam));
+						//if this still == -1 (i.e. all arguments already bound)
+						//then we assume currarg is a trailing comment, and discard it
+					}
+					if(paramidx!==-1){
+						sentargs[toolparams[paramidx]] = currarg;
+						paramidx = -1;
+					}
+					currarg = "";
+				} //else ch is inter-argument whitespace, discard it
+				continue;
+			}
+			if(ch==='[' || ch==='{' || ch==='(' || ch==='"' || ch==="'") //handle nested delimiters (do NOT continue next char)
+			{
+				currstack.push(ch);
+				inquotes = (ch==='"' || ch==="'");
+			}
+			else if(ch===']' || ch==='}' || ch===')')
+			{
+				if(!(ch===']' && stacktop==='[') && !(ch==='}' && stacktop==='{') && !(ch===')' && stacktop==='(')){
+					return "Error parsing slash command (/"+tool.name+"): mismatched delimiters ('"+stacktop+"' followed by '"+ch+"')";
+				}
+				currstack.pop();
+			}
+			currarg += ch; //ordinary character
+		}
+		//end of senttext input
+		if(currstack.length){
+			return "Error parsing slash command (/"+tool.name+"): unmatched delimiter "+currstack.pop();
+		}
+		if(paramidx!==-1 || currarg.length) //last argument
+		{
+			if(paramidx===-1){
+				paramidx = toolparams.findIndex(nam => !sentargs.hasOwnProperty(nam));
+			}
+			if(paramidx!==-1){
+				sentargs[toolparams[paramidx]] = currarg;
+			}
+		}
+		return sentargs;
+	}
+	function customtool_parse_literal(value)
+	{
+		if(typeof value!=="string")
+		{
+			return value;
+		}
+		let trimmed = value.trim();
+		if(trimmed==="")
+		{
+			return "";
+		}
+		if((trimmed[0]==="'" && trimmed[trimmed.length-1]==="'") || (trimmed[0]==='"' && trimmed[trimmed.length-1]==='"'))
+		{
+			if(trimmed[0]==="'")
+			{
+				return trimmed.slice(1,-1).replace(/\\'/g,"'").replace(/\\\\/g,"\\");
+			}
+			try {
+				return JSON.parse(trimmed);
+			} catch(e) {
+				return trimmed.slice(1,-1);
+			}
+		}
+		if(/^(true|false|null)$/i.test(trimmed) || /^-?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(trimmed) || /^[\[{]/.test(trimmed))
+		{
+			try {
+				return JSON.parse(trimmed);
+			} catch(e) {
+				return value;
+			}
+		}
+		return value;
+	}
+	function customtool_coerce_arg(value, propobj)
+	{
+		let type = propobj.type?propobj.type:"";
+		let argval = customtool_parse_literal(value);
+		switch(type)
+		{
+			case "string":
+				return (argval===undefined?undefined:String(argval));
+			case "number":
+				argval = Number(argval);
+				if(Number.isNaN(argval)){ throw new Error("Parameter must be a number"); }
+				return argval;
+			case "boolean":
+				if(typeof argval==="string")
+				{
+					if(argval.toLowerCase()==="true"){ return true; }
+					if(argval.toLowerCase()==="false"){ return false; }
+				}
+				return Boolean(argval);
+			case "integer":
+				argval = Number(argval);
+				if(Number.isNaN(argval)){ throw new Error("Parameter must be an integer"); }
+				return Math.trunc(argval);
+			case "null":
+				return (argval==null)?null:undefined;
+			case "array":
+				if(!Array.isArray(argval)){ throw new Error("Parameter must be an array"); }
+				return argval;
+			case "object":
+				if(argval===null || typeof argval!=="object" || Array.isArray(argval)){ throw new Error("Parameter must be an object"); }
+				return argval;
+			default:
+				return argval;
+		}
+	}
+	function TrustedCustomToolCallPromise(tool, argsobj){
+		return Promise.resolve()
+		.then(()=>{
+			argsobj = argsobj || {};
+			let schemaerr = customtool_schema_error(tool);
+			if(schemaerr){ throw new Error(schemaerr); }
+			let toolparamobj = customtool_get_parameters(tool);
+			let toolparams = Object.keys(toolparamobj);
+			if(tool.parameters.required)
+			{
+				for(let i=0;i<tool.parameters.required.length;++i)
+				{
+					let reqname = tool.parameters.required[i];
+					if(!Object.prototype.hasOwnProperty.call(argsobj, reqname) && !Object.prototype.hasOwnProperty.call(toolparamobj[reqname], "default"))
+					{
+						throw new Error("Missing required parameter: "+reqname);
+					}
+				}
+			}
+			let callargs = toolparams.map((nam) => {
+				let propobj = toolparamobj[nam];
+				let argval = Object.prototype.hasOwnProperty.call(argsobj, nam) ? argsobj[nam]
+				: Object.prototype.hasOwnProperty.call(propobj, "default") ? propobj.default
+				: undefined;
+				return customtool_coerce_arg(argval, propobj);
+			});
+			let name = tool.name;
+			if(!trusted_custom_tools.hasOwnProperty(name)) //evaluates the tool's functionBody
+			{
+				trusted_custom_tools[name] = new Function(...toolparams, tool.functionBody);
+			}
+			let result = trusted_custom_tools[name](...callargs);
+			if(result)
+			{
+				console.log("Custom Tool Call OK");
+				console.log(result);
+			}
+			return (tool.parameters.additionalProperties && tool.parameters.additionalProperties.asynchronous) ?
+			result : Promise.resolve(result);
+		})
+		.catch(err => {
+			console.log("Custom Tool Call Error");
+			console.log(err || String(err));
+			throw err;
+		})
+	}
+	function mcp_content_has_media(content)
+	{
+		if(!Array.isArray(content))
+		{
+			return false;
+		}
+		for(let i=0;i<content.length;++i)
+		{
+			let item = content[i];
+			if(!item || typeof item!=="object")
+			{
+				continue;
+			}
+			if(item.type==="image_url" || item.type==="input_audio")
+			{
+				return true;
+			}
+			if(item.type==="text" && typeof item.text==="string" && item.text.indexOf("data:image")!==-1)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
 	//MCP HTTP client code
 	const MCP_PROTOCOL_VER = "2025-11-25";
 	var mcp_req_id = 0;
@@ -8519,16 +9327,53 @@ Current version indicated by LITEVER below.
 			pending_response_id = "toolcall-v1-dummy-id-"+(Math.floor(1000 + Math.random() * 9000)).toString(); //dummy id, autogenerated
 
 			let mcpurl = GetMCPUrlOfTool(callresp.name);
-			const customHeaders = localsettings.cached_mcp_tools[mcpurl].apikey ?
-			{ 'Authorization': `Bearer ${localsettings.cached_mcp_tools[mcpurl].apikey}` } : {};
-			if(localsettings.corsproxy_mcp)
+			let MCPToolCallPromise = null;
+			if(mcpurl==="custom_tools" && localsettings.custom_tools_AI_enabled) //hook in the custom tool
 			{
-				mcpurl = apply_proxy_url(mcpurl,true);
+				MCPToolCallPromise = Promise.resolve()
+				.then(() => {
+					// Validate inputs
+					if(!localsettings.cached_mcp_tools || Object.keys(localsettings.cached_mcp_tools).length === 0 || !callresp.name) {
+						throw new Error("tool call invalid parameters");
+					}
+					let customtools = customtools_sanitize_list(localsettings.custom_tools);
+					let idx = customtools.map(tool => tool.name).indexOf(callresp.name);
+					if(idx===-1){
+						throw new Error("Custom tool not found");
+					}
+					// Simulate the tool call in Javascript
+					return TrustedCustomToolCallPromise(customtools[idx],callargs);
+				}).then((result) => {
+					let restype = typeof(result);
+					if(restype==="string" && result.startsWith("data:image"))
+					{
+						restype = "image_url";
+						result = {url:result};
+					}
+					if(restype==="undefined") //if the function has no return value, we add one
+					{
+						restype = "string";
+						result = "Operation completed successfully";
+					}
+					let content = {type: restype};
+					content[restype] = result;
+					return {"content":[content]};
+				});
 			}
-			MCPInit(mcpurl, customHeaders)
-			.then(mcp_client => {
-				return MCPToolCallInternal(mcp_client,callresp.name,callargs);
-			}).then(function (response) {
+			else
+			{
+				const customHeaders = localsettings.cached_mcp_tools[mcpurl].apikey ?
+				{ 'Authorization': `Bearer ${localsettings.cached_mcp_tools[mcpurl].apikey}` } : {};
+				if(localsettings.corsproxy_mcp)
+				{
+					mcpurl = apply_proxy_url(mcpurl,true);
+				}
+				MCPToolCallPromise = MCPInit(mcpurl, customHeaders)
+				.then(mcp_client => {
+					return MCPToolCallInternal(mcp_client,callresp.name,callargs);
+				});
+			}
+			MCPToolCallPromise.then(function (response) {
 				if(response.content && response.content.length>0)
 				{
 					let outitems = [];
@@ -8537,7 +9382,7 @@ Current version indicated by LITEVER below.
 						let tgt = replaceStringsInObject(response.content[i], "&quot;", "\""); //we must remove existing escaped quotes or things break later
 						outitems.push(tgt);
 					}
-					callresp.content = JSON.stringify(outitems);
+					callresp.content = mcp_content_has_media(outitems) ? outitems : JSON.stringify(outitems);
 				}
 				callresptxt += JSON.stringify(callresp);
 				if(toolcall_obj.tool_calls.length < 2)
@@ -8604,6 +9449,9 @@ Current version indicated by LITEVER below.
 			let url = apply_proxy_url(custom_kobold_endpoint + koboldcpp_mcp_endpoint);
 			servers[url] = { apikey: (custom_kobold_key!=""?custom_kobold_key:null), tools:[] };
 		}
+		if(localsettings.custom_tools_AI_enabled){
+			servers["custom_tools"] = { apikey: null, tools: [] };
+		}
 		return servers;
 	}
 	function Fetch_MCP_Tools() //connects to multiple mcp servers, updates the tool list
@@ -8616,6 +9464,11 @@ Current version indicated by LITEVER below.
 		const fetchPromises = [];
 
 		urls.forEach(url => {
+			if(url==="custom_tools" && localsettings.custom_tools_AI_enabled)
+			{
+				let customtools = customtools_sanitize_list(localsettings.custom_tools);
+				fetchPromises.push({url:url, apikey:null, tools:customtools.map(tool => ({type:"function",function:filter_obj_by_keys(tool,["name","description","parameters"])}))});
+			} else {
 			const customHeaders = urlsobj[url].apikey ?
 				{ 'Authorization': `Bearer ${urlsobj[url].apikey}` } : {};
 
@@ -8638,15 +9491,26 @@ Current version indicated by LITEVER below.
 				});
 
 			fetchPromises.push(fetchPromise);
+			}
 		});
 
 		// wait till all fetched or failed
 		Promise.all(fetchPromises)
 		.then(results => {
 			pending_cached_mcp_tools = {};
+			let seen_tool_names = {};
 			for(let i=0;i<results.length;++i)
 			{
 				let itm = results[i];
+				itm.tools = itm.tools.filter(tool => {
+					let toolname = tool && tool.function ? tool.function.name : "";
+					if(!toolname || seen_tool_names[toolname.toLowerCase()])
+					{
+						return false;
+					}
+					seen_tool_names[toolname.toLowerCase()] = true;
+					return true;
+				});
 				pending_cached_mcp_tools[itm.url] = {apikey: itm.apikey, tools:itm.tools };
 			}
 			Render_MCP_Tools(pending_cached_mcp_tools,pending_disabled_mcp_tools);
@@ -8667,6 +9531,7 @@ Current version indicated by LITEVER below.
 		const toolscontainer = document.getElementById("tools_list_container");
 		let toolshtml = `<table class="tools-table"><thead><tr><th>Tool</th><th>Enabled</th></tr></thead><tbody>`;
 		let hasAnyTools = false;
+		let toolidx = 0;
 
 		for(let url in mcp_tools)
 		{
@@ -8674,17 +9539,20 @@ Current version indicated by LITEVER below.
 			itm.tools.forEach(tool => {
 				const toolFunction = tool.function || tool;
 				hasAnyTools = true;
+				let checkboxid = "mcptool_"+toolidx;
+				let tooldesc = toolFunction.description ? toolFunction.description.substr(0, 180) : "No description";
 				toolshtml += `
 					<tr>
 						<td class="tools-info">
-							<div class="tool-title">${toolFunction.name}</div>
-							<div class="tool-description">${toolFunction.description ? toolFunction.description.substr(0, 180) : 'No description'}</div>
+							<div class="tool-title">${escape_html(toolFunction.name)}</div>
+							<div class="tool-description">${escape_html(tooldesc)}</div>
 						</td>
 						<td class="tools-checkbox">
-							<input type="checkbox" id="mcptool_${toolFunction.name}" value="${toolFunction.name}" ${disabled_tools.includes(toolFunction.name)?"":"checked"}/>
+							<input type="checkbox" id="${checkboxid}" value="${escape_html(toolFunction.name)}" ${disabled_tools.includes(toolFunction.name)?"":"checked"}/>
 						</td>
 					</tr>
 				`;
+				toolidx++;
 			});
 		}
 		toolshtml += `</tbody></table>`;
@@ -10174,6 +11042,8 @@ Current version indicated by LITEVER below.
 			new_save_storyobj.savedsettings.saved_comfy_bearer_token = "";
 			new_save_storyobj.savedsettings.saved_xtts_url = "";
 			new_save_storyobj.savedsettings.saved_mcp_urls = "";
+			new_save_storyobj.savedsettings.custom_tools = [];
+			new_save_storyobj.savedsettings.custom_tools_AI_enabled = false;
 
 			new_save_storyobj.savedsettings.modelhashes = [];
 
@@ -10192,23 +11062,23 @@ Current version indicated by LITEVER below.
 		return new_save_storyobj;
 	}
 
-	function load_file(event) {
+	function load_file(event, to_groupchat=false) {
 		let input = event.target;
 
 		if (input.files.length > 0) {
 
 			var selectedFile = input.files[0];
 
-			load_selected_file(selectedFile);
+			load_selected_file(selectedFile, to_groupchat);
 
-			document.getElementById("loadfileinput").value = "";
+			input.value = "";
 		} else {
 			console.log("No file to load")
 		}
 	};
 
 	//attempt to load a file from disk. could be any format, even images
-	function load_selected_file(selectedFile)
+	function load_selected_file(selectedFile, to_groupchat=false)
 	{
 		var selectedFilename = "";
 		if(selectedFile)
@@ -10225,7 +11095,7 @@ Current version indicated by LITEVER below.
 				//we don't want to fiddle with the file as its very complex. only handle the parts we are interested in, and just leave the rest untouched.
 				if (is_kai_json(new_loaded_storyobj) && !new_loaded_storyobj.scenarioVersion) {
 					//quick sanity check. if prompt does not exist, this is not a KAI save.
-					kai_json_load(new_loaded_storyobj,false);
+					kai_json_load(new_loaded_storyobj,false, false, true, to_groupchat);
 					if (selectedFilename && selectedFilename != "") {
 						localsettings.last_known_filename = selectedFilename;
 					}
@@ -10234,15 +11104,19 @@ Current version indicated by LITEVER below.
 					let has_tav_wi_check = has_tavern_wi_check(new_loaded_storyobj);
 					if (!new_loaded_storyobj.scenarioVersion && (new_loaded_storyobj.name != null || new_loaded_storyobj.description != null ||
 						new_loaded_storyobj.personality != null || (new_loaded_storyobj.spec=="chara_card_v2" || new_loaded_storyobj.spec=="chara_card_v3") || has_tav_wi_check)) {
-						load_tavern_obj(new_loaded_storyobj);
+						load_tavern_obj(new_loaded_storyobj,to_groupchat);
 					}
 					else if (new_loaded_storyobj.char_name != null || new_loaded_storyobj.char_persona != null) {
 						//check for ooba text generation fields (character)
-						load_ooba_obj(new_loaded_storyobj);
+						load_ooba_obj(new_loaded_storyobj,to_groupchat);
 					}
 					else if(new_loaded_storyobj.md && new_loaded_storyobj.savedsettings) //add some compat loading for sharefiles
 					{
-						kai_json_load(new_loaded_storyobj,false);
+						kai_json_load(new_loaded_storyobj,false, false, true, to_groupchat);
+					}
+					else if(to_groupchat)
+					{
+						msgbox("Could not import selected file as a group chat participant. Please select a KoboldAI save, Tavern character card, Risu card, or compatible Ooba character file.");
 					}
 					else if(new_loaded_storyobj.scenarioVersion>1 && new_loaded_storyobj.scenarioVersion<10)
 					{
@@ -10268,37 +11142,24 @@ Current version indicated by LITEVER below.
 					const data = pngfr.result;
 					const arr = new Uint8Array(data);
 
-					function setImgAsAvatar(data)
-					{
-						compressImage(data, (compressedImageURI, aspectratio) => {
-							aestheticInstructUISettings.AI_portrait = compressedImageURI;
-							document.getElementById('portrait_ratio_AI').value = aspectratio.toFixed(2);
-							refreshAestheticPreview(true);
-							render_gametext();
-						}, true, AVATAR_PX);
-					}
-
 					// 1. Try Tavern PNG
 					let result = convertTavernPng(arr);
 					if (result) {
-						load_tavern_obj(result);
-						setImgAsAvatar(data);
+						load_tavern_obj(result,to_groupchat,data);
 						return;
 					}
 
 					// 2. Try Tavern EXIF
 					result = getTavernExifJSON(arr);
 					if (result) {
-						load_tavern_obj(result);
-						setImgAsAvatar(data);
+						load_tavern_obj(result,to_groupchat,data);
 						return;
 					}
 
 					// 3. Try Risu V3
 					result = extractRisuData(arr);
 					if (result) {
-						load_tavern_obj(result);
-						setImgAsAvatar(data);
+						load_tavern_obj(result,to_groupchat,data);
 						return;
 					}
 
@@ -10306,11 +11167,17 @@ Current version indicated by LITEVER below.
 					try {
 						result = UnzipKAISTORYFile(arr);
 						if (result) {
-							kai_json_load(result, false);
+							kai_json_load(result, false, false, true, to_groupchat);
 							return;
 						}
 					} catch (error) {
 						console.log("Unzip failed: " + error);
+					}
+
+					if(to_groupchat)
+					{
+						msgbox("Could not import selected file as a group chat participant. Please select a KoboldAI save, Tavern character card, Risu card, or compatible Ooba character file.");
+						return;
 					}
 
 					//try JSONL
@@ -10321,6 +11188,11 @@ Current version indicated by LITEVER below.
 						if(temparrs && temparrs.length>1 && temparrs[temparrs.length-1].mes && temparrs[temparrs.length-1].name)
 						{
 							load_tavern_jsonl(temparrs);
+							return;
+						}
+						else if(temparrs && temparrs.length>1 && temparrs[0].type=="session")
+						{
+							load_lcpp_jsonl(temparrs);
 							return;
 						}
 					}
@@ -10373,8 +11245,19 @@ Current version indicated by LITEVER below.
 		return is_kai;
 	}
 
-	function kai_json_load(storyobj, force_load_settings, ignore_multiplayer_sync=false, save_after_loading=true)
+	function kai_json_load(storyobj, force_load_settings, ignore_multiplayer_sync=false, save_after_loading=true, to_groupchat=false)
 	{
+		if(to_groupchat)
+		{
+			let savedsettings = storyobj.savedsettings || {};
+			let savedaestheticsettings = storyobj.savedaestheticsettings || {};
+			let chatopponent = savedsettings.chatopponent?String(savedsettings.chatopponent).split("||$||")[0]:defaultchatopponent;
+			let memory = storyobj.memory?storyobj.memory:"";
+			memory = replaceAll(memory,"{{char}}",chatopponent,true);
+			let portrait = (savedaestheticsettings.AI_portrait && savedaestheticsettings.AI_portrait!="default") ? savedaestheticsettings.AI_portrait : null;
+			add_another_participant_from_file({name:chatopponent,ctx_memory:memory,portrait:portrait});
+			return;
+		}
 		//either show popup or just proceed to load
 		handle_advload_popup((localsettings.show_advanced_load && !force_load_settings),()=>
 		{
@@ -10914,6 +11797,34 @@ Current version indicated by LITEVER below.
 		return false;
 	}
 
+	function load_lcpp_jsonl(obj)
+	{
+		if(localsettings.opmode!=4)
+		{
+			//force into instruct
+			localsettings.opmode = 4;
+		}
+		gametext_arr = [];
+		localsettings.gui_type_instruct = 2;
+		localsettings.inject_chatnames_instruct = false;
+		for(let i=0;i<obj.length;++i)
+		{
+			let curr = obj[i];
+			if(curr.type!="message")
+			{
+				continue;
+			}
+			if (curr.message && curr.message.role == "user") {
+				gametext_arr.push(get_instructstartplaceholder() + curr.message.content);
+			} else if (curr.message && curr.message.role == "assistant") {
+				gametext_arr.push(get_instructendplaceholder() + curr.message.content);
+			}
+		}
+		update_for_sidepanel();
+		render_gametext(true);
+		sync_multiplayer(true);
+	}
+
 	function load_tavern_jsonl(obj)
 	{
 		if(localsettings.opmode!=3 && localsettings.opmode!=4)
@@ -10976,8 +11887,20 @@ Current version indicated by LITEVER below.
 		render_gametext(true);
 		sync_multiplayer(true);
 	}
-	function load_tavern_obj(obj)
+	function load_tavern_obj(obj, to_groupchat=false, image_data=null)
 	{
+		if(to_groupchat)
+		{
+			if((obj.spec=="chara_card_v2"||obj.spec=="chara_card_v3") && obj.data!=null)
+			{
+				obj = obj.data;
+			}
+			let chatopponent = obj.name?obj.name:defaultchatopponent;
+			let memory = [obj.description, obj.personality].filter(Boolean).join("\n\n");
+			memory = replaceAll(memory,"{{char}}",chatopponent,true);
+			add_another_participant_from_file({name: chatopponent,ctx_memory:memory,portrait:image_data});
+			return;
+		}
 		let selectedgreeting = "";
 		let load_tav_obj_confirm_p1 = function(usechatmode) // need second input for alt greeting
 		{
@@ -11125,11 +12048,28 @@ Current version indicated by LITEVER below.
 		{
 			load_tav_obj_confirm_p1(true);
 		}
+		//set image as avatar
+		if(image_data)
+		{
+			compressImage(image_data, (compressedImageURI, aspectratio) => {
+				aestheticInstructUISettings.AI_portrait = compressedImageURI;
+				document.getElementById('portrait_ratio_AI').value = aspectratio.toFixed(2);
+				refreshAestheticPreview(true);
+				render_gametext();
+			}, true, AVATAR_PX);
+		}
 	}
-	function load_ooba_obj(obj)
+	function load_ooba_obj(obj, to_groupchat=false)
 	{
 		console.log("Loading ooba obj");
 		let chatopponent = obj.char_name?obj.char_name:defaultchatopponent;
+		if(to_groupchat)
+		{
+			let memory = obj.char_persona?obj.char_persona:"";
+			memory = replaceAll(memory,"{{char}}",chatopponent,true);
+			add_another_participant_from_file({name:chatopponent,ctx_memory:memory,portrait:null});
+			return;
+		}
 		let myname = ((localsettings.chatname && localsettings.chatname!="")?localsettings.chatname:"User");
 		let memory = obj.char_persona?("Persona: "+obj.char_persona):"";
 		let scenario = obj.world_scenario?obj.world_scenario:"";
@@ -12900,6 +13840,7 @@ Current version indicated by LITEVER below.
 			document.getElementById("charactercreator").classList.contains("hidden") &&
 			document.getElementById("zoomedimgcontainer").classList.contains("hidden") &&
 			document.getElementById("groupselectcontainer").classList.contains("hidden") &&
+			document.getElementById("groupchataestheticcontainer").classList.contains("hidden") &&
 			document.getElementById("addmediacontainer").classList.contains("hidden") &&
 			document.getElementById("pasteimgcontainer").classList.contains("hidden") &&
 			document.getElementById("webcamcontainer").classList.contains("hidden") &&
@@ -12943,6 +13884,8 @@ Current version indicated by LITEVER below.
 		document.getElementById("charactercreator").classList.add("hidden");
 		document.getElementById("zoomedimgcontainer").classList.add("hidden");
 		document.getElementById("groupselectcontainer").classList.add("hidden");
+		document.getElementById("groupchataestheticcontainer").classList.add("hidden");
+		groupchat_select_snapshot = null;
 		document.getElementById("addmediacontainer").classList.add("hidden");
 		document.getElementById("pasteimgcontainer").classList.add("hidden");
 		document.getElementById("webcamcontainer").classList.add("hidden");
@@ -13562,6 +14505,14 @@ Current version indicated by LITEVER below.
 			}
 		}
 		toggleoaichatcompl();
+		document.getElementById("model_cost").innerText = "";
+		if(cached_model_pricing[dropdown.value])
+		{
+			let data = cached_model_pricing[dropdown.value];
+			let price_input = (data.prompt * 1000000).toFixed(2);
+			let price_output = (data.completion * 1000000).toFixed(2);
+			document.getElementById("model_cost").innerText = `($${price_input} / $${price_output} per 1M)`;
+		}
 	}
 	function claude_fetch_models()
 	{
@@ -13636,6 +14587,7 @@ Current version indicated by LITEVER below.
 	}
 	function update_oai_model_list(data, dropdown, epchoice)
 	{
+		cached_model_pricing = {};
 		var lastOption = dropdown.lastElementChild;
 		for (var i = dropdown.options.length - 1; i >= 0; i--) {
 			var option = dropdown.options[i];
@@ -13646,6 +14598,10 @@ Current version indicated by LITEVER below.
 		for(var i = 0; i < data.data.length; i++) {
 			var opt = data.data[i];
 			sortedarr.push(opt.id);
+			if(opt.pricing)
+			{
+				cached_model_pricing[opt.id] = opt.pricing;
+			}
 		}
 		sortedarr.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
 		let pending_custmodel = (localsettings.prev_custom_endpoint_model_dict?(localsettings.prev_custom_endpoint_model_dict[epchoice] || ""):"");
@@ -13756,6 +14712,7 @@ Current version indicated by LITEVER below.
 	}
 
 	let autofetch_attempt_dict = {};
+	let cached_model_pricing = {};
 	function try_fetch_oai_models_auto()
 	{
 		let targetep = document.getElementById("custom_oai_endpoint").value;
@@ -16082,6 +17039,7 @@ Current version indicated by LITEVER below.
 		}
 		document.getElementById("ttsselect").value = localsettings.tts_mode;
 		document.getElementById("kcpp_tts_voice").value = localsettings.kcpp_tts_voice;
+		document.getElementById("oai_tts_model").value = localsettings.oai_tts_model;
 		document.getElementById("oai_tts_voice").value = localsettings.oai_tts_voice;
 		if(wbvoices)
 		{
@@ -16938,7 +17896,10 @@ Current version indicated by LITEVER below.
 		localsettings.tts_mode = document.getElementById("ttsselect").value;
 		localsettings.xtts_voice = document.getElementById("xtts_voices").value;
 		localsettings.kcpp_tts_voice = document.getElementById("kcpp_tts_voice").value;
-		localsettings.oai_tts_voice = document.getElementById("oai_tts_voice").value?document.getElementById("oai_tts_voice").value:defaultsettings.oai_tts_voice;
+		let oai_tts_model = document.getElementById("oai_tts_model").value;
+		let oai_tts_voice = document.getElementById("oai_tts_voice").value;
+		localsettings.oai_tts_model = oai_tts_model?oai_tts_model:defaultsettings.oai_tts_model;
+		localsettings.oai_tts_voice = oai_tts_voice?oai_tts_voice:defaultsettings.oai_tts_voice;
 		localsettings.wb_tts_choice = document.getElementById("wb_tts_choice").value?document.getElementById("wb_tts_choice").value:0;
 		localsettings.kcpp_tts_json = kcpp_tts_json;
 		localsettings.beep_notify_mode = document.getElementById("beep_notify_mode").value;
@@ -16979,16 +17940,18 @@ Current version indicated by LITEVER below.
 		localsettings.saved_mcp_urls = document.getElementById("mcpurls").value.trim();
 		localsettings.cached_mcp_tools = JSON.parse(JSON.stringify(pending_cached_mcp_tools));
 		pending_disabled_mcp_tools = [];
+		let mcptoolidx = 0;
 		for(key in localsettings.cached_mcp_tools)
 		{
 			let currarr = localsettings.cached_mcp_tools[key].tools;
 			for(let i=0;i<currarr.length;++i)
 			{
-				let mcptool = document.getElementById(`mcptool_${currarr[i].function.name}`);
+				let mcptool = document.getElementById("mcptool_"+mcptoolidx);
 				if(mcptool && !mcptool.checked)
 				{
 					pending_disabled_mcp_tools.push(currarr[i].function.name);
 				}
+				mcptoolidx++;
 			}
 		}
 		localsettings.disabled_mcp_tools = JSON.parse(JSON.stringify(pending_disabled_mcp_tools));
@@ -17219,7 +18182,15 @@ Current version indicated by LITEVER below.
 		numberOfLineBreaks = numberOfLineBreaks>8?8:numberOfLineBreaks;
 		textarea.rows = numberOfLineBreaks+1;
 	}
-
+	function groupchat_reply_order(coarr)
+	{
+		//refactored out to a global function so that usermods can change the reply order strategy
+		if(!coarr || coarr.length==0)
+		{
+			return "";
+		}
+		return coarr[Math.floor(Math.random()*coarr.length)];
+	}
 	function toggle_generate_images_mode(silent=false)
 	{
 		document.getElementById("generate_images_model_container").classList.add("hidden");
@@ -17534,10 +18505,9 @@ Current version indicated by LITEVER below.
 			pending_response_id = "-1";
 			waiting_for_summarycall = 2;
 			let max_allowed_characters = Math.floor(localsettings.max_context_length * 3.0) - 100;
-			let truncated_context = recentCtx.substring(recentCtx.length - max_allowed_characters);
-
-			truncated_context = replace_placeholders(truncated_context);
 			let wst = (localsettings.websearch_template==""?default_websearch_template:localsettings.websearch_template);
+			let truncated_context = replace_placeholders(recentCtx);
+			truncated_context = substring_to_boundary(truncated_context, max_allowed_characters);
 			truncated_context += "\n\n" + wst.replaceAll('{{QUERY}}', search_query);
 
 			let submit_payload = {
@@ -17610,14 +18580,15 @@ Current version indicated by LITEVER below.
 			}
 
 			truncated_context = end_trim_to_sentence(truncated_context,true);
-			truncated_context = truncated_context.substring(truncated_context.length - max_allowed_characters);
+			truncated_context = replace_placeholders(truncated_context);
+			truncated_context = substring_to_boundary(truncated_context, max_allowed_characters);
+			truncated_memory = truncate_memory(replace_placeholders(truncated_memory), max_mem_len, false);
 			let augmented_len = truncated_memory.length + truncated_context.length;
 			let excess_len = augmented_len - max_allowed_characters; //if > 0, then we exceeded context window
 			truncated_context = truncated_memory + truncated_context.substring(excess_len);
 
 			let long_story = (truncated_context.length>1800?true:false);
 			truncated_context += "\n### Instruction: Summarize the above text in a single paragraph of up to "+(long_story?"ten":"five")+" detailed sentences.\n### Response:";
-			truncated_context = replace_placeholders(truncated_context);
 			let submit_payload = {
 			"prompt": truncated_context,
 			"params": {
@@ -18021,6 +18992,7 @@ Current version indicated by LITEVER below.
 			documentdb_chunksize = 800;
 			documentdb_data = "";
 			newlineaftermemory = true;
+			localsettings.groupchat_data = {};
 		}
 		if(localsettings.inject_randomness_seed>0)
 		{
@@ -18069,7 +19041,7 @@ Current version indicated by LITEVER below.
 			let styleElement = document.getElementById('custom_css');
 			styleElement.innerHTML = "";
 			show_welcome_panel();
-		},null,false,"Also clear API keys");
+		},null,false,"Also clear API keys and custom tools");
 
 	}
 
@@ -18217,10 +19189,10 @@ Current version indicated by LITEVER below.
 					let curr = matches[matchiter];
 					curr = escape_html(curr);
 					curr = unescape_html_alternate(curr);
-					let expandedhtml = `<span><button type="button" title="Show Thoughts" class="btn btn-primary" style="font-size:12px;padding:2px 2px;" onclick="toggle_hide_thinking(this)">Show Thoughts (${curr.length} characters)</button><span class="color_lightgreen ${autoexpanded?'':'hidden'}"><br>${(curr)}\n</span><br></span>`;
+					let expandedhtml = `<span><button type="button" title="Show Thoughts" class="btn btn-primary" style="font-size:12px;padding:2px 2px;" onclick="toggle_hide_thinking(this)">Show Thoughts (${curr.length} characters)</button><span class="color_lightgreen ${autoexpanded?'':'hidden'}"><br>${(curr)}\n</span></span>\n`;
 					if(!curr || curr.trim()=="" || curr.trim()=="/nothink" || curr.trim()==`${localsettings.start_thinking_tag}${localsettings.stop_thinking_tag}`)
 					{
-						expandedhtml = `<span><button type="button" title="No Thoughts" class="btn btn-primary" style="font-size:12px;padding:2px 2px;" onclick="">No Thoughts</button><br></span>`;
+						expandedhtml = `<span><button type="button" title="No Thoughts" class="btn btn-primary" style="font-size:12px;padding:2px 2px;" onclick="">No Thoughts</button></span>\n`;
 					}
 					++matchiter;
 					return expandedhtml;
@@ -18707,7 +19679,7 @@ Current version indicated by LITEVER below.
 				image_db[imgid].len = duration;
 			});
 		}
-
+		return imgid;
 	}
 
 	function clear_paste_window()
@@ -19243,7 +20215,8 @@ Current version indicated by LITEVER below.
 		var reader = new FileReader();
 		reader.onload = function() {
 			var base64Audio = this.result;
-			self_upload_audio(base64Audio, "tts_audio", true);
+			let newimgid = self_upload_audio(base64Audio, "tts_audio", true);
+			image_db[newimgid].imsource = 0; //0=generated,1=uploaded
 		};
 		reader.readAsDataURL(file);
 	}
@@ -19257,6 +20230,15 @@ Current version indicated by LITEVER below.
 	ttsMasterGain.connect(ttsAudioContext.destination);
 	function tts_speak(text, do_download=false, do_embed_tts=false, is_test=false)
 	{
+		if(!text || text=="" || text.trim()=="")
+		{
+			return;
+		}
+		text = strip_tts_media_placeholders(text);
+		if(!text || text=="" || text.trim()=="")
+		{
+			return;
+		}
 		let ssval = localsettings.tts_mode;
 		let streamallowed = (ssval==XTTS_ID || ssval==ALLTALK_ID || ssval==OAI_TTS_ID || ssval==KCPP_TTS_ID);
 		if(streamallowed && localsettings.tts_stream && !is_test)
@@ -19273,6 +20255,16 @@ Current version indicated by LITEVER below.
 			tts_speak_direct(text,do_download,do_embed_tts,is_test,false);
 		}
 	}
+
+	function strip_tts_media_placeholders(text)
+	{
+		text = text.replace(/<t2i>[\s\S]*?<\/t2i>/g, "");
+		text = text.replace(/\[<\|p\|.+?\|p\|>\]/g, "");
+		text = text.replace(/\[<\|h\|.+?\|h\|>\]/g, "");
+		text = text.replace(/{{\[DAT_.{1,8}_REF\]}}/g, "");
+		return text;
+	}
+
 	function poll_chunked_tts()
 	{
 		if(tts_speak_input_queue.length>0 && !tts_is_processing && tts_speak_output_queue.length < 3)
@@ -19307,6 +20299,11 @@ Current version indicated by LITEVER below.
 
 	function tts_speak_direct(text, do_download=false, do_embed_tts=false, is_test=false, append_to_outqueue=false)
 	{
+		if(!text || text=="" || text.trim()=="")
+		{
+			return;
+		}
+		text = strip_tts_media_placeholders(text);
 		if(!text || text=="" || text.trim()=="")
 		{
 			return;
@@ -19770,7 +20767,7 @@ Current version indicated by LITEVER below.
 	}
 	function submit_generation_button(aesthetic_ui)
 	{
-		if(localsettings.voice_typing_mode==0) //only when voice is off
+		if(localsettings.voice_typing_mode==0 || !is_using_kcpp_with_whisper()) //normal submit when voice off, or when whisper is unavailable (e.g. stale saved setting) so the button still works
 		{
 			if(aesthetic_ui)
 			{
@@ -19875,7 +20872,29 @@ Current version indicated by LITEVER below.
 
 	function prepare_submit_generation() //wrap websearch into this
 	{
+		if(is_corpo_ui() && corpo_editing_turn != -1)
+		{
+			corpo_edit_chunk_save();
+		}
 		let senttext = document.getElementById("input_text").value;
+		let toolname = senttext.startsWith('/')?senttext.slice(1).match(/^\S*/)[0]:'';
+		let customtools = customtools_sanitize_list(localsettings.custom_tools);
+		let idx = customtools.map(tool => tool.name).indexOf(toolname);
+		if(idx!==-1 && customtools[idx].userCallable){
+			//try to parse senttext as a slash command
+			let sentargs = parse_slash_command(customtools[idx],senttext);
+			if(typeof sentargs==="string"){
+				msgbox(sentargs);
+				return;
+			}
+			document.getElementById("input_text").value = "Slash command (/"+toolname+") activated, please wait...";
+			TrustedCustomToolCallPromise(customtools[idx],sentargs).then(function (res) {
+				document.getElementById("input_text").value = res?res:("Slash command (/"+toolname+") executed successfully.");
+			}).catch(function (err) {
+				document.getElementById("input_text").value = "Slash command (/"+toolname+") error: "+err.message;
+			});
+			return;
+		}
 		document.getElementById("input_text").value = "";
 		PerformWebsearch(senttext,(res)=>{
 			submit_generation(senttext);
@@ -20147,9 +21166,10 @@ Current version indicated by LITEVER below.
 				{
 					let coarr = co.split("||$||");
 					coarr = coarr.filter(x=>(x&&x!=""));
+					coarr = coarr.map(x=>sanitize_groupchat_participant_name(x));
+					coarr = coarr.filter(x=>(x&&x!=""));
 					coarr = coarr.filter(x=>(!groupchat_removals.includes(x)));
-					coarr = coarr.map(x=>x.trim());
-					co = coarr[Math.floor(Math.random()*coarr.length)];
+					co = groupchat_reply_order(coarr);
 
 					//we check if a name was recently mentioned in the previous response.
 					//if so, switch to that user
@@ -20277,13 +21297,17 @@ Current version indicated by LITEVER below.
 							}
 							let coarr = localsettings.chatopponent.split("||$||");
 							coarr = coarr.filter(x=>(x&&x!=""));
+							coarr = coarr.map(x=>sanitize_groupchat_participant_name(x));
+							coarr = coarr.filter(x=>(x&&x!=""));
 							coarr = coarr.filter(x=>(!groupchat_removals.includes(x)));
-							coarr = coarr.map(x=>x.trim());
-							let co = coarr[Math.floor(Math.random()*coarr.length)];
-							pending_context_preinjection += co + ":";
-							if(localsettings.inject_jailbreak_instruct || (localsettings.think_injected!=0 && localsettings.start_thinking_tag!=""))
+							let co = groupchat_reply_order(coarr);
+							if(co!="")
 							{
-								pending_context_preinjection += " ";
+								pending_context_preinjection += co + ":";
+								if(localsettings.inject_jailbreak_instruct || (localsettings.think_injected!=0 && localsettings.start_thinking_tag!=""))
+								{
+									pending_context_preinjection += " ";
+								}
 							}
 						}
 						if(localsettings.think_injected==1 && localsettings.start_thinking_tag!="")
@@ -20315,6 +21339,9 @@ Current version indicated by LITEVER below.
 				}
 			}
 
+			truncated_context = replace_placeholders(truncated_context,false,false,true);
+			truncated_context = substring_to_boundary(truncated_context, max_allowed_characters);
+
 			//we clip the memory if its too long, taking the last x chars (not the first)
 			//memory is allowed to be up to 0.8 times of ctx allowance, anote up to 0.6 times
 			let max_mem_len = Math.floor(max_allowed_characters*0.8);
@@ -20331,7 +21358,13 @@ Current version indicated by LITEVER below.
 				}
 				appendedsysprompt += "\n";
 			}
-			let truncated_memory = truncate_memory(current_memory, max_mem_len, true);
+			let memory_with_groupchat_context = current_memory;
+			let groupchat_context_memory = get_groupchat_context_memory();
+			if(groupchat_context_memory!="")
+			{
+				memory_with_groupchat_context += (memory_with_groupchat_context.trim()!="" ? "\n" : "") + groupchat_context_memory;
+			}
+			let truncated_memory = memory_with_groupchat_context;
 			if (truncated_memory != null && truncated_memory != "") {
 				if(newlineaftermemory)
 				{
@@ -20523,9 +21556,7 @@ Current version indicated by LITEVER below.
 				wistr = substring_to_boundary(wistr, max_wi_len);
 			}
 
-			//we clip the authors note if its too long
 			let truncated_anote = current_anotetemplate.replace("<|>", current_anote);
-			truncated_anote = substring_to_boundary(truncated_anote, max_anote_len);
 
 			if (current_anote.length == 0) {
 				//if there's no authors note at all, don't include the template
@@ -20535,31 +21566,47 @@ Current version indicated by LITEVER below.
 			if(wi_insertlocation>0)
 			{
 				truncated_anote = wistr + truncated_anote;
-				truncated_anote = substring_to_boundary(truncated_anote, max_anote_len);
 			}
 			else
 			{
 				truncated_memory += wistr;
 			}
 
-			truncated_memory = appendedsysprompt + truncate_memory(truncated_memory, max_mem_len, true);
-
-			//now we resize the context such that the memory and authors note can fit inside
-			truncated_context = substring_to_boundary(truncated_context, max_allowed_characters);
-
-			//append memory to the start of the context, clipping excess space if needed
-			//only do this processing if memory or anote is not blank
-			if (truncated_memory.length > 0 || current_anote.length > 0)
+			//if memory or authors note is not blank,
+			//append memory to the start of the context and insert anote somewhere before the ending
+			//if they are too long, clip excess space and resize the context so they can fit inside
+			if (appendedsysprompt.length > 0 || truncated_memory.length > 0 || truncated_anote.length > 0)
 			{
+				appendedsysprompt = replace_placeholders(appendedsysprompt,false,false,true);
 				truncated_memory = replace_placeholders(truncated_memory,false,false,true);
+				truncated_memory = appendedsysprompt + truncate_memory(truncated_memory, max_mem_len, true);
 				truncated_anote = replace_placeholders(truncated_anote,false,false,false);
+				truncated_anote = substring_to_boundary(truncated_anote, max_anote_len);
+				let min_context_len = Math.min(32, max_allowed_characters);
 				if(!is_using_kcpp_with_added_memory())
 				{
-					let augmented_len = truncated_memory.length + truncated_context.length + truncated_anote.length;
-					let excess_len = augmented_len - max_allowed_characters; //if > 0, then we exceeded context window
-					excess_len = excess_len < 0 ? 0 : excess_len;
-					let newlimit = (max_allowed_characters-excess_len) < 32 ? 32 : (max_allowed_characters-excess_len);
-					truncated_context = substring_to_boundary(truncated_context, newlimit); //must always have at least 32 chars from main context
+					let available_aux_len = max_allowed_characters - min_context_len;
+					if(truncated_anote.length > available_aux_len)
+					{
+						truncated_anote = substring_to_boundary(truncated_anote, available_aux_len);
+						truncated_memory = "";
+					}
+					else if(truncated_memory.length + truncated_anote.length > available_aux_len)
+					{
+						truncated_memory = truncate_memory(truncated_memory, available_aux_len - truncated_anote.length, true);
+					}
+					let newlimit = Math.max(min_context_len, max_allowed_characters - truncated_memory.length - truncated_anote.length);
+					truncated_context = substring_to_boundary(truncated_context, newlimit);
+				}
+				else
+				{
+					let available_anote_len = max_allowed_characters - min_context_len;
+					if(truncated_anote.length > available_anote_len)
+					{
+						truncated_anote = substring_to_boundary(truncated_anote, available_anote_len);
+					}
+					let newlimit = Math.max(min_context_len, max_allowed_characters - truncated_anote.length);
+					truncated_context = substring_to_boundary(truncated_context, newlimit);
 				}
 
 				//insert authors note 80 tokens before the ending (320 characters).
@@ -20597,9 +21644,6 @@ Current version indicated by LITEVER below.
 					truncated_context = truncated_memory + truncated_context;
 				}
 			}
-
-			truncated_context = replace_placeholders(truncated_context,false,false,true);
-
 			if(is_using_kcpp_with_added_memory())
 			{
 				let tmp = repair_post_placeholders_fix(truncated_memory, truncated_context);
@@ -20758,7 +21802,7 @@ Current version indicated by LITEVER below.
 			let st = get_instruct_starttag(true);
 			let et = get_instruct_endtag(true);
 			let me = get_my_multiplayer_chatname();
-			seqs = [st, et];
+			seqs = [st]; //don't include the assistant tag, otherwise it breaks some think formats
 			if(localsettings.separate_end_tags)
 			{
 				if(get_instruct_endtag_end(true))
@@ -20780,7 +21824,7 @@ Current version indicated by LITEVER below.
 				//the model just gets too confused and is likely to repeat the tag.
 			}
 		}
-		//special case for GPT-OSS, never use it as a stop sequence or stuff gets messed
+		//special case for GPT-OSS and Muse Glimmer, never use it as a stop sequence or stuff gets messed
 		seqs = seqs.filter(itm => !itm.includes("<|start|>assistant"));
 		if(!localsettings.includedefaultstops)
 		{
@@ -21481,7 +22525,8 @@ Current version indicated by LITEVER below.
 					if (oai_payload.messages && Array.isArray(oai_payload.messages))
 					{
 						const systemInstructions = [];
-						for (const msg of oai_payload.messages) {
+						for (let i = 0; i < oai_payload.messages.length; i++) {
+							var msg = oai_payload.messages[i];
 							// 1. Handle System Instructions
 							if (msg.role === 'system') {
 								systemInstructions.push({ text: msg.content });
@@ -21498,7 +22543,8 @@ Current version indicated by LITEVER below.
 							}
 							else if (Array.isArray(msg.content))  // Handle Multimodal Arrays (Text + Image + Audio)
 							{
-								for (const item of msg.content) {
+								for (var j = 0; j < msg.content.length; j++) {
+									var item = msg.content[j];
 									if (item.type === 'text') {
 										parts.push({ text: item.text });
 									} else if (item.type === 'image_url') {
@@ -23097,15 +24143,6 @@ Current version indicated by LITEVER below.
 				let pat = new RegExp(get_thinking_regex(), "gmi");
 				gentxtspeak = gentxtspeak.replace(pat, '');
 			}
-			//remove t2i
-			if (localsettings.img_autogen_type == 2)
-			{
-				const pat = /<t2i>(.*?)<\/t2i>/g;
-				gentxtspeak = gentxtspeak.replace(pat, "");
-				const pat2 = /{{\[DAT_.{1,8}_REF\]}}/g;
-				gentxtspeak = gentxtspeak.replace(pat2, "");
-			}
-
 			if(localsettings.narrate_targets != 0)
 			{
 				tts_speak(gentxtspeak,false,localsettings.embed_narrations,false);
@@ -27708,41 +28745,474 @@ Current version indicated by LITEVER below.
 		}, null);
 	}
 
+
 	var groupchat_removals = []; //list of names removed from groupchat
+	var groupchat_select_snapshot = null;
+	function sanitize_groupchat_participant_name(name)
+	{
+		name = name == null ? "" : String(name);
+		return replaceAll(name,"||$||"," ").replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+	}
+	function clone_groupchat_data(data)
+	{
+		if(!data || typeof data!="object" || Array.isArray(data))
+		{
+			return {};
+		}
+		return JSON.parse(JSON.stringify(data || {}));
+	}
+	function ensure_groupchat_data()
+	{
+		if(!localsettings.groupchat_data || typeof localsettings.groupchat_data!="object" || Array.isArray(localsettings.groupchat_data))
+		{
+			localsettings.groupchat_data = {};
+		}
+		return localsettings.groupchat_data;
+	}
+	function begin_groupchat_select_session()
+	{
+		if(groupchat_select_snapshot==null)
+		{
+			groupchat_select_snapshot = {
+				chatname:localsettings.chatname,
+				chatopponent:localsettings.chatopponent,
+				groupchat_data:clone_groupchat_data(ensure_groupchat_data()),
+				aestheticInstructUISettings:deepCopyAestheticSettings(aestheticInstructUISettings)
+			};
+		}
+	}
+	function restore_groupchat_select_snapshot()
+	{
+		if(groupchat_select_snapshot==null)
+		{
+			return;
+		}
+		localsettings.chatname = groupchat_select_snapshot.chatname;
+		localsettings.chatopponent = groupchat_select_snapshot.chatopponent;
+		localsettings.groupchat_data = clone_groupchat_data(groupchat_select_snapshot.groupchat_data);
+		aestheticInstructUISettings = deepCopyAestheticSettings(groupchat_select_snapshot.aestheticInstructUISettings);
+		sync_groupchat_chatname_input();
+		let chatopponent = document.getElementById("chatopponent");
+		if(chatopponent)
+		{
+			chatopponent.value = replaceAll(localsettings.chatopponent,"||$||","\n");
+			handle_bot_name_onchange();
+		}
+		groupchat_select_snapshot = null;
+	}
+	function groupchat_bot_names()
+	{
+		return localsettings.chatopponent ? localsettings.chatopponent.split("||$||").map(x=>sanitize_groupchat_participant_name(x)).filter(x=>x!="") : [];
+	}
+	function groupchat_default_bot_meta()
+	{
+		return {
+			portrait:"default",
+			portrait_width:aestheticInstructUISettings.portrait_width_AI,
+			portrait_ratio:aestheticInstructUISettings.portrait_ratio_AI,
+			bubbleColor:aestheticInstructUISettings.bubbleColor_AI,
+			text_tcolor:aestheticInstructUISettings.text_tcolor_AI,
+			speech_tcolor:aestheticInstructUISettings.speech_tcolor_AI,
+			action_tcolor:aestheticInstructUISettings.action_tcolor_AI,
+			ctx_memory:""
+		};
+	}
+	function apply_groupchat_ai_style(meta)
+	{
+		meta.portrait_width = aestheticInstructUISettings.portrait_width_AI;
+		meta.portrait_ratio = aestheticInstructUISettings.portrait_ratio_AI;
+		meta.bubbleColor = aestheticInstructUISettings.bubbleColor_AI;
+		meta.text_tcolor = aestheticInstructUISettings.text_tcolor_AI;
+		meta.speech_tcolor = aestheticInstructUISettings.speech_tcolor_AI;
+		meta.action_tcolor = aestheticInstructUISettings.action_tcolor_AI;
+		return meta;
+	}
+	function apply_groupchat_ai_style_to_all()
+	{
+		let groupchat_data = ensure_groupchat_data();
+		for (let key in groupchat_data) {
+			apply_groupchat_ai_style(groupchat_data[key]);
+		}
+	}
+	function groupchat_bot_meta_key(name)
+	{
+		return "gc_" + cyrb_hash(sanitize_groupchat_participant_name(name), 0, 8);
+	}
+	function normalize_groupchat_bot_meta(found)
+	{
+		return Object.assign(groupchat_default_bot_meta(), found || {});
+	}
+	function groupchat_bot_meta_exists(name)
+	{
+		let found = ensure_groupchat_data()[groupchat_bot_meta_key(name)];
+		return (found?true:false);
+	}
+	function get_groupchat_bot_meta(name)
+	{
+		let found = ensure_groupchat_data()[groupchat_bot_meta_key(name)];
+		if(found)
+		{
+			return normalize_groupchat_bot_meta(found);
+		}
+		return groupchat_default_bot_meta();
+	}
+	function set_groupchat_bot_meta(name, meta)
+	{
+		ensure_groupchat_data()[groupchat_bot_meta_key(name)] = normalize_groupchat_bot_meta(meta);
+	}
+	function sync_groupchat_chatname_input()
+	{
+		let chatname = document.getElementById("chatname");
+		if(chatname)
+		{
+			chatname.value = localsettings.chatname;
+		}
+	}
+	function set_groupchat_bot_names(names)
+	{
+		localsettings.chatopponent = names.map(x=>sanitize_groupchat_participant_name(x)).filter(x=>x!="").join("||$||");
+		let chatopponent = document.getElementById("chatopponent");
+		if(chatopponent)
+		{
+			chatopponent.value = replaceAll(localsettings.chatopponent,"||$||","\n");
+			handle_bot_name_onchange();
+		}
+		prune_groupchat_bot_meta();
+	}
+	function prune_groupchat_bot_meta()
+	{
+		let validkeys = groupchat_bot_names().map(x=>groupchat_bot_meta_key(x));
+		let groupchat_data = ensure_groupchat_data();
+		for (let key in groupchat_data) {
+			if (!validkeys.includes(key)) {
+				delete groupchat_data[key];
+			}
+		}
+	}
+	function rename_groupchat_participant(index, newname)
+	{
+		let names = groupchat_bot_names();
+		if(index<0 || index>=names.length)
+		{
+			console.log("rename_groupchat_participant: Invalid bot index.");
+			return;
+		}
+		newname = sanitize_groupchat_participant_name(newname);
+		if(newname=="")
+		{
+			if(names.length<=1)
+			{
+				msgbox("You need to keep at least one AI participant.");
+			}
+			else
+			{
+				names.splice(index, 1);
+				set_groupchat_bot_names(names);
+			}
+			show_groupchat_select();
+			return;
+		}
+		let oldname = names[index];
+		let oldmeta = get_groupchat_bot_meta(oldname);
+		names[index] = newname;
+		set_groupchat_bot_names(names);
+		set_groupchat_bot_meta(newname, oldmeta);
+		prune_groupchat_bot_meta();
+		show_groupchat_select();
+	}
+	function edit_groupchat_participant_name(index, is_self)
+	{
+		if(is_self)
+		{
+			let text = "Edit your chat name.";
+			inputBoxOkCancel(text,"Edit your Chat Name",localsettings.chatname,"[Enter User Name]",()=>{
+				let userinput = getInputBoxValue();
+				userinput = sanitize_groupchat_participant_name(userinput);
+				if(userinput.trim()!="")
+				{
+					localsettings.chatname = userinput.trim();
+					sync_groupchat_chatname_input();
+				}
+				show_groupchat_select();
+			},()=>{},false);
+		}
+		else
+		{
+			let names = groupchat_bot_names();
+			let text ="Edit this AI participant name.\n\nLeave this field blank and press OK to delete this participant. The final AI participant cannot be deleted.";
+			inputBoxOkCancel(text,"Rename or Delete Participant",names[index],"[Enter Participant Name]",()=>{
+				let userinput = getInputBoxValue();
+				rename_groupchat_participant(index, userinput);
+			},()=>{},false);
+		}
+	}
+	function edit_groupchat_context(index)
+	{
+		let names = groupchat_bot_names();
+		if(index<0 || index>=names.length)
+		{
+			return;
+		}
+		let currname = names[index];
+		let curr_bot_data = get_groupchat_bot_meta(currname);
+		inputBox(`Set character context memory for ${currname}.`,"Character Context Memory",curr_bot_data.ctx_memory,"Enter participant context",()=>{
+			let userinput = getInputBoxValue();
+			curr_bot_data.ctx_memory = userinput;
+			set_groupchat_bot_meta(currname, curr_bot_data);
+		},false,true);
+	}
+	function get_groupchat_context_memory()
+	{
+		if(!(localsettings.opmode==3 || (localsettings.opmode==4 && localsettings.inject_chatnames_instruct)))
+		{
+			return "";
+		}
+		let names = groupchat_bot_names();
+		let ctx = [];
+		for(let i=0;i<names.length;++i)
+		{
+			if(groupchat_removals.includes(names[i]))
+			{
+				continue;
+			}
+			let curr_bot_data = get_groupchat_bot_meta(names[i]);
+			if(curr_bot_data.ctx_memory && curr_bot_data.ctx_memory.trim()!="")
+			{
+				ctx.push("[" + names[i] + " Info: " + curr_bot_data.ctx_memory.trim() + "]");
+			}
+		}
+		return ctx.join("\n");
+	}
 	function show_groupchat_select()
 	{
+		begin_groupchat_select_session();
 		document.getElementById("groupselectcontainer").classList.remove("hidden");
+		let selectable_groupchat = (localsettings.opmode==3 || (localsettings.opmode==4 && localsettings.inject_chatnames_instruct));
 		let gs = ``;
-		if(localsettings.opmode==3)
-		{
-			if (localsettings.chatopponent != "" && localsettings.chatopponent.includes("||$||")) {
-				gs = `Selected participants will reply randomly, unless you address them directly by name.`
-				+`<br><br>Unselected participants will not reply in group chats.<br>`
-				+`<table style="width:90%; margin:8px auto;">`;
-				let grouplist = localsettings.chatopponent.split("||$||");
-				for (let i = 0; i < grouplist.length; ++i) {
-					let show = !groupchat_removals.includes(grouplist[i]);
-					gs += `<tr><td width='184px'><span style="vertical-align: middle;">` + grouplist[i] + `</span></td>`
-						+`<td width='24px'><button type="button" class="btn btn-primary widelbtn" id="widel0" onclick="impersonate_message(`+i+`)">+</button></td>`
-						+`<td width='24px'><input type="checkbox" id="groupselectitem_` + i + `" style=" vertical-align: top;" ` + (show ? "checked" : "") + `></td></tr>`;
-				}
-				gs += `</table>`;
-			}
-			else if(localsettings.chatopponent != "")
-			{
-				gs = `You're having a one-on-one chat with <b>`+localsettings.chatopponent+`</b>.<br><br>`
-				+`<a href='#' class='color_blueurl' onclick='hide_popups();display_settings();display_settings_tab(0);'>Turn it into a <b>group chat</b> by <b>adding more AI characters</b> (one per line)</a>.<br><br>`
-				+ `<a href='#' class='color_blueurl' onclick='impersonate_message(0)'>Impersonate `+localsettings.chatopponent+` speaking as them</a>`;
-			}
-		}else{
-			gs = `You're in Instruct Mode.<br><br>`
-				+ `<a href='#' class='color_blueurl' onclick='impersonate_message(0)'>Impersonate the AI Assistant</a>`;
-		}
 
-		gs += `<br><a href='#' class='color_blueurl' onclick='impersonate_user()'>Make the AI write a response as me (for 1 turn)</a>`;
+		if(selectable_groupchat)
+		{
+			gs = `Selected participants will reply randomly, unless you address them directly by name.`
+			+`<br><br>Unselected participants will not reply in group chats.<br>`;
+
+			gs += `<table class="groupchatselect-table">`
+			+`<thead><tr>`
+			+`<th style="text-align:center;">Participant</th>`
+			+`<th style="text-align:center;">Avatar</th>`
+			+`<th style="text-align:center;">Persona</th>`
+			+`<th style="text-align:center;">Reply For</th>`
+			+`<th style="text-align:center;">Reply</th>`
+			+`</tr></thead><tbody>`;
+
+			let grouplist = groupchat_bot_names();
+
+			gs += `<tr><td><div title="Edit participant name" class="ui-settings-inline color_blueurl groupchat-inline-action" onclick="edit_groupchat_participant_name(0,true)">${escape_html(localsettings.chatname)}</div></td>`
+				+`<td style="text-align:center;">${render_groupchat_avatar_cell(0,true)}</td>`
+				+`<td style="text-align:center;"></td>`
+				+`<td style="text-align:center;"><button title="Make the AI write a response as me" type="button" class="btn btn-primary widelbtn" onclick="impersonate_user()">+</button></td>`
+				+`<td style="text-align:center;"><input title="Your own name is always available" type="checkbox" style="vertical-align: top;" checked disabled></td></tr>`;
+
+			for (let i = 0; i < grouplist.length; ++i) {
+				let show = !groupchat_removals.includes(grouplist[i]);
+				let participant_index = i;
+				let participant_name = grouplist[participant_index];
+				let impersonate_button = `<button title="Impersonate Character" type="button" class="btn btn-primary widelbtn" onclick="impersonate_message(${i})">+</button>`;
+				let checkbox = `<input type="checkbox" id="groupselectitem_${participant_index}" style="vertical-align: top;" ${(show ? "checked" : "")}>`;
+				gs += `<tr><td><div title="Edit participant name" class="ui-settings-inline color_blueurl groupchat-inline-action" onclick="edit_groupchat_participant_name(${participant_index},false)">${escape_html(participant_name)}</div></td>`
+					+`<td style="text-align:center;">${render_groupchat_avatar_cell(participant_index,false)}</td>`
+					+`<td style="text-align:center;"><button title="Set participant context" type="button" class="btn btn-primary" style="height:24px;min-width:24px;padding:1px 6px;margin:2px;font-weight:bolder;" onclick="edit_groupchat_context(${participant_index})">+</button></td>`
+					+`<td style="text-align:center;">${impersonate_button}</td>`
+					+`<td style="text-align:center;">${checkbox}</td></tr>`;
+			}
+			gs += `</tbody></table>`;
+			gs += `<br><div class="ui-settings-inline color_blueurl groupchat-inline-action" onclick="add_another_participant(true)">Add AI Participant</div>`;
+			gs+= `<input type="file" id="loadgroupchatinput" accept="*" onchange="load_file(event,true)" style="display:none;">`;
+			gs += `Alternatively, <a href="#" class="color_blueurl groupchat-inline-action" onclick="document.getElementById('loadgroupchatinput').click()"><b>click here to import an existing Tavern Character Card</b></a>.`;
+		}
+		else if(localsettings.opmode==4 && !localsettings.inject_chatnames_instruct)
+		{
+			gs = `You're in Instruct Mode.<br><br>`
+			+ `<a href='#' class='color_blueurl' onclick='impersonate_message(0)'>Impersonate the AI Assistant</a>`;
+			gs += `<br><a href='#' class='color_blueurl' onclick='impersonate_user()'>Make the AI write a response as me (for 1 turn)</a>`;
+		}
 
 		document.getElementById("groupselectitems").innerHTML = gs;
 	}
+	function get_groupchat_portrait(name, is_self)
+	{
+		let portrait = is_self ? aestheticInstructUISettings.you_portrait:aestheticInstructUISettings.AI_portrait;
+		if(!is_self)
+		{
+			if(groupchat_bot_meta_exists(name))
+			{
+				let data = get_groupchat_bot_meta(name);
+				portrait = data.portrait;
+			}
+		}
+		return portrait;
+	}
+	function render_groupchat_avatar_cell(index, is_self)
+	{
+		let name = is_self ? localsettings.chatname : groupchat_bot_names()[index];
+		let portrait = get_groupchat_portrait(name, is_self);
+		portrait = (!is_self && portrait=="default") ? niko_square : portrait;
+		if(!portrait)
+		{
+			return `<button title="Set Aesthetics" type="button" class="btn btn-primary widelbtn" onclick="open_groupchat_aesthetics(${index},${is_self})">Set</button>`;
+		}
+		return `<button title="Set Aesthetics" type="button" class="btn btn-primary" style="padding:1px;" onclick="open_groupchat_aesthetics(${index},${is_self})"><span style="display:block;width:36px;height:36px;background-image:url(${escape_html(portrait)});background-size:cover;background-position:center;border-radius:4px;"></span></button>`;
+	}
+	var current_groupchat_aesthetic_key = "";
+	var temp_groupchat_aesthetic_data = null;
+	function refresh_groupchat_aesthetics()
+	{
+		let color_to_input_value = function(color)
+		{
+			if(!color)
+			{
+				return "#000000";
+			}
+			color = color.trim();
+			return color.startsWith("#") ? color : rgb_to_hex(color);
+		}
+		let portrait = temp_groupchat_aesthetic_data.portrait;
+		document.getElementById("groupchat_aesthetic_avatar").style.backgroundImage = portrait ? `url(${portrait=="default"?niko_square:portrait})` : "none";
+		document.getElementById("groupchat_portrait_width").value = temp_groupchat_aesthetic_data.portrait_width;
+		document.getElementById("groupchat_portrait_ratio").value = temp_groupchat_aesthetic_data.portrait_ratio;
+		document.getElementById("groupchat_bubbleColor").value = color_to_input_value(temp_groupchat_aesthetic_data.bubbleColor);
+		document.getElementById("groupchat_text_tcolor").value = color_to_input_value(temp_groupchat_aesthetic_data.text_tcolor);
+		document.getElementById("groupchat_speech_tcolor").value = color_to_input_value(temp_groupchat_aesthetic_data.speech_tcolor);
+		document.getElementById("groupchat_action_tcolor").value = color_to_input_value(temp_groupchat_aesthetic_data.action_tcolor);
+	}
+	function read_groupchat_aesthetics()
+	{
+		temp_groupchat_aesthetic_data.portrait_width = Math.max(10, Math.min(250, parseFloat(document.getElementById("groupchat_portrait_width").value) || 64));
+		temp_groupchat_aesthetic_data.portrait_ratio = Math.max(0.01, Math.min(3, parseFloat(document.getElementById("groupchat_portrait_ratio").value) || 1));
+		temp_groupchat_aesthetic_data.bubbleColor = document.getElementById("groupchat_bubbleColor").value;
+		temp_groupchat_aesthetic_data.text_tcolor = document.getElementById("groupchat_text_tcolor").value;
+		temp_groupchat_aesthetic_data.speech_tcolor = document.getElementById("groupchat_speech_tcolor").value;
+		temp_groupchat_aesthetic_data.action_tcolor = document.getElementById("groupchat_action_tcolor").value;
+	}
+	function open_groupchat_aesthetics(index, is_self)
+	{
+		let grouplist = groupchat_bot_names();
+		if(!is_self && (index<0 || index>=grouplist.length))
+		{
+			return;
+		}
+		let currname = is_self?localsettings.chatname:grouplist[index];
+		document.getElementById("groupchataestheticcontainer").classList.remove("hidden");
+		document.getElementById("groupchataesthetictitle").innerText = "Participant Aesthetics - " + currname;
+		let portrait = get_groupchat_portrait(currname,is_self);
+		if(is_self)
+		{
+			current_groupchat_aesthetic_key = "self";
+			temp_groupchat_aesthetic_data = {};
+			temp_groupchat_aesthetic_data.portrait_width = aestheticInstructUISettings.portrait_width_you;
+			temp_groupchat_aesthetic_data.portrait_ratio = aestheticInstructUISettings.portrait_ratio_you;
+			temp_groupchat_aesthetic_data.bubbleColor = aestheticInstructUISettings.bubbleColor_you;
+			temp_groupchat_aesthetic_data.text_tcolor = aestheticInstructUISettings.text_tcolor_you;
+			temp_groupchat_aesthetic_data.speech_tcolor = aestheticInstructUISettings.speech_tcolor_you;
+			temp_groupchat_aesthetic_data.action_tcolor = aestheticInstructUISettings.action_tcolor_you;
+			temp_groupchat_aesthetic_data.portrait = portrait;
+		}
+		else
+		{
+			current_groupchat_aesthetic_key = currname;
+			temp_groupchat_aesthetic_data = get_groupchat_bot_meta(currname);
+			temp_groupchat_aesthetic_data.portrait = portrait;
+		}
+		refresh_groupchat_aesthetics();
+	}
+	function select_groupchat_avatar()
+	{
+		if(!temp_groupchat_aesthetic_data)
+		{
+			return;
+		}
+		let finput = document.getElementById('portraitFileInput');
+		finput.click();
+		finput.onchange = (event) => {
+			if (event.target.files.length > 0 && event.target.files[0]) {
+				const file = event.target.files[0];
+				const reader = new FileReader();
+				reader.onload = function(img) {
+					compressImage(img.target.result, (compressedImageURI, aspectratio) => {
+						temp_groupchat_aesthetic_data.portrait = compressedImageURI;
+						temp_groupchat_aesthetic_data.portrait_ratio = aspectratio.toFixed(2);
+						refresh_groupchat_aesthetics();
+					}, true, AVATAR_PX);
+				}
+				reader.readAsDataURL(file);
+			}
+			finput.value = "";
+		};
+	}
+	function reset_groupchat_avatar()
+	{
+		if(!temp_groupchat_aesthetic_data)
+		{
+			return;
+		}
+		if(current_groupchat_aesthetic_key=="self")
+		{
+			temp_groupchat_aesthetic_data.portrait = null;
+			temp_groupchat_aesthetic_data.portrait_width = aestheticInstructUISettings.portrait_width_you;
+			temp_groupchat_aesthetic_data.portrait_ratio = aestheticInstructUISettings.portrait_ratio_you;
+			temp_groupchat_aesthetic_data.bubbleColor = aestheticInstructUISettings.bubbleColor_you;
+			temp_groupchat_aesthetic_data.text_tcolor = aestheticInstructUISettings.text_tcolor_you;
+			temp_groupchat_aesthetic_data.speech_tcolor = aestheticInstructUISettings.speech_tcolor_you;
+			temp_groupchat_aesthetic_data.action_tcolor = aestheticInstructUISettings.action_tcolor_you;
+		}
+		else
+		{
+			temp_groupchat_aesthetic_data.portrait = "default";
+			apply_groupchat_ai_style(temp_groupchat_aesthetic_data);
+		}
+		refresh_groupchat_aesthetics();
+	}
+	function confirm_groupchat_aesthetics()
+	{
+		if(!temp_groupchat_aesthetic_data || !current_groupchat_aesthetic_key)
+		{
+			return;
+		}
+		read_groupchat_aesthetics();
+		if(current_groupchat_aesthetic_key=="self")
+		{
+			aestheticInstructUISettings.you_portrait = temp_groupchat_aesthetic_data.portrait;
+			aestheticInstructUISettings.portrait_width_you = temp_groupchat_aesthetic_data.portrait_width;
+			aestheticInstructUISettings.portrait_ratio_you = temp_groupchat_aesthetic_data.portrait_ratio;
+			aestheticInstructUISettings.bubbleColor_you = temp_groupchat_aesthetic_data.bubbleColor;
+			aestheticInstructUISettings.text_tcolor_you = temp_groupchat_aesthetic_data.text_tcolor;
+			aestheticInstructUISettings.speech_tcolor_you = temp_groupchat_aesthetic_data.speech_tcolor;
+			aestheticInstructUISettings.action_tcolor_you = temp_groupchat_aesthetic_data.action_tcolor;
+		}
+		else
+		{
+			let curr_bot_data = get_groupchat_bot_meta(current_groupchat_aesthetic_key);
+			curr_bot_data.portrait = temp_groupchat_aesthetic_data.portrait;
+			curr_bot_data.portrait_width = temp_groupchat_aesthetic_data.portrait_width;
+			curr_bot_data.portrait_ratio = temp_groupchat_aesthetic_data.portrait_ratio;
+			curr_bot_data.bubbleColor = temp_groupchat_aesthetic_data.bubbleColor;
+			curr_bot_data.text_tcolor = temp_groupchat_aesthetic_data.text_tcolor;
+			curr_bot_data.speech_tcolor = temp_groupchat_aesthetic_data.speech_tcolor;
+			curr_bot_data.action_tcolor = temp_groupchat_aesthetic_data.action_tcolor;
+			set_groupchat_bot_meta(current_groupchat_aesthetic_key, curr_bot_data);
+		}
+		temp_groupchat_aesthetic_data = null;
+		current_groupchat_aesthetic_key = "";
+		document.getElementById("groupchataestheticcontainer").classList.add("hidden");
+		show_groupchat_select();
+	}
+	function cancel_groupchat_aesthetics()
+	{
+		temp_groupchat_aesthetic_data = null;
+		current_groupchat_aesthetic_key = "";
+		document.getElementById("groupchataestheticcontainer").classList.add("hidden");
+		show_groupchat_select();
+	}
+
 	var is_impersonate_user = false;
 	function impersonate_user()
 	{
@@ -27760,9 +29230,7 @@ Current version indicated by LITEVER below.
 	}
 	function impersonate_message(index)
 	{
-		hide_popups();
-
-		if(localsettings.opmode==3)
+		if(localsettings.opmode==3 || (localsettings.opmode==4 && localsettings.inject_chatnames_instruct))
 		{
 			let grouplist = localsettings.chatopponent.split("||$||");
 			let target = grouplist[index];
@@ -27773,8 +29241,8 @@ Current version indicated by LITEVER below.
 				{
 					gametext_arr.push("\n"+target+": "+userinput);
 					render_gametext();
+					hide_popups();
 				}
-				hide_popups();
 			},false);
 		}
 		else
@@ -27801,50 +29269,93 @@ Current version indicated by LITEVER below.
 			},false);
 		}
 	}
-	function add_another_participant()
+	function add_another_participant(also_open_groupchat)
 	{
 		inputBox("Turn it into a group chat by adding more AI characters.\n\nInput name of additional character:","Add Another Participant","","[Enter Character Name]", ()=>{
 			let userinput = getInputBoxValue();
-			userinput = userinput.trim();
+			userinput = sanitize_groupchat_participant_name(userinput);
 			if(userinput!="")
 			{
-				if(document.getElementById("chatopponent").value=="")
+				let names = groupchat_bot_names();
+				let chatopponent = document.getElementById("chatopponent");
+				if(chatopponent && !also_open_groupchat)
 				{
-					document.getElementById("chatopponent").value = userinput;
-				}else{
-					document.getElementById("chatopponent").value += "||$||"+userinput;
-					handle_bot_name_onchange();
+					names = chatopponent.value.split("\n").map(x=>sanitize_groupchat_participant_name(x)).filter(x=>x!="");
+				}
+				names.push(userinput);
+				set_groupchat_bot_names(names);
+				if(also_open_groupchat)
+				{
+					show_groupchat_select();
 				}
 			}
 		},false);
 	}
+	function add_another_participant_from_file(obj)
+	{
+		let name = sanitize_groupchat_participant_name(obj.name);
+		if(name!="")
+		{
+			let names = groupchat_bot_names();
+			names.push(name);
+			set_groupchat_bot_names(names);
+			let bot_data = get_groupchat_bot_meta(name);
+			if(obj.ctx_memory)
+			{
+				bot_data.ctx_memory = obj.ctx_memory;
+				set_groupchat_bot_meta(name, bot_data);
+			}
+			if(obj.portrait)
+			{
+				compressImage(obj.portrait, (compressedImageURI, aspectratio) => {
+					bot_data.portrait = compressedImageURI;
+					bot_data.portrait_ratio = aspectratio.toFixed(2);
+					set_groupchat_bot_meta(name, bot_data);
+					show_groupchat_select();
+				}, true, AVATAR_PX);
+			}
+			else
+			{
+				show_groupchat_select();
+			}
+		}
+	}
 	function confirm_groupchat_select()
 	{
-		groupchat_removals = [];
+		let new_groupchat_removals = [];
 		if(localsettings.chatopponent!="")
 		{
-			let grouplist = localsettings.chatopponent.split("||$||");
+			let grouplist = groupchat_bot_names();
 			for(let i=0;i<grouplist.length;++i)
 			{
 				let sel = document.getElementById("groupselectitem_"+i);
 				if(sel && !sel.checked)
 				{
-					groupchat_removals.push(grouplist[i]);
+					new_groupchat_removals.push(grouplist[i]);
 				}
 			}
-			hide_popups();
-			if(groupchat_removals.length==grouplist.length)
+			if(new_groupchat_removals.length==grouplist.length)
 			{
 				msgbox("You need to select at least one group chat participant!");
-				groupchat_removals = [];
+				return;
 			}
+			groupchat_removals = new_groupchat_removals;
 		}
 		else
 		{
-			hide_popups();
+			groupchat_removals = [];
 		}
-
-
+		groupchat_select_snapshot = null;
+		hide_popups();
+		refreshAestheticPreview(false);
+		render_gametext();
+	}
+	function cancel_groupchat_select()
+	{
+		restore_groupchat_select_snapshot();
+		hide_popups();
+		refreshAestheticPreview(false);
+		render_gametext();
 	}
 
 	function toggleTopNav() {
@@ -27934,6 +29445,7 @@ Current version indicated by LITEVER below.
 
 	let aestheticInstructUISettings = new AestheticInstructUISettings();
 	let tempAestheticInstructUISettings = null; // These exist to act as backup when customizing, to revert when pressing the 'Cancel' button.
+	let tempAestheticGroupchatData = null;
 
 	function selectAvatarImage(isSelfPortrait)
 	{
@@ -28026,6 +29538,7 @@ Current version indicated by LITEVER below.
 		document.getElementById("reset-all-aesthetic-instruct").addEventListener('click', (e) => {
 			let ns = new AestheticInstructUISettings();
 			aestheticInstructUISettings = deepCopyAestheticSettings(ns);
+			apply_groupchat_ai_style_to_all();
 			refreshAestheticPreview(false);
 		});
 
@@ -28034,6 +29547,7 @@ Current version indicated by LITEVER below.
 
 	function openAestheticUISettingsMenu() {
 		tempAestheticInstructUISettings = deepCopyAestheticSettings(aestheticInstructUISettings);
+		tempAestheticGroupchatData = clone_groupchat_data(ensure_groupchat_data());
 		document.getElementById("aestheticsettingscontainer").classList.remove("hidden");
 		updateAestheticTextPreview();
 	}
@@ -28041,9 +29555,11 @@ Current version indicated by LITEVER below.
 	function hideAestheticUISettingsMenu(confirm) {
 		if (!confirm) {
 			aestheticInstructUISettings = deepCopyAestheticSettings(tempAestheticInstructUISettings);
+			localsettings.groupchat_data = tempAestheticGroupchatData || {};
 			refreshAestheticPreview(false);
 		}
 		tempAestheticInstructUISettings = null;
+		tempAestheticGroupchatData = null;
 		document.getElementById("aestheticsettingscontainer").classList.add("hidden");
 		render_gametext();
 	}
@@ -28064,6 +29580,14 @@ Current version indicated by LITEVER below.
 	}
 
 	function updateDataFromUI() {
+		let previousAIStyle = {
+			portrait_width:aestheticInstructUISettings.portrait_width_AI,
+			portrait_ratio:aestheticInstructUISettings.portrait_ratio_AI,
+			bubbleColor:aestheticInstructUISettings.bubbleColor_AI,
+			text_tcolor:aestheticInstructUISettings.text_tcolor_AI,
+			speech_tcolor:aestheticInstructUISettings.speech_tcolor_AI,
+			action_tcolor:aestheticInstructUISettings.action_tcolor_AI
+		};
 		aestheticInstructUISettings.text_tcolor_you = getColorPickerValueFromElement(`you-text-colorselector`);
 		aestheticInstructUISettings.speech_tcolor_you = getColorPickerValueFromElement(`you-speech-colorselector`);
 		aestheticInstructUISettings.action_tcolor_you = getColorPickerValueFromElement(`you-action-colorselector`);
@@ -28103,6 +29627,15 @@ Current version indicated by LITEVER below.
 		aestheticInstructUISettings.portrait_width_you = cleannum(aestheticInstructUISettings.portrait_width_you, 10, 250);
 		aestheticInstructUISettings.portrait_ratio_you = cleannum(aestheticInstructUISettings.portrait_ratio_you, 0.01, 3).toFixed(2);
 		aestheticInstructUISettings.background_minHeight = cleannum(aestheticInstructUISettings.background_minHeight, 0, 300);
+		if(previousAIStyle.portrait_width != aestheticInstructUISettings.portrait_width_AI
+			|| previousAIStyle.portrait_ratio != aestheticInstructUISettings.portrait_ratio_AI
+			|| previousAIStyle.bubbleColor != aestheticInstructUISettings.bubbleColor_AI
+			|| previousAIStyle.text_tcolor != aestheticInstructUISettings.text_tcolor_AI
+			|| previousAIStyle.speech_tcolor != aestheticInstructUISettings.speech_tcolor_AI
+			|| previousAIStyle.action_tcolor != aestheticInstructUISettings.action_tcolor_AI)
+		{
+			apply_groupchat_ai_style_to_all();
+		}
 
 		function getColorPickerValueFromElement(id) {
 			let element = document.getElementById(id);
@@ -28191,7 +29724,7 @@ Current version indicated by LITEVER below.
 
 	function render_aesthetic_ui(input, isPreview) //class suffix string used to prevent defined styles from leaking into global scope
 	{
-		const avatarImage = function(for_ai) { //todo: this is still bad code, but will keep it for now
+		const avatarImage = function(for_ai, bot_key) { //todo: this is still bad code, but will keep it for now
 			if((for_ai && !as.AI_portrait) || (!for_ai && !as.you_portrait) || as.border_style == 'None')
 			{
 				return ''; //for no portrait
@@ -28208,6 +29741,14 @@ Current version indicated by LITEVER below.
 				width = as.portrait_width_AI;
 				height = (as.border_style == 'Circle' ? as.portrait_width_AI : as.portrait_width_AI / as.portrait_ratio_AI);
 				imgclassname = "AI-portrait-image";
+				if(groupchat_bot_meta_exists(bot_key))
+				{
+					let botdata = get_groupchat_bot_meta(bot_key);
+					width = botdata.portrait_width;
+					height = (as.border_style == 'Circle' ? width : width / botdata.portrait_ratio);
+					let metakey = groupchat_bot_meta_key(bot_key);
+					imgclassname = `aui_participant_${metakey} AI-portrait-image`;
+				}
 			}
 			return `<div class='${imgclassname}${classSuffixStr}${reinvertcolor}' style='width:${width}px; height:${height}px; border-radius: ${radius}'></div>`;
 		}
@@ -28236,6 +29777,40 @@ Current version indicated by LITEVER below.
 		}
 		let as = aestheticInstructUISettings;
 		let classSuffixStr = isPreview ? "prv" : "";
+		let participantStyling = "";
+
+		let groupchat_data = ensure_groupchat_data();
+		for (let key in groupchat_data) {
+			if (groupchat_data.hasOwnProperty(key)) {
+				let currchar = normalize_groupchat_bot_meta(groupchat_data[key]);
+				let participantClass = `aui_participant_${key}`;
+				let portrait = currchar.portrait!="default" ? currchar.portrait : niko_square;
+				participantStyling +=
+				`.${participantClass}{
+					color: ${currchar.text_tcolor};
+					background-color:${currchar.bubbleColor};
+				}
+				.${participantClass}.AI-portrait-image${classSuffixStr}{
+					background:url(${portrait});
+					background-clip: content-box;
+					background-position: 50% 50%;
+					background-size: 100% 100%;
+					background-origin: content-box;
+					background-repeat: no-repeat;
+				}
+				.${participantClass} em, .${participantClass} b :not(code){
+					color: ${currchar.action_tcolor};
+					font-style: italic;
+					font-weight: normal;
+				}
+				.${participantClass} .quotespn {
+					color: ${currchar.speech_tcolor};
+					font-weight: normal;
+				}`;
+				participantStyling += "\n";
+			}
+		}
+
 		let portraitsStyling = // Also, implement portraits as css classes. Now chat entries can reuse them instead of recreating them.
 		`<style>
 			.you-portrait-image${classSuffixStr} {margin: 6px 6px; background:url(${as.you_portrait}); background-clip: content-box; background-position: 50% 50%; background-size: 100% 100%; background-origin: content-box; background-repeat: no-repeat; border:none;}
@@ -28279,6 +29854,7 @@ Current version indicated by LITEVER below.
 				color: ${as.speech_tcolor_AI};
 				font-weight: normal;
 			}
+			${participantStyling}
 			#chat_msg_body blockquote, #aesthetic_text_preview blockquote
 			{
 				font-size: ${as.font_size}px;
@@ -28378,6 +29954,8 @@ Current version indicated by LITEVER below.
 			}
 
 			let namepart = (curr.name!="" && localsettings.show_nametags?`<p class='aui_nametag'>${escape_html(curr.name)}</p>`:"");
+
+			let turnParticipantClass = groupchat_bot_meta_exists(curr.name) ? `aui_participant_${groupchat_bot_meta_key(curr.name)}` : "";
 			let showavatar = true;
 
 			//adventure and story has no names or avatars, also handle unlabelled first turns for chat/instruct
@@ -28399,13 +29977,13 @@ Current version indicated by LITEVER below.
 			newbodystr += `<div style='display:flex; align-items:stretch; flex-direction: row;'>`;
 			if(curr.myturn)
 			{
-				newbodystr += `${(showavatar?avatarImage(false):"")}
-				<div class='aui_myturn_block'`;
+				newbodystr += `${(showavatar?avatarImage(false,null):"")}
+				<div class='aui_myturn_block ${turnParticipantClass}'`;
 			}
 			else
 			{
-				newbodystr += `${(showavatar?avatarImage(true):"")}
-				<div class='aui_aiturn_block'`;
+				newbodystr += `${(showavatar?avatarImage(true,curr.name):"")}
+				<div class='aui_aiturn_block ${turnParticipantClass}'`;
 			}
 			newbodystr += ` style='flex: 1; display:flex; padding: ${as.padding()}; margin: ${as.margin()}; min-height:${as.background_minHeight}px;`
 			+ ` font-size: ${as.font_size}px; flex-direction:column; align-items: ${as.centerHorizontally ? 'center' : 'flex-start'};`
@@ -29671,7 +31249,7 @@ Current version indicated by LITEVER below.
 									</div>
 								</div>
 								<div class="settinglabel" style="width:100%">
-									<button type="button" class="btn btn-primary" style="padding:2px 4px;margin:2px;margin-left:auto;font-size:12px;" onclick="add_another_participant()">Add Another Participant</button>
+									<button type="button" class="btn btn-primary" style="padding:2px 4px;margin:2px;margin-left:auto;font-size:12px;" onclick="add_another_participant(false)">Add Another Participant</button>
 								</div>
 							</div>
 
@@ -30019,11 +31597,11 @@ Current version indicated by LITEVER below.
 									<input title="Max Output" inputmode="numeric" class="justifyright push-right" id="max_length" oninput="
 									document.getElementById('max_length_slide').value = this.value;">
 								</div>
-								<div><input title="Max Output Slider" type="range" min="16" max="1536" step="2"	id="max_length_slide" oninput="
+								<div><input title="Max Output Slider" type="range" min="16" max="2048" step="2"	id="max_length_slide" oninput="
 									document.getElementById('max_length').value = this.value;"></div>
 								<div class="settingminmax">
 									<div class="justifyleft">16</div>
-									<div class="justifyright" id="max_length_slide_label">1536</div>
+									<div class="justifyright" id="max_length_slide_label">2048</div>
 								</div>
 								<div id="auto_genamt_panel" class="settinglabel">
 									<div class="justifyleft" title="Automatically lowers settings if incompatible with existing workers">Auto-Adjust Limits </div>
@@ -30946,6 +32524,10 @@ Current version indicated by LITEVER below.
 							<input title="Automatically Execute Tools" type="checkbox" id="tools_auto_exec" class="push-right">
 						</div>
 						<div class="settinglabel">
+							<div class="justifyleft">Define Custom Tools <span class="helpicon">?<span class="helptext">Allows you to build your own tools as Javascript functions (caution).</span></span></div>
+							<button type="button" class="btn btn-primary push-right" onclick="show_customtools()">Custom Tools</button>
+						</div>
+						<div class="settinglabel">
 							<div class="justifyleft">Use CORS Proxy for MCP <span class="helpicon">?<span
 								class="helptext">Many public MCP servers restrict CORS, use this to proxy your requests. Uses external tools, please only use if necessary.</span></span></div>
 							<input title="Use CORS Proxy for MCP" type="checkbox" id="corsproxy_mcp" class="push-right">
@@ -31557,7 +33139,10 @@ Current version indicated by LITEVER below.
 
 				<input class="form-control" name="username" autocomplete="username" type="text" id="custom_oai_endpoint" placeholder="OpenAI API URL" value="" onblur="">
 				<input class="form-control" name="password" autocomplete="current-password" type="password" id="custom_oai_key" placeholder="API Key (Required)" value="" onfocus="focus_api_keys()" onblur="blur_api_keys()"><br>
-				Model Choice:<br>
+				<div style="display:flex; align-items:center;">
+					<div style="padding:2px">Model Choice:</div>
+					<div style="padding:2px;margin-left:auto;" id="model_cost"></div>
+				</div>
 				<select title="OpenAI Model Selection" style="padding:4px;display:inline;width:calc(100% - 200px)" class="form-control" id="custom_oai_model" onchange="oai_model_change(true)">
 					<option value="gpt-3.5-turbo-instruct" selected="selected">gpt-3.5-turbo-instruct</option>
 					<option value="davinci-002">davinci-002</option>
@@ -31745,7 +33330,9 @@ Current version indicated by LITEVER below.
 				<span class="color_green" style="font-weight: bold;">Please input Claude API URL and Key.</span><br><br>
 				<input class="form-control" type="text" id="custom_claude_endpoint" placeholder="Claude API URL" value="">
 				<input class="form-control" type="password" id="custom_claude_key" placeholder="Claude API Key (Required)" value="" onfocus="focus_api_keys()" onblur="blur_api_keys()"><br>
-				Model Choice:<br>
+				<div style="display:flex; align-items:center;">
+					<div style="padding:2px">Model Choice:</div>
+				</div>
 				<select title="Claude AI Model Selection" style="padding:4px; width:calc(100% - 110px); display:inline-block" class="form-control" id="custom_claude_model"  onload="toggleclaudemodel()"  onchange="toggleclaudemodel()">
 					<option value="claude-opus-4-8">claude-opus-4-8</option>
 					<option value="claude-opus-4-7">claude-opus-4-7</option>
@@ -32235,7 +33822,7 @@ Current version indicated by LITEVER below.
 
 	<div class="popupcontainer flex hidden" id="groupselectcontainer">
 		<div class="popupbg flex"></div>
-		<div class="nspopup flexsizevsmall">
+		<div class="nspopup flexsizesmall">
 			<div class="popuptitlebar">
 				<div class="popuptitletext">Chat Selectors</div>
 			</div>
@@ -32245,7 +33832,93 @@ Current version indicated by LITEVER below.
 			</div>
 			<div class="popupfooter">
 				<button type="button" class="btn btn-primary" onclick="confirm_groupchat_select()">Ok</button>
-				<button type="button" class="btn btn-primary" onclick="hide_popups()">Cancel</button>
+				<button type="button" class="btn btn-primary" onclick="cancel_groupchat_select()">Cancel</button>
+			</div>
+		</div>
+	</div>
+
+	<div class="popupcontainer flex hidden" id="groupchataestheticcontainer">
+		<div class="popupbg flex"></div>
+		<div class="nspopup groupchataestheticpopup">
+			<div class="popuptitlebar">
+				<div class="popuptitletext" id="groupchataesthetictitle">Participant Aesthetics</div>
+			</div>
+			<div class="menutext">
+				<div id="groupchat_aesthetic_avatar"></div>
+				<div class="ui-settings-inline" style="justify-content:center; margin-bottom:8px;">
+					<div style="margin-right: 20px">Portrait: </div>
+					<div id="groupchat-portrait" onclick="select_groupchat_avatar()">🖼️ Set Portrait</div>
+					<div style="margin-left: 10px;"><a href="#" class="color_blueurl" onclick="reset_groupchat_avatar(); return false;">(Reset Image)</a></div>
+				</div>
+				<div class="settinglabel">
+					<div class="justifyleft">Portrait Size</div>
+					<input class="push-right" title="Portrait Size" type="number" min="10" max="250" id="groupchat_portrait_width" style="width:70px">
+				</div>
+				<div class="settinglabel">
+					<div class="justifyleft">Portrait Ratio</div>
+					<input class="push-right" title="Portrait Ratio" type="number" min="0.01" max="3" step="0.01" id="groupchat_portrait_ratio" style="width:70px">
+				</div>
+				<div class="settinglabel">
+					<div class="justifyleft">Bubble Color</div>
+					<input class="push-right" title="Bubble Color" type="color" id="groupchat_bubbleColor">
+				</div>
+				<div class="settinglabel">
+					<div class="justifyleft">Text Color</div>
+					<input class="push-right" title="Text Color" type="color" id="groupchat_text_tcolor">
+				</div>
+				<div class="settinglabel">
+					<div class="justifyleft">Speech Color</div>
+					<input class="push-right" title="Speech Color" type="color" id="groupchat_speech_tcolor">
+				</div>
+				<div class="settinglabel">
+					<div class="justifyleft">Action Color</div>
+					<input class="push-right" title="Action Color" type="color" id="groupchat_action_tcolor">
+				</div>
+			</div>
+			<div class="popupfooter">
+				<button type="button" class="btn btn-primary" onclick="confirm_groupchat_aesthetics()">OK</button>
+				<button type="button" class="btn btn-primary" onclick="cancel_groupchat_aesthetics()">Cancel</button>
+			</div>
+		</div>
+	</div>
+
+	<div class="popupcontainer flex hidden" id="customtoolscontainer">
+		<div class="popupbg flex"></div>
+		<div class="nspopup flexsize evenhigher">
+			<div class="popuptitlebar">
+				<div class="popuptitletext">Define Custom Tools</div>
+			</div>
+			<div class="menutext">
+				<div id="customtoolsitems">
+				</div>
+			</div>
+			<div class="popupfooter">
+				<button type="button" class="btn btn-primary" onclick="customtools_done(true)">OK</button>
+				<button type="button" class="btn btn-primary" onclick="customtools_done(false)">Cancel</button>
+			</div>
+		</div>
+	</div>
+
+	<div class="popupcontainer flex hidden" id="customtooleditcontainer">
+		<div class="popupbg flex"></div>
+		<div class="nspopup flexsize higher">
+			<div class="popuptitlebar">
+				<div class="popuptitletext">Edit Custom Tool</div>
+			</div>
+			<div class="menutext">
+				<div class="settinglabel"><div class="justifyleft">&nbsp;&nbsp;Tool Name: </div><input class="push-right" title="Tool Name" type="text" placeholder="Enter the tool's name (e.g. read_diary)" style="width: calc(100% - 100px);" id="customtooleditor_name"></div>
+				<div class="settinglabel"><div class="justifyleft">&nbsp;&nbsp;Description: </div><textarea class="form-control menuinput_multiline" title="Description" placeholder="Details on when and how to use the tool (e.g. Read the contents of the diary)" id="customtooleditor_description"></textarea></div>
+				<br>
+				<div class="settinglabel"><div class="justify-center">&nbsp;&nbsp;Edit parameters JSON directly  <span class="helpicon">?<span class="helptext">When checked, you must manually specify the JSON schema for the tool's input arguments.</span></span>  <input type="checkbox" title="Edit Parameters JSON directly?" id="customtooleditor_editparametersjsondirectly" onchange="customtooleditor_parameters_toggle()"></div></div>
+				<div class="settinglabel hidden" id="customtooleditor_parametersjsoncontainer"><textarea class="form-control menuinput_multiline" title="Parameters JSON" placeholder="{ type:'object', properties:{}, additionalProperties:false }" id="customtooleditor_parametersjson"></textarea></div>
+				<div class="settinglabel" id="customtooleditor_parameterstemplatecontainer">
+				</div>
+				<div class="settinglabel"><div class="justifyleft">&nbsp;&nbsp;Function Body: </div><textarea class="form-control menuinput_multiline" title="Function Body" placeholder="Javascript source code for the function (e.g. return String( localsettings.diary || 'The diary is empty' ); )" rows="5" id="customtooleditor_functionbody"></textarea></div>
+				<div class="settinglabel"><div class="justifyleft">&nbsp;&nbsp;Is Asynchronous (returns a Promise)?:  <input type="checkbox" title="Is Asynchronous?" id="customtooleditor_asynchronous"></div></div>
+			</div>
+			<div class="popupfooter">
+				<button type="button" class="btn btn-primary" onclick="customtooleditor_done(true)">OK</button>
+				<button type="button" class="btn btn-primary" onclick="customtooleditor_done(false)">Cancel</button>
 			</div>
 		</div>
 	</div>

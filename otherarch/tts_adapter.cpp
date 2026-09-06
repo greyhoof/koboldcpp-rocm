@@ -492,6 +492,15 @@ static int code_terminate_id = 151670;
 static int nthreads = 4;
 static int tts_max_len = 4096;
 
+static std::string save_tts_audio_base64(const std::vector<float> & audio, int sample_rate, bool use_mp3)
+{
+    if (!use_mp3) {
+        return save_wav16_base64(audio, sample_rate);
+    }
+
+    return save_mono_mp3_base64(audio, sample_rate);
+}
+
 //ttscpp specific
 static bool is_ttscpp_file = false;
 static generation_configuration * ttscpp_config = nullptr;
@@ -575,8 +584,7 @@ bool ttstype_load_model(const tts_load_model_inputs inputs)
 
         nthreads = inputs.threads;
 
-        tts_model_params.use_mmap = false;
-        tts_model_params.use_mlock = false;
+        tts_model_params.load_mode = LLAMA_LOAD_MODE_NONE;
         tts_model_params.n_gpu_layers = inputs.gpulayers; //offload if possible
         tts_model_params.split_mode = llama_split_mode::LLAMA_SPLIT_MODE_LAYER;
         int kcpp_parseinfo_maindevice = inputs.kcpp_main_gpu<=0?0:inputs.kcpp_main_gpu;
@@ -718,7 +726,7 @@ static tts_generation_outputs ttstype_generate_ttscpp(const tts_generation_input
         printf("\nTTS Generated audio in %.2fs.\n",ttstime);
         std::vector<float> wavdat = std::vector(response_data.data, response_data.data + response_data.n_outputs);
         //audio_post_clean(wavdat);
-        last_generated_audio = save_wav16_base64(wavdat, ttscpp_runner->sampling_rate);
+        last_generated_audio = save_tts_audio_base64(wavdat, ttscpp_runner->sampling_rate, inputs.use_mp3);
         output.data = last_generated_audio.c_str();
         output.status = 1;
         last_generation_settings_audio_seed = 0;
@@ -1131,7 +1139,7 @@ static tts_generation_outputs ttstype_generate_outetts(const tts_generation_inpu
             return output;
         }
 
-        last_generated_audio = save_wav16_base64(audio, t_sr);
+        last_generated_audio = save_tts_audio_base64(audio, t_sr, inputs.use_mp3);
         ttstime = timer_check();
 
         printf("\nTTS Generated %d audio tokens in %.2fs.\n",(int) codes.size(),ttstime);
@@ -1170,11 +1178,13 @@ static tts_generation_outputs ttstype_generate_qwen3tts(const tts_generation_inp
         std::string custom_reference_audio_str = inputs.reference_audio;
         std::vector<float> custom_reference_audio_pcmf32;
         std::string speaker_instruction = inputs.speaker_instruction;
+        std::string ttslanguage = inputs.language;
 
         int speakerID = inputs.speaker_seed;
+        //{"aiden":2861, "dylan":2878, "eric":2875, "ono_anna":2873,"ryan":3061, "serena":3066, "sohee":2864, "uncle_fu":3010, "vivian":3065}
         int speakermap[] = {2861,3066,2873,3061,2864,2875,2878,3065,3010};
 
-        if (speakerID > 0 && speakerID <= 5) {
+        if (speakerID > 0 && speakerID <= 9) {
             speakerID = speakermap[speakerID-1];
         } else {
             speakerID = -1;
@@ -1191,6 +1201,7 @@ static tts_generation_outputs ttstype_generate_qwen3tts(const tts_generation_inp
             printf("\nUsing Audio Seed: %d, SpeakerID: %d", audio_seed, speakerID);
         }
         qwen3tts_runner.set_seed(audio_seed);
+        qwen3tts_runner.set_language(ttslanguage);
 
         if(custom_reference_audio_str!="")
         {
@@ -1239,7 +1250,7 @@ static tts_generation_outputs ttstype_generate_qwen3tts(const tts_generation_inp
 
         ttstime = timer_check();
         printf("\nTTS Generated audio in %.2fs.\n",ttstime);
-        last_generated_audio = save_wav16_base64(result.audio, result.sample_rate);
+        last_generated_audio = save_tts_audio_base64(result.audio, result.sample_rate, inputs.use_mp3);
         output.data = last_generated_audio.c_str();
         output.status = 1;
         last_generation_settings_audio_seed = inputs.audio_seed;

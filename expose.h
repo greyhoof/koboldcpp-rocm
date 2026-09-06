@@ -51,6 +51,8 @@ struct load_model_inputs
     const int visionmaxtokens = -1;
     const bool use_mmap = false;
     const bool use_mlock = false;
+    const bool use_direct_io = false;
+    const bool no_host = false;
     const bool use_mtp = false;
     const bool use_smartcontext = false;
     const bool use_contextshift = false;
@@ -186,14 +188,12 @@ struct sd_load_model_inputs
 {
     const char * model_filename = nullptr;
     const char * executable_path = nullptr;
-    const int kcpp_main_device = -1;
+    const char * backend = nullptr;
     const int threads = 0;
     const int quant = 0;
     const bool flash_attention = false;
-    const bool offload_cpu = false;
+    const char * params_backend = nullptr;
     const bool use_mmap = false;
-    const int kcpp_vae_device = -1;
-    const int kcpp_clip_device = -1;
     const bool diffusion_conv_direct = false;
     const bool vae_conv_direct = false;
     const bool taesd = false;
@@ -211,8 +211,10 @@ struct sd_load_model_inputs
     const char * upscaler_filename = nullptr;
     const int img_hard_limit = 0;
     const int img_soft_limit = 0;
-    const float max_vram = 0.f;
+    const char * max_vram = nullptr;
+    const char * split_mode = nullptr;
     const bool stream_layers = false;
+    const bool auto_fit = false;
     const char * devices_override = nullptr;
     const bool quiet = false;
     const int debugmode = 0;
@@ -223,6 +225,7 @@ struct sd_generation_inputs
     const char * negative_prompt = nullptr;
     const char * init_images = "";
     const char * mask = "";
+    const char * audio_data = "";
     const int extra_images_len = 0;
     const char ** extra_images = nullptr;
     const bool reverse_refimg = false;
@@ -239,6 +242,8 @@ struct sd_generation_inputs
     const char * sample_method = nullptr;
     const char * scheduler = nullptr;
     const float eta = -1.0f;
+    const char * extra_sample_args = nullptr;
+    const char * ref_image_args = nullptr;
     const int clip_skip = -1;
     const int vid_req_frames = 1;
     const int vid_fps = 16;
@@ -319,6 +324,8 @@ struct tts_generation_inputs
     const char * custom_speaker_data = "";
     const char * reference_audio = "";
     const char * speaker_instruction = "";
+    const char * language = "";
+    const bool use_mp3 = false;
 };
 struct tts_generation_outputs
 {

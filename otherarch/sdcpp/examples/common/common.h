@@ -16,10 +16,11 @@
 #define BOOL_STR(b) ((b) ? "true" : "false")
 
 extern const char* const modes_str[];
-#define SD_ALL_MODES_STR "img_gen, vid_gen, convert, upscale, metadata"
+#define SD_ALL_MODES_STR "img_gen, adetailer, vid_gen, convert, upscale, metadata"
 
 enum SDMode {
     IMG_GEN,
+    ADETAILER,
     VID_GEN,
     CONVERT,
     UPSCALE,
@@ -31,6 +32,7 @@ struct StringOption {
     std::string short_name;
     std::string long_name;
     std::string desc;
+    int concat;
     std::string* target;
 };
 
@@ -131,8 +133,11 @@ struct SDContextParams {
     std::string taesd_path;
     std::string esrgan_path;
     std::string control_net_path;
+    std::string ip_adapter_path;
+    std::string motion_module_path;
     std::string embedding_dir;
     std::string photo_maker_path;
+    std::string pulid_weights_path;
     sd_type_t wtype = SD_TYPE_COUNT;
     std::string tensor_type_rules;
     std::string lora_model_dir = ".";
@@ -144,10 +149,17 @@ struct SDContextParams {
     rng_type_t rng_type         = CUDA_RNG;
     rng_type_t sampler_rng_type = RNG_TYPE_COUNT;
     bool offload_params_to_cpu  = false;
-    float max_vram              = 0.f;
+    std::string max_vram        = "0";
     bool stream_layers          = false;
+    bool eager_load             = false;
     std::string backend;
     std::string params_backend;
+    std::string split_mode;
+    std::string model_args;
+    bool auto_fit = false;
+    std::string rpc_servers;
+    std::string effective_backend;
+    std::string effective_params_backend;
     bool enable_mmap           = false;
     bool control_net_cpu       = false;
     bool clip_on_cpu           = false;
@@ -157,16 +169,6 @@ struct SDContextParams {
     bool diffusion_conv_direct = false;
     bool vae_conv_direct       = false;
 
-    bool circular   = false;
-    bool circular_x = false;
-    bool circular_y = false;
-
-    bool chroma_use_dit_mask = true;
-    bool chroma_use_t5_mask  = false;
-    int chroma_t5_mask_pad   = 1;
-
-    bool qwen_image_zero_cond_t = false;
-
     prediction_t prediction           = PREDICTION_COUNT;
     lora_apply_mode_t lora_apply_mode = LORA_APPLY_AUTO;
 
@@ -175,24 +177,31 @@ struct SDContextParams {
     float flow_shift = INFINITY;
     ArgOptions get_options();
     void build_embedding_map();
+    void prepare_backend_assignments();
     bool resolve(SDMode mode);
     bool validate(SDMode mode);
     bool resolve_and_validate(SDMode mode);
     std::string to_string() const;
-    sd_ctx_params_t to_sd_ctx_params_t(bool vae_decode_only, bool free_params_immediately, bool taesd_preview);
+    sd_ctx_params_t to_sd_ctx_params_t(bool taesd_preview);
 };
 
 struct SDGenerationParams {
     // User-facing input fields.
     std::string prompt;
     std::string negative_prompt;
+    std::string ad_model_path;
+    std::string ad_prompt;
+    std::string ad_negative_prompt;
+    std::string extra_ad_args;
     int clip_skip              = -1;  // <= 0 represents unspecified
     int width                  = -1;
     int height                 = -1;
     int batch_count            = 1;
+    int qwen_image_layers      = 3;
     int64_t seed               = 42;
     float strength             = 0.75f;
     float control_strength     = 0.9f;
+    float ip_adapter_strength  = 1.0f;
     bool auto_resize_ref_image = true;
     bool increase_ref_index    = false;
     bool embed_image_metadata  = true;
@@ -201,7 +210,11 @@ struct SDGenerationParams {
     std::string end_image_path;
     std::string mask_image_path;
     std::string control_image_path;
+    std::string ip_adapter_image_path;
     std::vector<std::string> ref_image_paths;
+    std::vector<std::string> ref_video_paths;
+    std::vector<std::string> ref_video_audio_paths;
+    std::vector<std::string> ref_audio_paths;
     std::string control_video_path;
 
     sd_sample_params_t sample_params;
@@ -226,12 +239,21 @@ struct SDGenerationParams {
     sd_tiling_params_t vae_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
     std::string extra_tiling_args;
 
+    std::string ref_image_args;
+
     std::string pm_id_images_dir;
     std::string pm_id_embed_path;
     float pm_style_strength = 20.f;
 
+    std::string pulid_id_embedding_path;
+    float pulid_id_weight = 1.0f;
+
     int upscale_repeats   = 1;
     int upscale_tile_size = 128;
+
+    bool circular   = false;
+    bool circular_x = false;
+    bool circular_y = false;
 
     bool hires_enabled         = false;
     std::string hires_upscaler = "Latent";
@@ -256,13 +278,20 @@ struct SDGenerationParams {
     SDImageOwner init_image;
     SDImageOwner end_image;
     std::vector<SDImageOwner> ref_images;
+    std::vector<std::vector<SDImageOwner>> ref_videos;
+    std::vector<SDAudioOwner> ref_video_audios;
+    std::vector<SDAudioOwner> ref_audios;
     SDImageOwner mask_image;
     SDImageOwner control_image;
+    SDImageOwner ip_adapter_image;
     std::vector<SDImageOwner> pm_id_images;
     std::vector<SDImageOwner> control_frames;
 
     // Backing storage for sd_img_gen_params_t view fields.
     std::vector<sd_image_t> ref_image_views;
+    std::vector<std::vector<sd_image_t>> ref_video_frame_views;
+    std::vector<sd_ref_video_t> ref_video_views;
+    std::vector<sd_audio_t> ref_audio_views;
     std::vector<sd_image_t> pm_id_image_views;
     std::vector<sd_image_t> control_frame_views;
 

@@ -3,10 +3,12 @@
 
 #include "core/tensor_ggml.hpp"
 #include "model/common/block.hpp"
+#include "model_manager.h"
 
 struct VAE : public GGMLRunner {
 protected:
     SDVersion version;
+    std::string weight_prefix;
     bool scale_input                                      = true;
     virtual sd::Tensor<float> _compute(const int n_threads,
                                        const sd::Tensor<float>& z,
@@ -62,18 +64,21 @@ protected:
     }
 
 public:
-    VAE(SDVersion version, ggml_backend_t backend, ggml_backend_t params_backend)
-        : version(version), GGMLRunner(backend, params_backend) {}
+    VAE(SDVersion version,
+        ggml_backend_t backend,
+        const std::string& weight_prefix                    = "",
+        std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+        : version(version), weight_prefix(weight_prefix), GGMLRunner(backend, weight_manager) {}
 
     int get_scale_factor() {
         int scale_factor = 8;
         if (version == VERSION_LTXAV) {
             scale_factor = 32;
-        } else if (version == VERSION_WAN2_2_TI2V) {
+        } else if (version == VERSION_WAN2_2_TI2V || sd_version_is_hunyuan_video(version) || sd_version_is_mage_flow(version) || sd_version_is_minimax_h3(version)) {
             scale_factor = 16;
         } else if (sd_version_uses_flux2_vae(version)) {
             scale_factor = 16;
-        } else if (version == VERSION_CHROMA_RADIANCE || version == VERSION_HIDREAM_O1) {
+        } else if (version == VERSION_CHROMA_RADIANCE || version == VERSION_HIDREAM_O1 || sd_version_is_minit2i(version)) {
             scale_factor = 1;
         }
         return scale_factor;
@@ -110,11 +115,11 @@ public:
         tile_size_y = get_tile_size(params.tile_size_y, params.rel_size_y, latent_y);
     }
 
-    sd::Tensor<float> encode(int n_threads,
-                             const sd::Tensor<float>& x,
-                             sd_tiling_params_t tiling_params,
-                             bool circular_x = false,
-                             bool circular_y = false) {
+    virtual sd::Tensor<float> encode(int n_threads,
+                                     const sd::Tensor<float>& x,
+                                     sd_tiling_params_t tiling_params,
+                                     bool circular_x = false,
+                                     bool circular_y = false) {
         int64_t t0              = ggml_time_ms();
         sd::Tensor<float> input = x;
         sd::Tensor<float> output;
@@ -128,7 +133,12 @@ public:
             int64_t H              = input.shape()[1] / scale_factor;
             float tile_overlap;
             int tile_size_x, tile_size_y;
-            get_tile_sizes(tile_size_x, tile_size_y, tile_overlap, tiling_params, W, H, 1.30539f);
+            // Image VAE encode is more sensitive to tile boundary context than decode.
+            // Keep the smaller legacy factor for video VAEs, but default image encode
+            // tiles to 64 latent pixels so a 512px SD image is encoded as one tile.
+            const float encode_tile_factor = sd_version_is_minimax_h3(version) ? 1.f : (sd_version_is_wan(version) || sd_version_is_hunyuan_video(version) || sd_version_is_ltxav(version)) ? 1.30539f
+                                                                                                                                                                                            : 2.0f;
+            get_tile_sizes(tile_size_x, tile_size_y, tile_overlap, tiling_params, W, H, encode_tile_factor);
             LOG_DEBUG("VAE Tile size: %dx%d", tile_size_x, tile_size_y);
             output = tiled_compute(input,
                                    n_threads,
@@ -146,7 +156,7 @@ public:
             output = _compute(n_threads, input, false);
         }
 
-        free_compute_buffer();
+        runner_done();
 
         if (output.empty()) {
             LOG_ERROR("vae encode compute failed");
@@ -157,13 +167,13 @@ public:
         return std::move(output);
     }
 
-    sd::Tensor<float> decode(int n_threads,
-                             const sd::Tensor<float>& x,
-                             sd_tiling_params_t tiling_params,
-                             bool decode_video = false,
-                             bool circular_x   = false,
-                             bool circular_y   = false,
-                             bool silent       = false) {
+    virtual sd::Tensor<float> decode(int n_threads,
+                                     const sd::Tensor<float>& x,
+                                     sd_tiling_params_t tiling_params,
+                                     bool decode_video = false,
+                                     bool circular_x   = false,
+                                     bool circular_y   = false,
+                                     bool silent       = false) {
         int64_t t0              = ggml_time_ms();
         sd::Tensor<float> input = x;
         sd::Tensor<float> output;
@@ -197,7 +207,7 @@ public:
             output = _compute(n_threads, input, true);
         }
 
-        free_compute_buffer();
+        runner_done();
 
         if (output.empty()) {
             LOG_ERROR("vae decode compute failed");
@@ -214,7 +224,7 @@ public:
     virtual sd::Tensor<float> vae_output_to_latents(const sd::Tensor<float>& vae_output, std::shared_ptr<RNG> rng) = 0;
     virtual sd::Tensor<float> diffusion_to_vae_latents(const sd::Tensor<float>& latents)                           = 0;
     virtual sd::Tensor<float> vae_to_diffusion_latents(const sd::Tensor<float>& latents)                           = 0;
-    virtual void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string prefix)         = 0;
+    virtual void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors)                                   = 0;
     virtual void set_conv2d_scale(float scale) { SD_UNUSED(scale); };
     virtual void set_temporal_tiling_enabled(bool enabled) { SD_UNUSED(enabled); };
     virtual void set_tiling_params(const sd_tiling_params_t& params) {
@@ -223,8 +233,10 @@ public:
 };
 
 struct FakeVAE : public VAE {
-    FakeVAE(SDVersion version, ggml_backend_t backend, ggml_backend_t params_backend)
-        : VAE(version, backend, params_backend) {}
+    FakeVAE(SDVersion version,
+            ggml_backend_t backend,
+            std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+        : VAE(version, backend, "", weight_manager) {}
 
     int get_encoder_output_channels(int input_channels) {
         return input_channels;
@@ -251,7 +263,7 @@ struct FakeVAE : public VAE {
         return latents;
     }
 
-    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string prefix) override {}
+    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {}
 
     std::string get_desc() override {
         return "fake_vae";

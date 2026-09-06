@@ -14,12 +14,7 @@
 #include <iostream>
 #include <algorithm>
 
-#ifdef GGML_USE_CUDA
-#include "ggml_v3-cuda.h"
-#endif
-#if defined(GGML_USE_CLBLAST)
-#include "ggml_v3-opencl.h"
-#endif
+#include "kcpp_backend.h"
 
 // load the model's weights from a file
 ModelLoadResult gpt_neox_model_load(const std::string & fname, gpt_neox_model & model, gpt_vocab & vocab, FileFormat file_format, int gpulayers) {
@@ -271,6 +266,11 @@ ModelLoadResult gpt_neox_model_load(const std::string & fname, gpt_neox_model & 
                 break;
             }
 
+            if (n_dims < 1 || n_dims > 2) {
+                fprintf(stderr, "%s: invalid n_dims %d in model file\n", __func__, n_dims);
+                return ModelLoadResult::FAIL;
+            }
+
             int32_t nelements = 1;
             int32_t ne[2] = { 1, 1 };
             for (int i = 0; i < n_dims; ++i) {
@@ -329,42 +329,27 @@ ModelLoadResult gpt_neox_model_load(const std::string & fname, gpt_neox_model & 
     fin.close();
 
     //gpu offload
-    #if defined(GGML_USE_CLBLAST) || defined(GGML_USE_CUDA)
+    if (kcpp_backend_check(KCPP_BACKENDS_USE_CUDA)) {
     if(gpulayers>0)
     {
         const auto & hparams = model.hparams;
         size_t vram_total = 0;
         const int n_gpu = std::min(gpulayers, int(hparams.n_layer));
-        #if defined(GGML_USE_CLBLAST)
-        fprintf(stderr, "%s: [opencl] offloading %d layers to GPU\n", __func__, n_gpu);
-        #else
         fprintf(stderr, "%s: [CUDA] offloading %d layers to GPU\n", __func__, n_gpu);
-        #endif
         for (int i = 0; i < n_gpu; ++i) {
             const auto & layer = model.layers[i];
             layer.c_attn_attn_w->backend = GGML_V3_BACKEND_GPU;
             layer.c_attn_proj_w->backend = GGML_V3_BACKEND_GPU;
             layer.c_mlp_fc_w->backend = GGML_V3_BACKEND_GPU;
             layer.c_mlp_proj_w->backend = GGML_V3_BACKEND_GPU;
-            #if defined(GGML_USE_CLBLAST)
-            ggml_v3_cl_transform_tensor(layer.c_attn_attn_w->data,layer.c_attn_attn_w); vram_total += ggml_v3_nbytes(layer.c_attn_attn_w);
-            ggml_v3_cl_transform_tensor(layer.c_attn_proj_w->data,layer.c_attn_proj_w); vram_total += ggml_v3_nbytes(layer.c_attn_proj_w);
-            ggml_v3_cl_transform_tensor(layer.c_mlp_fc_w->data,layer.c_mlp_fc_w); vram_total += ggml_v3_nbytes(layer.c_mlp_fc_w);
-            ggml_v3_cl_transform_tensor(layer.c_mlp_proj_w->data,layer.c_mlp_proj_w); vram_total += ggml_v3_nbytes(layer.c_mlp_proj_w);
-            #else
-            ggml_v3_cuda_transform_tensor(layer.c_attn_attn_w->data,layer.c_attn_attn_w); vram_total += ggml_v3_nbytes(layer.c_attn_attn_w);
-            ggml_v3_cuda_transform_tensor(layer.c_attn_proj_w->data,layer.c_attn_proj_w); vram_total += ggml_v3_nbytes(layer.c_attn_proj_w);
-            ggml_v3_cuda_transform_tensor(layer.c_mlp_fc_w->data,layer.c_mlp_fc_w); vram_total += ggml_v3_nbytes(layer.c_mlp_fc_w);
-            ggml_v3_cuda_transform_tensor(layer.c_mlp_proj_w->data,layer.c_mlp_proj_w); vram_total += ggml_v3_nbytes(layer.c_mlp_proj_w);
-            #endif
+            kcpp_backend_cuda_ggmlv3_transform_tensor(layer.c_attn_attn_w->data,layer.c_attn_attn_w); vram_total += ggml_v3_nbytes(layer.c_attn_attn_w);
+            kcpp_backend_cuda_ggmlv3_transform_tensor(layer.c_attn_proj_w->data,layer.c_attn_proj_w); vram_total += ggml_v3_nbytes(layer.c_attn_proj_w);
+            kcpp_backend_cuda_ggmlv3_transform_tensor(layer.c_mlp_fc_w->data,layer.c_mlp_fc_w); vram_total += ggml_v3_nbytes(layer.c_mlp_fc_w);
+            kcpp_backend_cuda_ggmlv3_transform_tensor(layer.c_mlp_proj_w->data,layer.c_mlp_proj_w); vram_total += ggml_v3_nbytes(layer.c_mlp_proj_w);
         }
-        #if defined(GGML_USE_CLBLAST)
-            fprintf(stderr, "%s: [opencl] total VRAM used: %zu MB\n", __func__, vram_total / 1024 / 1024);
-        #else
-            fprintf(stderr, "%s: [CUDA] total VRAM used: %zu MB\n", __func__, vram_total / 1024 / 1024);
-        #endif
+        fprintf(stderr, "%s: [CUDA] total VRAM used: %zu MB\n", __func__, vram_total / 1024 / 1024);
     }
-    #endif
+    }
 
     return ModelLoadResult::SUCCESS;
 }

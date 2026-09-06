@@ -72,15 +72,15 @@ add_compile_definitions(GGML_USE_RPC)
 add_compile_definitions(NOMINMAX)
 add_compile_definitions(_REGEX_MAX_STACK_COUNT=5000)
 
-if (GGML_HIP_FORCE_ROCWMMA_FATTN_GFX12)
-    add_compile_definitions(GGML_HIP_ROCWMMA_FATTN_GFX12)
-endif()
 
 if (MSVC)
     add_compile_options("$<$<COMPILE_LANGUAGE:C>:/utf-8>")
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
     add_compile_options("$<$<COMPILE_LANGUAGE:C>:/bigobj>")
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/bigobj>")
+else()
+    add_compile_options("$<$<COMPILE_LANGUAGE:C>:-Wno-unused-value>")
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-value>")
 endif()
 
 file(GLOB GGML_SOURCES_CUDA "ggml/src/ggml-cuda/*.cu")
@@ -467,6 +467,16 @@ if (MINGW)
     add_compile_definitions(_WIN32_WINNT=0x602)
 endif()
 
+# Standalone libmtmd build without pulling in the rest of the tools/ tree.
+# Useful when packaging just the mtmd library for language bindings (e.g. an
+# Apple XCFramework, or a WASM build). When the full tools build is enabled,
+# mtmd is already built by the tools/ subdirectory above; this hook only fires
+# when LLAMA_BUILD_TOOLS is OFF to avoid double-adding the target.
+option(LLAMA_BUILD_MTMD "llama: build tools/mtmd library standalone" OFF)
+if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
+    add_subdirectory(tools/mtmd)
+endif()
+
 #
 # Build libraries
 #
@@ -551,6 +561,8 @@ set_target_properties(ggml_v3 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_library(common2
             common/common.cpp
             common/common.h
+            common/json.cpp
+            common/json.h
             common/speculative.cpp
             common/speculative.h
             common/sampling.cpp
@@ -560,6 +572,8 @@ add_library(common2
             tools/mtmd/mtmd-helper.cpp
             tools/mtmd/mtmd-image.cpp
             tools/mtmd/mtmd-helper.h
+            tools/mtmd/mtmd-helper-gen.cpp
+            tools/mtmd/mtmd-helper-common.h
             tools/mtmd/clip.cpp
             tools/mtmd/clip.h
             src/unicode.h
@@ -575,20 +589,31 @@ add_library(common2
             otherarch/llmutils.h
             common/reasoning-budget.cpp
             common/reasoning-budget.h
+            vendor/hash/hash.cpp
+            vendor/hash/hash.h
+            vendor/hash/sha256/sha256.c
+            vendor/hash/sha256/sha256.h
             tools/mtmd/mtmd-audio.cpp
             tools/mtmd/mtmd-audio.h)
-target_include_directories(common2 PUBLIC . ./ggml/include ./ggml/src ./ggml/src/ggml-cpu ./include ./otherarch ./otherarch/tools ./vendor/stb ./vendor/nlohmann ./vendor ./otherarch/sdcpp ./otherarch/sdcpp/thirdparty ./tools ./common)
+target_include_directories(common2 PUBLIC . ./ggml/include ./ggml/src ./ggml/src/ggml-cpu ./include ./otherarch ./otherarch/tools ./vendor/stb ./vendor/nlohmann ./vendor ./vendor/hash ./otherarch/sdcpp ./otherarch/sdcpp/thirdparty ./tools ./common)
 target_compile_features(common2 PUBLIC cxx_std_17) # don't bump
 target_link_libraries(common2 PRIVATE ggml ${LLAMA_EXTRA_LIBS})
 set_target_properties(common2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if (CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+    set(KCPP_HASH_NO_WARN_FLAG /w)
+else()
+    set(KCPP_HASH_NO_WARN_FLAG -w)
+endif()
+set_source_files_properties(vendor/hash/sha256/sha256.c PROPERTIES COMPILE_OPTIONS ${KCPP_HASH_NO_WARN_FLAG})
 
 add_library(sdtype_adapter
             otherarch/sdcpp/sdtype_adapter.cpp
             otherarch/sdcpp/src/core/ggml_graph_cut.cpp
             otherarch/sdcpp/src/core/ggml_graph_cut.h
             otherarch/sdcpp/examples/cli/image_metadata.cpp
-            otherarch/sdcpp/src/core/layer_registry.cpp
-            otherarch/sdcpp/src/core/layer_registry.h
+            otherarch/sdcpp/src/model_manager.cpp
+            otherarch/sdcpp/src/model_manager.h
+            otherarch/sdcpp/src/extensions/pulid_extension.cpp
             otherarch/sdcpp/src/model_loader.cpp
             otherarch/sdcpp/src/extensions/photomaker_extension.cpp
             otherarch/sdcpp/src/runtime/sample-cache.cpp
@@ -597,6 +622,8 @@ add_library(sdtype_adapter
             otherarch/sdcpp/src/upscaler.cpp
             otherarch/sdcpp/src/runtime/guidance.cpp
             otherarch/sdcpp/src/runtime/guidance.h
+            otherarch/sdcpp/src/runtime/imatrix.cpp
+            otherarch/sdcpp/src/runtime/imatrix.h
             otherarch/sdcpp/src/stable-diffusion.cpp
             otherarch/sdcpp/thirdparty/zip.c
             otherarch/sdcpp/src/model_io/gguf_io.cpp
@@ -613,6 +640,8 @@ add_library(sdtype_adapter
             otherarch/sdcpp/src/tokenizers/gpt_oss_tokenizer.cpp
             otherarch/sdcpp/src/tokenizers/tokenizer.cpp
             otherarch/sdcpp/src/tokenizers/tokenize_util.cpp
+            otherarch/sdcpp/src/core/backend_fit.cpp
+            otherarch/sdcpp/src/core/layer_split_partition.cpp
             otherarch/sdcpp/src/core/ggml_extend_backend.cpp)
 target_include_directories(sdtype_adapter PUBLIC . ./ggml/include ./ggml/src ./ggml/src/ggml-cpu ./include ./otherarch ./otherarch/tools ./vendor/stb ./vendor/nlohmann ./vendor ./otherarch/sdcpp ./otherarch/sdcpp/include ./otherarch/sdcpp/src ./otherarch/sdcpp/examples ./tools ./common)
 target_compile_features(sdtype_adapter PUBLIC cxx_std_17) # don't bump
@@ -648,7 +677,10 @@ target_link_libraries(embeddings_adapter PRIVATE common2 ggml ${LLAMA_EXTRA_LIBS
 set_target_properties(embeddings_adapter PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(gpttype_adapter
-            gpttype_adapter.cpp)
+            gpttype_adapter.cpp
+            src/llama.cpp
+            common/chat.cpp
+            src/llama-model.cpp)
 target_include_directories(gpttype_adapter PUBLIC . ./src ./ggml/include ./ggml/src ./ggml/src/ggml-cpu ./include ./otherarch ./otherarch/tools ./vendor/stb ./vendor/nlohmann ./vendor ./otherarch/sdcpp ./otherarch/sdcpp/thirdparty ./tools ./common)
 target_compile_features(gpttype_adapter PUBLIC cxx_std_17) # don't bump
 target_link_libraries(gpttype_adapter PRIVATE common2 ggml ggml_v1 ggml_v2 ggml_v3 ${LLAMA_EXTRA_LIBS})
@@ -656,7 +688,7 @@ set_target_properties(gpttype_adapter PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if (LLAMA_CUBLAS)
     set(TARGET koboldcpp_cublas)
-    add_library(${TARGET} SHARED expose.cpp expose.h)
+    add_library(${TARGET} SHARED expose.cpp expose.h kcpp_backend.cpp kcpp_backend.h)
     target_include_directories(${TARGET} PUBLIC . ./ggml/include ./ggml/src ./ggml/src/ggml-cpu ./include ./otherarch ./otherarch/tools ./vendor/stb ./vendor/nlohmann ./vendor ./otherarch/sdcpp ./otherarch/sdcpp/thirdparty ./tools ./common)
     target_compile_features(${TARGET} PUBLIC cxx_std_17) # don't bump
     set_target_properties(${TARGET} PROPERTIES PREFIX "")
@@ -676,7 +708,7 @@ endif()
 
 if (LLAMA_HIPBLAS)
     set(TARGET koboldcpp_hipblas)
-    add_library(${TARGET} SHARED expose.cpp expose.h)
+    add_library(${TARGET} SHARED expose.cpp expose.h kcpp_backend.cpp kcpp_backend.h)
     # Set ROCm compilers for koboldcpp_hipblas
     set_property(TARGET ${TARGET} PROPERTY C_STANDARD 11)
     set_property(TARGET ${TARGET} PROPERTY CXX_STANDARD 17)

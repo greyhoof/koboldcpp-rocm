@@ -16,10 +16,13 @@
 #include "otherarch.h"
 #include "llama.h"
 #include <vector>
+#include <sstream>
 #include <map>
 #include <cstdint>
 #include <string>
 #include <cctype>
+#include <cstdlib>
+#include <cfloat>
 #include <locale>
 #include <chrono>
 #include <algorithm>
@@ -30,12 +33,10 @@
 
 #include "utils.h"
 #include "llmutils.h"
+#include "kcpp_backend.h"
 
-//for easier compilation
-//concat source files into one file for compilation purposes
 #include "llama_v2.cpp"
 #include "llama_v3.cpp"
-#include "src/llama.cpp"
 #include "gptj_v1.cpp"
 #include "gptj_v2.cpp"
 #include "gptj_v3.cpp"
@@ -47,19 +48,23 @@
 #include "neox_v2.cpp"
 #include "neox_v3.cpp"
 #include "mpt_v3.cpp"
+
 #include "tools/mtmd/mtmd.h"
 #include "tools/mtmd/mtmd-helper.h"
 #include "common/speculative.h"
+#include "common/chat.h"
+#include "common/log.h"
+#include "llama-grammar.h"
 #include "vendor/stb/stb_image.h"
 #include "otherarch/sdcpp/thirdparty/stb_image_resize.h"
 #include "common/common.h"
 #include "common/fit.h"
 #include "ggml-rpc.h"
-
-#if defined(GGML_USE_HIP)
-// for rocblas_initialize()
-#include "rocblas/rocblas.h"
-#endif
+#include "llama-impl.h"
+#include "llama-ext.h"
+#include "llama-model.h"
+#include "llama-vocab.h"
+#include "nlohmann/json.hpp"
 
 //const
 const int extra_context_handle_fragmentation = 128;
@@ -71,7 +76,7 @@ std::string executable_path = "";
 std::string lora_filename = "";
 std::string mmproj_filename = "";
 std::string draftmodel_filename = "";
-int speculative_chunk_amt = 8; //do it in chunks of this many tokens
+int speculative_chunk_amt = 4; //do it in chunks of this many tokens
 bool generation_finished;
 bool audio_multimodal_supported = false;
 bool vision_multimodal_supported = false;
@@ -119,7 +124,8 @@ static llama_v3_context * llama_ctx_v3 = nullptr;
 static llama_context * llama_ctx_v4 = nullptr;
 static llama_context * draft_ctx = nullptr; //will remain null if speculative is unused
 static common_speculative * draft_spec = nullptr; // llama.cpp speculative state for draft model / MTP drafting
-static bool draft_is_mtp = false;
+static bool draft_is_mtp = false; // true for MTP/DFLASH/DSPARK paths that verify multiple target logits
+static common_speculative_type draft_spec_type_active = COMMON_SPECULATIVE_TYPE_NONE;
 static bool mtp_uses_spec_checkpoint = false;
 static common_prompt_checkpoint mtp_spec_ckpt;
 static llama_context * guidance_ctx = nullptr; //for classifier free guidance, will be null if unused
@@ -127,6 +133,7 @@ static llama_context * guidance_ctx = nullptr; //for classifier free guidance, w
 static mtmd_context * mtmd_ctx = nullptr; //for multimodal media
 static std::vector<media_object> media_objects;
 static std::vector<int> last_media_mem; //for storing dummy tokens that will be consumed by mtmd
+static std::vector<int> media_object_token_counts; //per media object dummy token counts for inline placeholders
 static std::string media_composite_image_signature = ""; //for identifying when the media changes, we need to invalidate the cache
 static int current_media_identifier = MEDIA_TOKEN_IDENTIFIER_A;
 static int vision_max_res = 2048;
@@ -183,14 +190,10 @@ static const int smartcache_rnn_lifeboat_percent = 65;
 static const int smartcache_rnn_lifeboat_extra_slot_min_user_slots = 4;
 
 extern bool kcpp_permit_any_repack;
-
-inline int kcpp_cpu_has_blas(void) {
-#if defined(GGML_USE_BLAS) || defined(GGML_USE_CUDA) || defined(GGML_USE_VULKAN) || defined(GGML_USE_SYCL)
-    return 1;
-#else
-    return 0;
-#endif
-}
+extern bool kcpp_pipeline_parallelism;
+extern bool OldBPETokenizerMode;
+extern int kcpp_extra_swa_padding;
+extern int kcpp_active_swa_size;
 
 inline bool IsNanCheck(float f)
 {
@@ -218,6 +221,58 @@ inline bool LogitsDuplicated(std::vector<float> & arr1, std::vector<float> & arr
 
 static inline void log_callback_off(ggml_log_level level, const char* text, void*) {
     return;
+}
+
+static inline void kcpp_flush_log_output()
+{
+    common_log_flush(common_log_main());
+    fflush(stdout);
+    fflush(stderr);
+}
+
+static common_speculative_type speculative_draft_type_from_model(const llama_model * model)
+{
+    if(model == nullptr)
+    {
+        return COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE;
+    }
+
+    if(model->arch == LLM_ARCH_DFLASH)
+    {
+        return model->dspark_markov_w1 != nullptr ? COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK : COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+    }
+
+    if(model->hparams.n_layer_nextn > 0)
+    {
+        return COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+    }
+
+    return COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE;
+}
+
+static bool speculative_draft_type_verifies_all_logits(common_speculative_type type)
+{
+    return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP
+        || type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
+        || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+}
+
+static bool speculative_draft_type_needs_preprocess_kv_rollback(common_speculative_type type)
+{
+    return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
+        || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+}
+
+static void speculative_apply_block_draft_output_limits(llama_context_params & ctx_params, common_speculative_type type)
+{
+    if(type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH && type != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
+    {
+        return;
+    }
+
+    const uint32_t per_seq = std::max<uint32_t>(1, speculative_chunk_amt + 1);
+    ctx_params.n_outputs_max = std::max<uint32_t>(ctx_params.n_outputs_max, per_seq);
+    ctx_params.n_outputs_max_per_seq = std::max<uint32_t>(ctx_params.n_outputs_max_per_seq, per_seq);
 }
 
 static inline void string_trim_whitespace(std::string & s) {
@@ -435,10 +490,11 @@ bool allExtendedUnicode(const std::string& str) {
     return true;
 }
 
-void print_fitted_params(const llama_model_params & mparams, const llama_context_params & cparams)
+std::string get_fitted_params_str(const llama_model_params & mparams, const llama_context_params & cparams)
 {
-    std::cout << "-c "    << cparams.n_ctx;
-    std::cout << " -ngl " << mparams.n_gpu_layers;
+    std::ostringstream out;
+    out << "-c "    << cparams.n_ctx;
+    out << " -ngl " << mparams.n_gpu_layers;
     size_t nd = llama_max_devices();
     while (nd > 1 && mparams.tensor_split[nd - 1] == 0.0f) {
         nd--;
@@ -446,25 +502,36 @@ void print_fitted_params(const llama_model_params & mparams, const llama_context
     if (nd > 1) {
         for (size_t id = 0; id < nd; id++) {
             if (id == 0) {
-                std::cout << " -ts ";
+                out << " -ts ";
             }
             if (id > 0) {
-                std::cout << ",";
+                out << ",";
             }
-            std::cout << mparams.tensor_split[id];
+            out << mparams.tensor_split[id];
         }
     }
     const size_t ntbo = llama_max_tensor_buft_overrides();
     for (size_t itbo = 0; itbo < ntbo && mparams.tensor_buft_overrides[itbo].pattern != nullptr; itbo++) {
         if (itbo == 0) {
-            std::cout << " -ot ";
+            out << " -ot ";
         }
         if (itbo > 0) {
-            std::cout << ",";
+            out << ",";
         }
-        std::cout << mparams.tensor_buft_overrides[itbo].pattern << "=" << ggml_backend_buft_name(mparams.tensor_buft_overrides[itbo].buft);
+        out << mparams.tensor_buft_overrides[itbo].pattern << "=" << ggml_backend_buft_name(mparams.tensor_buft_overrides[itbo].buft);
     }
-    std::cout << "\n";
+    return out.str();
+}
+
+static bool has_tensor_split(const float* ratios, int num_ratios, ggml_backend_t backend = nullptr)
+{
+    const int ratios_count = std::min(num_ratios, tensor_split_max);
+    for (int i = 0; i < ratios_count; ++i) {
+        if (ratios[i] != 0.0f) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static size_t estimate_draft_autofit_tax_mb(
@@ -485,13 +552,12 @@ static size_t estimate_draft_autofit_tax_mb(
     llama_model_params draft_model_params = llama_model_default_params();
     llama_context_params draft_ctx_params = llama_context_default_params();
 
-    draft_model_params.use_mmap = base_model_params.use_mmap;
-    draft_model_params.use_mlock = base_model_params.use_mlock;
-    draft_model_params.use_direct_io = base_model_params.use_direct_io;
+    draft_model_params.load_mode = base_model_params.load_mode;
     draft_model_params.n_gpu_layers = has_draft_model ? draft_gpulayers : 0;
     draft_model_params.devices = base_model_params.devices;
     draft_model_params.main_gpu = base_model_params.main_gpu;
     draft_model_params.split_mode = llama_split_mode::LLAMA_SPLIT_MODE_LAYER;
+    draft_model_params.load_mtp = true;
 
     draft_ctx_params.n_ctx = base_ctx_params.n_ctx;
     draft_ctx_params.offload_kqv = base_ctx_params.offload_kqv;
@@ -506,23 +572,13 @@ static size_t estimate_draft_autofit_tax_mb(
     draft_ctx_params.swa_full = base_ctx_params.swa_full;
     draft_ctx_params.n_rs_seq = 0;
 
-    #if defined(GGML_USE_CUDA) || defined(GGML_USE_VULKAN)
-    bool ts_all_zero = true;
-    for (int i = 0; i < tensor_split_max; ++i) {
-        if (draft_gpusplit[i] != 0.0f) {
-            ts_all_zero = false;
-            break;
-        }
-    }
-    if(!ts_all_zero)
-    {
+    if(has_tensor_split(draft_gpusplit, tensor_split_max)) {
         draft_model_params.tensor_split = draft_gpusplit;
     }
-    #endif
 
     const char * estimate_model_path = has_draft_model ? spec_model_filename.c_str() : main_model_filename.c_str();
     bool measure_model_bytes = true;
-    bool draft_is_mtp_estimate = !has_draft_model && use_mtp;
+    common_speculative_type draft_spec_type_estimate = !has_draft_model && use_mtp ? COMMON_SPECULATIVE_TYPE_DRAFT_MTP : COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE;
 
     //mute logs for the fitting stuff first
     auto oldverbosity = common_log_get_verbosity_thold();
@@ -537,13 +593,12 @@ static size_t estimate_draft_autofit_tax_mb(
     {
         llama_model_params draft_probe_params = draft_model_params;
         draft_probe_params.no_alloc = true;
-        draft_probe_params.use_mmap = false;
-        draft_probe_params.use_mlock = false;
+        draft_probe_params.load_mode = LLAMA_LOAD_MODE_NONE;
 
         llama_model * draft_probe = llama_model_load_from_file(spec_model_filename.c_str(), draft_probe_params);
         if(draft_probe != nullptr)
         {
-            draft_is_mtp_estimate = draft_probe->hparams.n_layer_nextn > 0;
+            draft_spec_type_estimate = speculative_draft_type_from_model(draft_probe);
             llama_model_free(draft_probe);
         }
     }
@@ -574,8 +629,7 @@ static size_t estimate_draft_autofit_tax_mb(
     {
         llama_model_params ctx_other_model_params = base_model_params;
         ctx_other_model_params.no_alloc = true;
-        ctx_other_model_params.use_mmap = false;
-        ctx_other_model_params.use_mlock = false;
+        ctx_other_model_params.load_mode = LLAMA_LOAD_MODE_NONE;
 
         ctx_other_model = llama_model_load_from_file(main_model_filename.c_str(), ctx_other_model_params);
         if(ctx_other_model != nullptr)
@@ -593,12 +647,15 @@ static size_t estimate_draft_autofit_tax_mb(
         }
     }
 
-    if(draft_is_mtp_estimate)
+    if(draft_spec_type_estimate == COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
     {
         draft_ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        draft_ctx_params.n_seq_max = base_ctx_params.n_seq_max;
         draft_ctx_params.n_rs_seq = speculative_chunk_amt;
+        draft_ctx_params.n_outputs_max = std::max<uint32_t>(1, base_ctx_params.n_seq_max); //match the real MTP draft context so the autofit tax doesn't over-reserve the draft compute buffer at n_batch*n_vocab (~2GB on large-vocab models like Gemma)
         measure_model_bytes = has_draft_model;
     }
+    speculative_apply_block_draft_output_limits(draft_ctx_params, draft_spec_type_estimate);
 
     std::vector<ggml_backend_dev_t> devs;
     uint32_t hp_ngl = 0;
@@ -850,21 +907,26 @@ static bool speculative_state_setup(llama_context * main_ctx, const llama_contex
     }
     catch(const std::exception & e)
     {
+        common_log_flush(common_log_main());
         printf("Error: failed to initialize speculative decoding state: %s\n", e.what());
         llama_free(draft_ctx);
         draft_ctx = nullptr;
         draft_is_mtp = false;
+        draft_spec_type_active = COMMON_SPECULATIVE_TYPE_NONE;
         return false;
     }
 
     if(draft_spec == nullptr)
     {
+        common_log_flush(common_log_main());
         printf("Error: failed to initialize speculative decoding state.\n");
         llama_free(draft_ctx);
         draft_ctx = nullptr;
         draft_is_mtp = false;
+        draft_spec_type_active = COMMON_SPECULATIVE_TYPE_NONE;
         return false;
     }
+    draft_spec_type_active = type;
     return true;
 }
 
@@ -881,7 +943,7 @@ static void mtp_decoding_setup(llama_model * main_model, llama_context * main_ct
     mtp_ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     mtp_ctx_params.ctx_other = main_ctx;
     mtp_ctx_params.n_rs_seq = 0;
-    mtp_ctx_params.n_outputs_max = 1;
+    mtp_ctx_params.n_outputs_max = std::max<uint32_t>(1, mtp_ctx_params.n_seq_max);
 
     printf("\nAttempting to create built-in MTP context from the main model.\n");
     draft_ctx = llama_init_from_model(main_model, mtp_ctx_params);
@@ -893,7 +955,7 @@ static void mtp_decoding_setup(llama_model * main_model, llama_context * main_ct
     }
 
     draft_is_mtp = true;
-    speculative_state_setup(main_ctx, mtp_ctx_params, 0, COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+    speculative_state_setup(main_ctx, mtp_ctx_params, -1, COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
 }
 
 //loads a model for speculative decoding.
@@ -902,30 +964,20 @@ static void speculative_decoding_setup(std::string spec_model_filename, llama_co
     llama_model_params draft_model_params = llama_model_default_params();
     llama_context_params draft_ctx_params = llama_context_default_params();
 
-    draft_model_params.use_mmap = base_model_params.use_mmap;
-    draft_model_params.use_mlock = base_model_params.use_mlock;
-    draft_model_params.use_direct_io = base_model_params.use_direct_io;
+    draft_model_params.load_mode = base_model_params.load_mode;
     draft_model_params.n_gpu_layers = draft_gpulayers; //layers offload the speculative model.
     draft_model_params.devices = base_model_params.devices;
+    draft_model_params.load_mtp = true;
     draft_ctx_params.n_ctx = base_ctx_params.n_ctx;
     draft_ctx_params.offload_kqv = base_ctx_params.offload_kqv;
     draft_model_params.main_gpu = base_model_params.main_gpu;
     draft_model_params.split_mode = llama_split_mode::LLAMA_SPLIT_MODE_LAYER;
     draft_ctx_params.kv_unified = base_ctx_params.kv_unified;
-    #if defined(GGML_USE_CUDA) || defined(GGML_USE_VULKAN)
-    bool ts_all_zero = true;
-    for (int i = 0; i < tensor_split_max; ++i) {
-        if (draft_gpusplit[i] != 0.0f) {
-            ts_all_zero = false;
-            break;
-        }
-    }
-    if(!ts_all_zero)
-    {
+
+    if(has_tensor_split(draft_gpusplit, tensor_split_max)) {
         printf("\nApplying Draft GPU Split...\n");
         draft_model_params.tensor_split = draft_gpusplit;
     }
-    #endif
     draft_ctx_params.n_batch = base_ctx_params.n_batch;
     draft_ctx_params.n_ubatch = base_ctx_params.n_ubatch;
     draft_ctx_params.n_threads = base_ctx_params.n_threads;
@@ -943,13 +995,27 @@ static void speculative_decoding_setup(std::string spec_model_filename, llama_co
         draft_is_mtp = false;
         return;
     }
-    draft_is_mtp = draftmodel && draftmodel->hparams.n_layer_nextn > 0;
-    if(draft_is_mtp)
+    const common_speculative_type draft_spec_type = speculative_draft_type_from_model(draftmodel);
+    draft_is_mtp = speculative_draft_type_verifies_all_logits(draft_spec_type);
+    if(draft_spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
     {
         printf("Detected MTP draft head, using llama.cpp MTP speculative decoding.\n");
         draft_ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         draft_ctx_params.ctx_other = main_ctx;
         draft_ctx_params.n_rs_seq = speculative_chunk_amt;
+        draft_ctx_params.n_outputs_max = base_ctx_params.n_seq_max; //draft-mtp generates tokens autoregressively (1 output per sequence per decode, looped up to n_max); cap outputs at n_seq instead of letting it default to n_batch, which sized the draft sampling buffer at n_batch*n_vocab (~2GB on large-vocab models like Gemma)
+    }
+    else if(draft_spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
+    {
+        printf("Detected DSpark draft model, using llama.cpp DSpark speculative decoding.\n");
+        draft_ctx_params.ctx_other = main_ctx;
+        speculative_apply_block_draft_output_limits(draft_ctx_params, draft_spec_type);
+    }
+    else if(draft_spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
+    {
+        printf("Detected DFlash draft model, using llama.cpp DFlash speculative decoding.\n");
+        draft_ctx_params.ctx_other = main_ctx;
+        speculative_apply_block_draft_output_limits(draft_ctx_params, draft_spec_type);
     }
     draft_ctx = llama_init_from_model(draftmodel, draft_ctx_params);
     if(draft_ctx == NULL)
@@ -972,7 +1038,7 @@ static void speculative_decoding_setup(std::string spec_model_filename, llama_co
         {
             if(debugmode==1)
             {
-                printf("WARNING: Draft model vocab of (%d) does not match base vocab of (%d).\nIn debug mode, this restriction is bypassed. However, speculative decoding may malfunction!\n",draftvocab,base_n_vocab);
+                printf("WARNING: Draft model vocab of (%d) does not match base vocab of (%d).\n",draftvocab,base_n_vocab);
             }
             else
             {
@@ -994,7 +1060,7 @@ static void speculative_decoding_setup(std::string spec_model_filename, llama_co
 
         if(draft_ctx && draft_is_mtp)
         {
-            speculative_state_setup(main_ctx, draft_ctx_params, draft_gpulayers, COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+            speculative_state_setup(main_ctx, draft_ctx_params, draft_gpulayers, draft_spec_type);
         }
         else if(draft_ctx)
         {
@@ -1008,13 +1074,16 @@ static int32_t kcpp_decode_main_and_spec(llama_context * main_ctx, llama_batch b
     const int32_t decode_status = llama_decode(main_ctx, batch);
     if(decode_status == 0 && draft_spec)
     {
-        if(draft_ctx && llama_get_ctx_other(draft_ctx) != main_ctx && batch.n_tokens > 0 && batch.n_seq_id[0] > 0)
+        if(draft_ctx && batch.n_tokens > 0 && batch.n_seq_id[0] > 0 &&
+            (llama_get_ctx_other(draft_ctx) != main_ctx || speculative_draft_type_needs_preprocess_kv_rollback(draft_spec_type_active)))
         {
             llama_memory_seq_rm(llama_get_memory(draft_ctx), batch.seq_id[0][0], batch.pos[0], -1);
         }
         if(!common_speculative_process(draft_spec, batch))
         {
+            kcpp_flush_log_output();
             printf("\nERROR: Speculative state update failed!\n");
+            fflush(stdout);
             return -1;
         }
     }
@@ -1050,14 +1119,16 @@ static speculative_draft_result speculative_decoding_eval_chunk(llama_context * 
     common_speculative_draft(draft_spec);
     if(drafted_ids.empty())
     {
+        kcpp_flush_log_output();
         printf("\nERROR: Draft model produced no draft tokens!\n");
+        fflush(stdout);
         return results;
     }
 
     std::vector<llama_token> real_embd;
-    real_embd.reserve(drafted_ids.size());
+    real_embd.reserve(drafted_ids.size() + 1);
     real_embd.push_back(embd[0]);
-    for(size_t i = 0; i + 1 < drafted_ids.size(); ++i)
+    for(size_t i = 0; i < drafted_ids.size(); ++i)
     {
         real_embd.push_back(drafted_ids[i]);
     }
@@ -1082,7 +1153,9 @@ static speculative_draft_result speculative_decoding_eval_chunk(llama_context * 
     const int32_t decode_status = kcpp_decode_main_and_spec(main_ctx, batch.batch);
     if(decode_status != 0)
     {
+        kcpp_flush_log_output();
         printf("\nERROR: Speculative verification failed! (code:%d)\n", decode_status);
+        fflush(stdout);
         return results;
     }
 
@@ -1090,6 +1163,9 @@ static speculative_draft_result speculative_decoding_eval_chunk(llama_context * 
     for(size_t i = 0; i < drafted_ids.size(); ++i)
     {
         results.draftids.push_back(drafted_ids[i]);
+    }
+    for(size_t i = 0; i < real_embd.size(); ++i)
+    {
         results.actual_logits.push_back(llama_get_logits_ith(main_ctx, (int32_t)i));
     }
     results.draft_success = true;
@@ -2048,6 +2124,77 @@ void sample_temperature(llama_token_data_array * candidates_p, float temp, float
     }
 }
 
+static std::pair<std::vector<uint32_t>, llama_partial_utf8> kcpp_decode_utf8(
+        const std::string & src,
+        llama_partial_utf8 partial_start) {
+    static const int lookup[] = { 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 3, 4 };
+    const char * pos = src.c_str();
+    std::vector<uint32_t> code_points;
+
+    code_points.reserve(src.size() + 1);
+    uint32_t value    = partial_start.value;
+    int      n_remain = partial_start.n_remain;
+
+    while (*pos != 0 && n_remain > 0) {
+        uint8_t next_byte = static_cast<uint8_t>(*pos);
+        if ((next_byte >> 6) != 2) {
+            code_points.push_back(0);
+            return std::make_pair(std::move(code_points), llama_partial_utf8{ 0, -1 });
+        }
+        value = (value << 6) + (next_byte & 0x3F);
+        ++pos;
+        --n_remain;
+    }
+
+    if (partial_start.n_remain > 0 && n_remain == 0) {
+        code_points.push_back(value);
+    }
+
+    while (*pos != 0) {
+        uint8_t first_byte = static_cast<uint8_t>(*pos);
+        uint8_t highbits   = first_byte >> 4;
+        n_remain = lookup[highbits] - 1;
+
+        if (n_remain < 0) {
+            code_points.clear();
+            code_points.push_back(0);
+            return std::make_pair(std::move(code_points), llama_partial_utf8{ 0, n_remain });
+        }
+
+        uint8_t mask = (1 << (7 - n_remain)) - 1;
+        value = first_byte & mask;
+
+        ++pos;
+        while (*pos != 0 && n_remain > 0) {
+            value = (value << 6) + (static_cast<uint8_t>(*pos) & 0x3F);
+            ++pos;
+            --n_remain;
+        }
+        if (n_remain == 0) {
+            code_points.push_back(value);
+        }
+    }
+    code_points.push_back(0);
+
+    return std::make_pair(std::move(code_points), llama_partial_utf8{ value, n_remain });
+}
+
+static llama_grammar_candidates kcpp_llama_grammar_reject_candidates(
+        const llama_grammar_rules      & rules,
+        const llama_grammar_stacks     & stacks,
+        const llama_grammar_candidates & candidates) {
+    if (stacks.empty()) {
+        return {};
+    }
+
+    auto rejects = llama_grammar_reject_candidates_for_stack(rules, stacks.front(), candidates);
+    for (size_t i = 1, size = stacks.size(); i < size; ++i) {
+        rejects = llama_grammar_reject_candidates_for_stack(rules, stacks[i], rejects);
+    }
+
+    return rejects;
+}
+
 void sample_grammar(FileFormat file_format, int32_t n_vocab, llama_token_data_array * candidates, const struct llama_grammar * grammar) {
 
     const int64_t t_start_sample_us = ggml_time_us();
@@ -2080,12 +2227,12 @@ void sample_grammar(FileFormat file_format, int32_t n_vocab, llama_token_data_ar
         } else if (piece.empty() || piece[0] == 0) {
             rejects[i] = true;
         } else {
-            candidates_decoded.push_back(decode_utf8(piece.c_str(), grammar->partial_utf8));
+            candidates_decoded.push_back(kcpp_decode_utf8(piece, grammar->partial_utf8));
             candidates_grammar.push_back({ i, candidates_decoded.back().first.data(), candidates_decoded.back().second });
         }
     }
 
-    for (auto reject: llama_grammar_reject_candidates(grammar->rules, grammar->stacks, candidates_grammar)) {
+    for (auto reject: kcpp_llama_grammar_reject_candidates(grammar->rules, grammar->stacks, candidates_grammar)) {
         rejects[reject.index] = true;
     }
 
@@ -2319,7 +2466,7 @@ static void grammar_accept_token(FileFormat file_format, int32_t n_vocab, struct
     const std::string piece = FileFormatTokenizeID(token,file_format);
 
     // Note terminating 0 in decoded string
-    const auto   decoded     = decode_utf8(piece.c_str(), grammar->partial_utf8);
+    const auto   decoded     = kcpp_decode_utf8(piece, grammar->partial_utf8);
     const auto & code_points = decoded.first;
     for (auto it = code_points.begin(), end = code_points.end() - 1; it != end; ++it) {
         llama_grammar_accept(grammar, *it);
@@ -2393,6 +2540,201 @@ static bool mtmd_text_chunk_has_invalid_tokens(const mtmd_input_chunk * mtmdchun
     return false;
 }
 
+static bool kcpp_is_media_token(int token)
+{
+    return token <= MEDIA_TOKEN_IDENTIFIER_A && token > MEDIA_TOKEN_IDENTIFIER_A - 4096;
+}
+
+static int kcpp_media_token_for_index(int media_index)
+{
+    return current_media_identifier - (media_index * 2);
+}
+
+static int kcpp_media_index_from_token(int token)
+{
+    if(!kcpp_is_media_token(token))
+    {
+        return -1;
+    }
+    const int diff = current_media_identifier - token;
+    if(diff < 0 || (diff % 2) != 0)
+    {
+        return -1;
+    }
+    return diff / 2;
+}
+
+static bool kcpp_parse_attached_media_placeholder(
+    const std::string & prompt,
+    size_t pos,
+    int image_count,
+    int audio_count,
+    int & media_index,
+    size_t & placeholder_len)
+{
+    const std::string image_prefix = "(Attached Image ";
+    const std::string audio_prefix = "(Attached Audio ";
+    bool is_audio = false;
+    size_t prefix_len = 0;
+
+    if(prompt.compare(pos, image_prefix.size(), image_prefix) == 0)
+    {
+        prefix_len = image_prefix.size();
+    }
+    else if(prompt.compare(pos, audio_prefix.size(), audio_prefix) == 0)
+    {
+        is_audio = true;
+        prefix_len = audio_prefix.size();
+    }
+    else
+    {
+        return false;
+    }
+
+    size_t number_pos = pos + prefix_len;
+    size_t end_pos = number_pos;
+    while(end_pos < prompt.size() && std::isdigit((unsigned char) prompt[end_pos]))
+    {
+        ++end_pos;
+    }
+    if(end_pos == number_pos || end_pos >= prompt.size() || prompt[end_pos] != ')')
+    {
+        return false;
+    }
+
+    int number = std::atoi(prompt.substr(number_pos, end_pos - number_pos).c_str());
+    if(number <= 0)
+    {
+        return false;
+    }
+
+    int candidate = -1;
+    if(is_audio)
+    {
+        if(number <= audio_count)
+        {
+            candidate = image_count + number - 1;
+        }
+        else if(number <= (int) media_objects.size() && media_objects[number - 1].is_audio)
+        {
+            candidate = number - 1;
+        }
+    }
+    else
+    {
+        if(number <= image_count)
+        {
+            candidate = number - 1;
+        }
+        else if(number <= (int) media_objects.size() && !media_objects[number - 1].is_audio)
+        {
+            candidate = number - 1;
+        }
+    }
+
+    if(candidate < 0 || candidate >= (int) media_objects.size())
+    {
+        return false;
+    }
+    media_index = candidate;
+    placeholder_len = end_pos - pos + 1;
+    return true;
+}
+
+static void kcpp_append_media_placeholder_tokens(std::vector<int> & tokens, int media_index)
+{
+    if(media_index < 0 || media_index >= (int) media_object_token_counts.size())
+    {
+        return;
+    }
+    const int token_count = media_object_token_counts[media_index];
+    const int media_token = kcpp_media_token_for_index(media_index);
+    for(int i = 0; i < token_count; ++i)
+    {
+        tokens.push_back(media_token);
+    }
+}
+
+static bool kcpp_tokenize_prompt_with_inline_media(
+    const std::string & prompt,
+    std::vector<int> & output_tokens,
+    FileFormat file_format,
+    bool add_bos,
+    int image_count,
+    int audio_count)
+{
+    output_tokens.clear();
+    bool inserted_media = false;
+    bool emitted_anything = false;
+    size_t text_start = 0;
+
+    auto append_text = [&](size_t start, size_t end)
+    {
+        if(end <= start)
+        {
+            return;
+        }
+        std::vector<int> text_tokens;
+        TokenizeString(prompt.substr(start, end - start), text_tokens, file_format, add_bos && !emitted_anything);
+        output_tokens.insert(output_tokens.end(), text_tokens.begin(), text_tokens.end());
+        emitted_anything = true;
+    };
+
+    for(size_t pos = 0; pos < prompt.size(); ++pos)
+    {
+        int media_index = -1;
+        size_t placeholder_len = 0;
+        if(kcpp_parse_attached_media_placeholder(prompt, pos, image_count, audio_count, media_index, placeholder_len))
+        {
+            append_text(text_start, pos);
+            if(add_bos && !emitted_anything)
+            {
+                std::vector<int> bos;
+                TokenizeString("", bos, file_format, true);
+                output_tokens.insert(output_tokens.end(), bos.begin(), bos.end());
+            }
+            kcpp_append_media_placeholder_tokens(output_tokens, media_index);
+            emitted_anything = true;
+            inserted_media = true;
+            pos += placeholder_len - 1;
+            text_start = pos + 1;
+        }
+    }
+
+    append_text(text_start, prompt.size());
+    if(!inserted_media)
+    {
+        output_tokens.clear();
+    }
+    return inserted_media;
+}
+
+static int kcpp_adjust_media_truncation_start(const std::vector<int> & tokens, int offset)
+{
+    if(offset <= 0 || offset >= (int) tokens.size())
+    {
+        return offset;
+    }
+    const int token = tokens[offset];
+    if(kcpp_is_media_token(token) && tokens[offset - 1] == token)
+    {
+        while(offset < (int) tokens.size() && tokens[offset] == token)
+        {
+            ++offset;
+        }
+    }
+    return offset;
+}
+
+static bool kcpp_media_span_boundary_ok(const std::vector<int> & tokens, int pos)
+{
+    if(pos <= 0 || pos >= (int) tokens.size())
+    {
+        return true;
+    }
+    return !(kcpp_is_media_token(tokens[pos]) && tokens[pos - 1] == tokens[pos]);
+}
+
 //given an old GGUF context and a new context that has some middle portion removed,
 //find and remove the middle portion from the old context from the KV. Does not fast forward after this destructive action
 //returns true if contextshift is doable, executes it if dryrun is false
@@ -2413,6 +2755,11 @@ bool DoContextShifting(llama_context * ctx, llama_context * draft_ctx, std::vect
 
     for (int i = 0; i < current_context_tokens.size(); ++i)
     {
+        if(i >= new_tokens_len)
+        {
+            purgeneeded = false;
+            break;
+        }
         if (current_context_tokens[i] == new_context_tokens[i])
         {
             trimstart += 1;
@@ -2447,6 +2794,14 @@ bool DoContextShifting(llama_context * ctx, llama_context * draft_ctx, std::vect
         int found = ArrFindIndexOf(current_context_tokens,shared);
         if(found>=0 && found > trimstart)
         {
+            if(!kcpp_media_span_boundary_ok(current_context_tokens, trimstart) || !kcpp_media_span_boundary_ok(current_context_tokens, found))
+            {
+                if(debugmode==1 && !is_quiet)
+                {
+                    printf("\n[Context Shifting skipped: refusing to split a multimodal span]");
+                }
+                return false;
+            }
             bool ok = true;
             if(!dryrun)
             {
@@ -2627,20 +2982,20 @@ static void connect_rpc_servers(const std::string & servers) {
 
 mtmd_context_params init_mtmd_ctx_params(bool mmproj_cpu, bool dryrun)
 {
-    #if defined(GGML_USE_METAL)
-    if(file_format_meta.model_architecture == llm_arch::LLM_ARCH_QWEN2VL || file_format_meta.model_architecture == llm_arch::LLM_ARCH_GEMMA3)
-    {
-        mmproj_cpu = true;
-        if(!dryrun)
+    if(kcpp_backend_check(KCPP_BACKENDS_METAL)) {
+        if(file_format_meta.model_architecture == llm_arch::LLM_ARCH_QWEN2VL || file_format_meta.model_architecture == llm_arch::LLM_ARCH_GEMMA3)
         {
-            printf("MTMD will use CPU for this model!\n");
+            mmproj_cpu = true;
+            if(!dryrun)
+            {
+                printf("MTMD will use CPU for this model!\n");
+            }
         }
     }
-    #endif
     llama_flash_attn_type mtmd_fa = (kcpp_data->flash_attn?LLAMA_FLASH_ATTN_TYPE_ENABLED:LLAMA_FLASH_ATTN_TYPE_DISABLED);
-    #if defined(GGML_USE_CUDA)
-    mtmd_fa = LLAMA_FLASH_ATTN_TYPE_DISABLED; //kcpp: disabled in 1.102.2 as some headsizes break on turing
-    #endif
+    if(kcpp_backend_check(KCPP_BACKENDS_USE_CUDA)) {
+        mtmd_fa = LLAMA_FLASH_ATTN_TYPE_DISABLED; //kcpp: disabled in 1.102.2 as some headsizes break on turing
+    }
     if(mmproj_cpu)
     {
         if(!dryrun)
@@ -2706,6 +3061,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
     }
     draft_ctx = nullptr;
     draft_is_mtp = false;
+    draft_spec_type_active = COMMON_SPECULATIVE_TYPE_NONE;
     mtp_uses_spec_checkpoint = false;
     mtp_spec_ckpt.clear();
     guidance_ctx = nullptr;
@@ -2780,17 +3136,14 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
     int kcpp_parseinfo_maindevice = inputs.kcpp_main_gpu<=0?0:inputs.kcpp_main_gpu;
 
     printf("System Info: %s\n", kcpp_print_system_info());
-    #if defined(GGML_USE_CUDA)
     if(file_format!=FileFormat::GGUF_GENERIC)
     {
         if(ggml_v3_cpu_has_gpublas() && kcpp_parseinfo_maindevice>0)
         {
-            printf("CUBLAS v3: Set main device to %d\n",kcpp_parseinfo_maindevice);
-            ggml_v3_cuda_set_main_device(kcpp_parseinfo_maindevice);
+            kcpp_backend_cuda_ggmlv3_set_main_device(kcpp_parseinfo_maindevice);
         }
     }
 
-    #endif
     SetQuantsUnshuffled(false);
     if(file_format == FileFormat::GGML || file_format == FileFormat::GGHF || file_format == FileFormat::GGJT || file_format == FileFormat::GGJT_2)
     {
@@ -2854,20 +3207,10 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         llama_ctx_params.rope_freq_scale = rope_freq_scale;
         llama_ctx_params.n_batch = kcpp_data->n_batch;
 
-        #if defined(GGML_USE_CUDA) || defined(GGML_USE_VULKAN)
-        bool ts_all_zero = true;
-        for (int i = 0; i < tensor_split_max; ++i) {
-            if (inputs.tensor_split[i] != 0.0f) {
-                ts_all_zero = false;
-                break;
-            }
-        }
-        if(!ts_all_zero)
-        {
+        if(has_tensor_split(inputs.tensor_split, tensor_split_max)) {
             printf("\nApplying Tensor Split...\n");
             llama_ctx_params.tensor_split = inputs.tensor_split;
         }
-        #endif
 
         llama_ctx_v3 = llama_v3_init_from_file(kcpp_data->model_filename.c_str(), llama_ctx_params);
 
@@ -2930,11 +3273,27 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
 
         llama_ctx_params.offload_kqv = !inputs.low_vram;
         llama_ctx_params.kv_unified = true;
-        model_params.use_mmap = inputs.use_mmap;
-        model_params.use_mlock = inputs.use_mlock;
-        model_params.use_direct_io = false; //no direct io for now until stable
+        if((inputs.use_mtp || draftmodel_filename != "") && inputs.draft_amount > 0)
+        {
+            // Match llama-server's target rollback slots for speculative verification.
+            llama_ctx_params.n_rs_seq = inputs.draft_amount;
+        }
+        if(inputs.use_direct_io)
+        {
+            model_params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;
+        }
+        else if(inputs.use_mlock)
+        {
+            model_params.load_mode = inputs.use_mmap ? LLAMA_LOAD_MODE_MMAP_MLOCK : LLAMA_LOAD_MODE_MLOCK;
+        }
+        else
+        {
+            model_params.load_mode = inputs.use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
+        }
         model_params.n_gpu_layers = inputs.gpulayers;
-        kcpp_permit_any_repack = (model_params.use_mmap?false:true);
+        model_params.no_host = inputs.no_host;
+        model_params.load_mtp = inputs.use_mtp;
+        kcpp_permit_any_repack = !(inputs.use_mmap || inputs.use_direct_io);
 
         //set device overrides if needed
         std::vector<ggml_backend_dev_t> devices_override;
@@ -2954,11 +3313,11 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             printf("Main GPU device: Try set to %d\n",kcpp_parseinfo_maindevice);
         }
 
-        #if defined(GGML_USE_CUDA)
-        printf("CUDA MMQ: %s\n",(inputs.use_mmq?"True":"False"));
-        printf("---\nInitializing CUDA/HIP, please wait, the following step may take a few minutes (only for first launch)...\n---\n");
-        ggml_cuda_set_mul_mat_q(inputs.use_mmq);
-        #endif
+        if(kcpp_backend_check(KCPP_BACKENDS_USE_CUDA)) {
+            printf("CUDA MMQ: %s\n",(inputs.use_mmq?"True":"False"));
+            printf("---\nInitializing CUDA/HIP, please wait, the following step may take a few minutes (only for first launch)...\n---\n");
+            kcpp_backend_cuda_set_mul_mat_q(inputs.use_mmq);
+        }
 
         model_params.main_gpu = kcpp_parseinfo_maindevice;
         model_params.split_mode = (inputs.splitmode>0?((llama_split_mode)(inputs.splitmode)):llama_split_mode::LLAMA_SPLIT_MODE_LAYER);
@@ -2972,20 +3331,10 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         llama_ctx_params.n_threads = kcpp_data->n_threads;
         llama_ctx_params.n_threads_batch = kcpp_data->n_blasthreads;
 
-        #if defined(GGML_USE_CUDA) || defined(GGML_USE_VULKAN)
-        bool ts_all_zero = true;
-        for (int i = 0; i < tensor_split_max; ++i) {
-            if (inputs.tensor_split[i] != 0.0f) {
-                ts_all_zero = false;
-                break;
-            }
-        }
-        if(!ts_all_zero)
-        {
+        if(has_tensor_split(inputs.tensor_split, tensor_split_max)) {
             printf("\nApplying Tensor Split...\n");
             model_params.tensor_split = inputs.tensor_split;
         }
-        #endif
 
         //compat for old falcon
         if(file_format_meta.fileversion==1)
@@ -3111,9 +3460,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(),1024*1024*1024);
         if(inputs.autofit)
         {
-            #if defined(GGML_USE_HIP)
-            rocblas_initialize();
-            #endif // defined(GGML_USE_HIP)
+            kcpp_backend_hip_initialize();
 
             size_t totalmmprojtax = 0;
             if(mmproj_filename != "" && file_format==FileFormat::GGUF_GENERIC && !inputs.mmproj_cpu)
@@ -3174,19 +3521,22 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             }
             fit_params_target[0] = taxmb*1024*1024;
             bool success = (common_fit_params(kcpp_data->model_filename.c_str(), &model_params, &llama_ctx_params,
-            tensor_split_temp, tenos.data(), fit_params_target.data(), kcpp_data->n_ctx,
+            tensor_split_temp, tenos.data(), fit_params_target.data(), kcpp_data->n_ctx, nullptr,
             dospam?GGML_LOG_LEVEL_DEBUG:GGML_LOG_LEVEL_NONE)==0);
             if(!dospam)
             {
                 llama_log_set(currlogger, curruserdat);
+                common_log_set_verbosity_thold(oldverbosity);
             }
-            printf("Autofit Success: %d, Autofit Result: ",success);
-            print_fitted_params(model_params,llama_ctx_params);
+            common_log_flush(common_log_main());
+            fflush(stderr);
+            const std::string fitted_params = get_fitted_params_str(model_params,llama_ctx_params);
+            printf("Autofit Success: %d, Autofit Result: %s\n",success,fitted_params.c_str());
+            fflush(stdout);
             if(!success)
             {
                 //revert to previous
                 model_params.n_gpu_layers = inputs.gpulayers;
-                common_log_set_verbosity_thold(oldverbosity);
             }
         }
 
@@ -3362,25 +3712,24 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         {
             if(mtmd_ctx!=nullptr)
             {
-                printf("Error: Speculative decoding and MTP cannot be used with multimodal projectors!\n");
+                printf("Warning: Speculative decoding and MTP may not work well with multimodal projectors!\n");
+            }
+
+            speculative_chunk_amt = inputs.draft_amount;
+            if(draftmodel_filename != "")
+            {
+                if(inputs.use_mtp)
+                {
+                    printf("\nBoth --draftmodel and --usemtp were provided. The draft model will be used for speculative decoding.\n");
+                }
+                printf("\nAttempting to load draft model for speculative decoding. It will be fully offloaded if possible. Vocab must match the main model.\n");
+                speculative_decoding_setup(draftmodel_filename, llama_ctx_v4, model_params, llama_ctx_params, n_vocab, inputs.draft_gpusplit, inputs.draft_gpulayers);
             }
             else
             {
-                speculative_chunk_amt = inputs.draft_amount;
-                if(draftmodel_filename != "")
-                {
-                    if(inputs.use_mtp)
-                    {
-                        printf("\nBoth --draftmodel and --usemtp were provided. The draft model will be used for speculative decoding.\n");
-                    }
-                    printf("\nAttempting to load draft model for speculative decoding. It will be fully offloaded if possible. Vocab must match the main model.\n");
-                    speculative_decoding_setup(draftmodel_filename, llama_ctx_v4, model_params, llama_ctx_params, n_vocab, inputs.draft_gpusplit, inputs.draft_gpulayers);
-                }
-                else
-                {
-                    mtp_decoding_setup(llamamodel, llama_ctx_v4, llama_ctx_params);
-                }
+                mtp_decoding_setup(llamamodel, llama_ctx_v4, llama_ctx_params);
             }
+
         }
         if(draft_is_mtp && draft_spec)
         {
@@ -3954,12 +4303,17 @@ struct BatchGenerateRequest
     bool has_pending = false;
     llama_token pending_token = 0;
     int i_batch = -1;
+    bool i_batch_is_prefill = false;
     llama_sampler * sampler = nullptr;
     std::vector<std::string> generated_pieces;
     std::string output;
     int prompt_token_count = 0;
     int completion_token_count = 0;
     std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point process_start_time;
+    std::chrono::steady_clock::time_point generation_start_time;
+    float init_time = 0.0f;
+    float process_time = 0.0f;
     stop_reason finish_reason = stop_reason::INVALID;
     bool abort_requested = false;
     generation_outputs result;
@@ -4050,7 +4404,7 @@ public:
         std::unique_lock<std::mutex> lock(batch_mutex);
         batch_legacy_waiting++;
         batch_cv.notify_all();
-        batch_cv.wait(lock, [](){ return !batch_has_live_locked(); });
+        batch_cv.wait(lock, [](){ return !batch_legacy_active && !batch_has_live_locked(); });
         batch_legacy_waiting--;
         batch_invalidate_legacy_context_locked();
         batch_legacy_active = true;
@@ -4294,7 +4648,15 @@ static void batch_finish_request_locked(BatchGenerateRequest & req, stop_reason 
 {
     auto finish_time = std::chrono::steady_clock::now();
     float total_time = req.start_time.time_since_epoch().count() == 0 ? 0.0f : std::chrono::duration<float>(finish_time - req.start_time).count();
-    float generated_tps = total_time > 0.0f ? (float) req.completion_token_count / total_time : 0.0f;
+    float init_time = req.init_time;
+    float process_time = req.process_time;
+    float gen_time = req.generation_start_time.time_since_epoch().count() == 0 ? 0.0f : std::chrono::duration<float>(finish_time - req.generation_start_time).count();
+    if(process_time == 0.0f && req.prompt_token_count > 0 && total_time > 0.0f)
+    {
+        process_time = std::max(0.0f, total_time - init_time);
+    }
+    float processed_tps = process_time > 0.0f ? (float) req.prompt_token_count / process_time : 0.0f;
+    float generated_tps = gen_time > 0.0f ? (float) req.completion_token_count / gen_time : 0.0f;
     req.finish_reason = reason;
     req.result.status = (reason == stop_reason::ERROR_ENCOUNTERED) ? 0 : 1;
     req.result.stopreason = reason;
@@ -4307,8 +4669,8 @@ static void batch_finish_request_locked(BatchGenerateRequest & req, stop_reason 
         llama_memory_seq_rm(llama_get_memory(llama_ctx_v4), req.slot, -1, -1);
     }
     req.slot = -1;
-    printf("\n[%s] BatchRequest:%d, Prompt:%d, Generated:%d/%d in %.2fs (%.2fT/s), Stop:%d",
-        get_timestamp_str().c_str(), req.id, req.prompt_token_count, req.completion_token_count, req.max_length, total_time, generated_tps, (int) reason);
+    printf("\n[%s] BatchRequest:%d, Init:%.2fs, Processed:%d in %.2fs (%.2fT/s), Generated:%d/%d in %.2fs (%.2fT/s), Total:%.2fs, Stop:%d",
+        get_timestamp_str().c_str(), req.id, init_time, req.prompt_token_count, process_time, processed_tps, req.completion_token_count, req.max_length, gen_time, generated_tps, total_time, (int) reason);
     fflush(stdout);
     batch_cv.notify_all();
 }
@@ -4353,6 +4715,7 @@ static bool batch_claim_waiting_locked()
         req->slot = slot;
         req->state = BatchState::PREFILL;
         batch_touched_since_legacy = true;
+        req->start_time = std::chrono::steady_clock::now();
 
         ApplyPromptFormatAdjustments(req->prompt_added_memory, req->prompt);
         std::vector<llama_token> added_memory_tokens; //temporary buf before copying over
@@ -4397,8 +4760,12 @@ static bool batch_claim_waiting_locked()
         req->n_past = 0;
         req->has_pending = false;
         req->i_batch = -1;
-        req->start_time = std::chrono::steady_clock::now();
+        req->i_batch_is_prefill = false;
         llama_memory_seq_rm(llama_get_memory(llama_ctx_v4), slot, -1, -1);
+        req->process_start_time = std::chrono::steady_clock::now();
+        req->generation_start_time = std::chrono::steady_clock::time_point();
+        req->init_time = std::chrono::duration<float>(req->process_start_time - req->start_time).count();
+        req->process_time = 0.0f;
         claimed = true;
     }
     return claimed;
@@ -4434,6 +4801,7 @@ static void batch_worker_loop()
                 }
                 BatchGenerateRequest & req = *req_ptr;
                 req.i_batch = -1;
+                req.i_batch_is_prefill = false;
                 if(req.abort_requested)
                 {
                     batch_finish_request_locked(req, stop_reason::INVALID);
@@ -4447,6 +4815,7 @@ static void batch_worker_loop()
                         if(is_last)
                         {
                             req.i_batch = batch.n_tokens;
+                            req.i_batch_is_prefill = true;
                         }
                         common_batch_add(batch, req.prompt_tokens[req.prompt_pos], req.n_past, { req.slot }, is_last);
                         req.prompt_pos++;
@@ -4460,6 +4829,7 @@ static void batch_worker_loop()
                 else if(req.state == BatchState::GENERATING && req.has_pending)
                 {
                     req.i_batch = batch.n_tokens;
+                    req.i_batch_is_prefill = false;
                     common_batch_add(batch, req.pending_token, req.n_past, { req.slot }, true);
                     req.n_past++;
                     req.has_pending = false;
@@ -4479,6 +4849,7 @@ static void batch_worker_loop()
         }
 
         int decode_status = llama_decode(llama_ctx_v4, batch);
+        auto decode_finish_time = std::chrono::steady_clock::now();
 
         std::lock_guard<std::mutex> lock(batch_mutex);
         if(decode_status != 0)
@@ -4502,6 +4873,11 @@ static void batch_worker_loop()
             if(!req || req->state != BatchState::GENERATING || req->i_batch < 0)
             {
                 continue;
+            }
+            if(req->i_batch_is_prefill && req->generation_start_time.time_since_epoch().count() == 0)
+            {
+                req->generation_start_time = decode_finish_time;
+                req->process_time = std::chrono::duration<float>(decode_finish_time - req->process_start_time).count();
             }
             llama_token sampled = llama_sampler_sample(req->sampler, llama_ctx_v4, req->i_batch);
             req->completion_token_count++;
@@ -4546,7 +4922,7 @@ static void batch_start_worker_locked()
 
 bool gpttype_batch_generate_enabled()
 {
-    return continuous_batching_slots > 1 && file_format == FileFormat::GGUF_GENERIC && llama_ctx_v4 && kcpp_data;
+    return continuous_batching_slots > 1 && file_format == FileFormat::GGUF_GENERIC && llama_ctx_v4 && kcpp_data && !draft_ctx && !guidance_ctx;
 }
 
 int gpttype_batch_generate_submit(const generation_inputs inputs)
@@ -4720,6 +5096,115 @@ std::string gpttype_get_chat_template()
     return std::string(model_template.data(), model_template.size() - 1);
 }
 
+std::string gpttype_parse_chat_tool_calls(const std::string & generated_text,
+                                          const std::string & tools_json,
+                                          const std::string & chat_template,
+                                          const std::string & chat_template_kwargs_json,
+                                          const std::string & tool_choice,
+                                          bool parallel_tool_calls,
+                                          bool is_partial)
+{
+    try
+    {
+        if(generated_text.empty() || tools_json.empty())
+        {
+            return "";
+        }
+
+        common_json tools = common_json::parse(tools_json);
+        if(!tools.is_array() || tools.empty())
+        {
+            return "";
+        }
+
+        std::string tmpl_src = chat_template.empty() ? gpttype_get_chat_template() : chat_template;
+        if(tmpl_src.empty())
+        {
+            return "";
+        }
+
+        auto tmpls = common_chat_templates_init(nullptr, tmpl_src);
+
+        common_chat_msg msg;
+        msg.role = "user";
+        msg.content = "tool parser warmup";
+
+        common_chat_templates_inputs inputs;
+        inputs.use_jinja = true;
+        inputs.messages = { msg };
+        inputs.tools = common_chat_tools_parse_oaicompat(tools);
+        inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(tool_choice.empty() ? "auto" : tool_choice);
+        inputs.parallel_tool_calls = parallel_tool_calls;
+        inputs.add_generation_prompt = true;
+
+        if(!chat_template_kwargs_json.empty())
+        {
+            common_json kwargs = common_json::parse(chat_template_kwargs_json);
+            if(kwargs.is_object())
+            {
+                for(const auto & item : kwargs.items())
+                {
+                    inputs.chat_template_kwargs[item.key()] = item.value().dump();
+                }
+            }
+        }
+
+        common_chat_params chat_params = common_chat_templates_apply(tmpls.get(), inputs);
+        if(chat_params.parser.empty())
+        {
+            return "";
+        }
+
+        common_chat_parser_params parser_params(chat_params);
+        parser_params.parse_tool_calls = true;
+        parser_params.parser.load(chat_params.parser);
+
+        ggml_log_callback currlogger = nullptr;
+        void * curruserdat = nullptr;
+        int oldverbosity = common_log_get_verbosity_thold();
+        llama_log_get(&currlogger, &curruserdat);
+        llama_log_set(log_callback_off, nullptr);
+        common_log_set_verbosity_thold(GGML_LOG_LEVEL_NONE);
+
+        common_chat_msg parsed;
+        try
+        {
+            parsed = common_chat_parse(generated_text, is_partial, parser_params);
+        }
+        catch(...)
+        {
+            llama_log_set(currlogger, curruserdat);
+            common_log_set_verbosity_thold(oldverbosity);
+            throw;
+        }
+
+        llama_log_set(currlogger, curruserdat);
+        common_log_set_verbosity_thold(oldverbosity);
+        if(parsed.tool_calls.empty())
+        {
+            return "";
+        }
+
+        common_json tool_calls = parsed.to_json_oaicompat().value("tool_calls", common_json::array());
+        return tool_calls.dump();
+    }
+    catch(const std::exception & e)
+    {
+        if(debugmode == 1 && !is_quiet)
+        {
+            printf("\nNative tool parser failed: %s\n", e.what());
+        }
+    }
+    catch(...)
+    {
+        if(debugmode == 1 && !is_quiet)
+        {
+            printf("\nNative tool parser failed with unknown error.\n");
+        }
+    }
+    return "";
+}
+
 std::vector<int> gpttype_get_token_arr(const std::string & input, bool addbos)
 {
     std::vector<int> toks;
@@ -4796,11 +5281,10 @@ int GetThreadsToUse(bool blasmode)
 {
     if (blasmode)
     {
-        #if defined(GGML_USE_CUDA) || defined(GGML_USE_VULKAN)
+        if(kcpp_backend_check(KCPP_BACKENDS_USE_CUDA "|vulkan"))
             return kcpp_data->n_blasthreads;
-        #else
+        else
             return std::min(kcpp_data->n_blasthreads, 4);
-        #endif
     }
     return kcpp_data->n_threads;
 }
@@ -4899,21 +5383,25 @@ static void PrepareMediaEmbds(const int nctx, const std::vector<int> & media_int
         int introsize = media_intro.size();
         int outrosize = media_outro.size();
         last_media_mem.clear();
+        media_object_token_counts.clear();
 
         for(int i=0;i<media_objects.size();++i)
         {
             std::string media_obj = media_objects[i].b64data;
             const std::vector<uint8_t> media_data_buffer = kcpp_base64_decode(media_obj);
             mtmd::bitmap bitmap(media_objects[i].is_audio
-                ? mtmd_helper_bitmap_init_from_buf(mtmd_ctx, media_data_buffer.data(), media_data_buffer.size(),false).bitmap
+                ? mtmd_helper_bitmap_init_from_buf(mtmd_ctx, media_data_buffer.data(), media_data_buffer.size(), false, mtmd_helper_init_opt_default()).bitmap
                 : kcpp_mtmd_bitmap_init_image_from_buf(media_data_buffer.data(), media_data_buffer.size(), vision_max_res));
             if(!bitmap.ptr)
             {
+                media_object_token_counts.push_back(0);
                 printf("\nError: MTMD media %d failed to load!",i);
                 continue;
             }
+            const auto * marker = mtmd_default_marker();
             mtmd_input_text inp_txt = {
-                mtmd_default_marker(),
+                marker,
+                strlen(marker),
                 /* add_special */ false,
                 /* parse_special */ true,
             };
@@ -4922,6 +5410,7 @@ static void PrepareMediaEmbds(const int nctx, const std::vector<int> & media_int
             int32_t tokenized = mtmd_tokenize(mtmd_ctx, chunks.ptr.get(), &inp_txt, bitmaps.data(), bitmaps.size());
             if(tokenized != 0)
             {
+                media_object_token_counts.push_back(0);
                 media_composite_image_signature = ""; //force invalidate
                 printf("\nError: MTMD media %d failed to tokenize! (status %d)",i, tokenized);
                 continue;
@@ -4984,18 +5473,21 @@ static void PrepareMediaEmbds(const int nctx, const std::vector<int> & media_int
             }
             if(mediatokensneeded>0 && mediatokensneeded < nctx)
             {
+                media_object_token_counts.push_back(mediatokensneeded);
                 int tokcnt = mediatokensneeded;
                 if(i==0)
                 {
                     tokcnt += introsize + outrosize;
                 }
+                const int media_token = kcpp_media_token_for_index(i);
                 for(int n=0;n<tokcnt;++n)
                 {
-                    last_media_mem.push_back(current_media_identifier);
+                    last_media_mem.push_back(media_token);
                 }
             }
             else
             {
+                media_object_token_counts.push_back(0);
                 media_composite_image_signature = ""; //force invalidate
                 printf("\nWarning: Media excluded - Context size too low or not enough mtmd tokens! (needed %d)\nMedia will be IGNORED! You probably want to relaunch with a larger context size!\n",mediatokensneeded);
             }
@@ -5248,11 +5740,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     std::vector<int> media_intro; //added before media list
     std::vector<int> media_outro; //added before media list
     std::string intro = "\nAttached Media:\n";
-    if(mtmd_ctx && kcpp_mtmd_is_gemma4uv(mtmd_ctx)) //ugly fix for gemma4uv vision coherency
-    {
-        intro = "\n<|channel><channel|>" + intro;
-    }
-    TokenizeString(intro, media_intro, file_format, true);
+
+    TokenizeString(intro, media_intro, file_format, false);
 
     //clear previous run media memory, just-in-time free
     for(int i=0;i<media_objects.size();++i)
@@ -5438,6 +5927,17 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                 end = "<|END_THINKING|>";
                  budget_exceeded = "\n(Reasoning budget exceeded)\nTime to respond now.\n<|END_THINKING|>";
                 break;
+            case llm_arch::LLM_ARCH_MISTRAL3:
+                start = "[THINK]";
+                end = "[/THINK]";
+                budget_exceeded = "\n(Reasoning budget exceeded)\nTime to respond now.\n[/THINK]";
+                break;
+            case llm_arch::LLM_ARCH_MUSE_GLIMMER:
+                start = " to=self<|message|>";
+                end = "<|eom|>";
+                budget_exceeded = "\n(Reasoning budget exceeded)\nTime to respond now.\n<|eom|>";
+                expected_start_tokens = 3;
+                break;
             default:
                 break;
         }
@@ -5505,6 +6005,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     if(media_composite_image_signature=="")
     {
         last_media_mem.clear();
+        media_object_token_counts.clear();
     }
     if(media_data_changed)
     {
@@ -5512,7 +6013,21 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         media_embds_built = true;
     }
 
-    TokenizeString(kcpp_data->prompt, embd_inp, file_format, add_bos_token);
+    bool media_inserted_inline = false;
+    if(last_media_mem.size()>0)
+    {
+        media_inserted_inline = kcpp_tokenize_prompt_with_inline_media(
+            kcpp_data->prompt,
+            embd_inp,
+            file_format,
+            add_bos_token,
+            inputs.images_len,
+            inputs.audio_len);
+    }
+    if(!media_inserted_inline)
+    {
+        TokenizeString(kcpp_data->prompt, embd_inp, file_format, add_bos_token);
+    }
     if(addedmemory!="")
     {
         TokenizeString(addedmemory, embd_inp_mem, file_format, add_bos_token);
@@ -5525,6 +6040,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         std::vector<int> bos;
         TokenizeString("", bos, file_format, add_bos_token);
         int offset = embd_inp.size() - nctx + kcpp_data->n_predict;
+        offset = kcpp_adjust_media_truncation_start(embd_inp, offset);
         embd_inp = std::vector<int>(embd_inp.begin() + offset, embd_inp.end());
         //replace bos into front if exists
         if(bos.size()>0 && embd_inp.size()>0)
@@ -5533,7 +6049,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         }
     }
 
-    if(last_media_mem.size()>0) //stick the media placeholders before the added mem
+    if(last_media_mem.size()>0 && !media_inserted_inline) //stick the media placeholders before the added mem if no inline placeholders were found
     {
         if(last_media_mem.size() + kcpp_data->n_predict + 4 > nctx)
         {
@@ -5844,6 +6360,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     {
         bool triggersc = kcpp_data->use_smartcontext;
         bool triggerff = kcpp_data->use_fastforward;
+        std::vector<int> embd_inp_before_fastforward;
+        bool attempted_fastforward = false;
         if(!blank_prompt) //special case for blank prompts, no fast forward or shifts
         {
             int ff_swa_retain_amount = 0; //a hack for SWA to improve coherency for illegal rewinds
@@ -5868,6 +6386,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
             }
             if(triggerff)
             {
+                embd_inp_before_fastforward = embd_inp;
+                attempted_fastforward = true;
                 ContextFastForward(current_context_tokens, embd_inp, n_past, last_n_tokens, nctx, smartcontext, triggersc, false, 4, ff_swa_retain_amount);
             }
         }
@@ -5879,16 +6399,42 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
             }
             else
             {
-                llama_memory_seq_rm(llama_get_memory(llama_ctx_v4), 0, n_past, -1);
+                bool kv_trim_ok = llama_memory_seq_rm(llama_get_memory(llama_ctx_v4), 0, n_past, -1);
+                if(!kv_trim_ok && attempted_fastforward)
+                {
+                    llama_memory_clear(llama_get_memory(llama_ctx_v4),true);
+                    embd_inp = embd_inp_before_fastforward;
+                    n_past = 0;
+                    std::fill(last_n_tokens.begin(), last_n_tokens.end(), 0);
+                    if(debugmode==1 && !is_quiet)
+                    {
+                        printf("\nNote: KV cache could not be rewound for prompt reuse; reprocessing full prompt instead.\n");
+                    }
+                }
             }
             if(draft_ctx)
             {
-                llama_memory_seq_rm(llama_get_memory(draft_ctx), 0, n_past, -1);
+                if(n_past==0)
+                {
+                    llama_memory_clear(llama_get_memory(draft_ctx),true);
+                }
+                else if(!llama_memory_seq_rm(llama_get_memory(draft_ctx), 0, n_past, -1) && attempted_fastforward)
+                {
+                    llama_memory_clear(llama_get_memory(llama_ctx_v4),true);
+                    llama_memory_clear(llama_get_memory(draft_ctx),true);
+                    embd_inp = embd_inp_before_fastforward;
+                    n_past = 0;
+                    std::fill(last_n_tokens.begin(), last_n_tokens.end(), 0);
+                    if(debugmode==1 && !is_quiet)
+                    {
+                        printf("\nNote: Draft KV cache could not be rewound for prompt reuse; reprocessing full prompt instead.\n");
+                    }
+                }
             }
         }
     }
 
-    bool blasmode = (embd_inp.size() >= 32 && kcpp_cpu_has_blas() && kcpp_data->n_batch>=32);
+    bool blasmode = (embd_inp.size() >= 32 && kcpp_backend_check(KCPP_BACKENDS_BLAS) && kcpp_data->n_batch>=32);
 
     if(current_context_tokens.size()>n_past)
     {
@@ -6115,8 +6661,13 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     evalres = draft_results.draft_success;
                     if(debugmode==1 && !is_quiet)
                     {
+                        if(!evalres)
+                        {
+                            kcpp_flush_log_output();
+                        }
                         std::string draftedtoks = get_tok_vec_str(draft_results.draftids);
                         printf("\nDrafted %d Tokens: [%s]\n",draft_results.drafted_amount,draftedtoks.c_str());
+                        fflush(stdout);
                     }
                 }
             }
@@ -6187,7 +6738,9 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
 
             if (!evalres)
             {
+                kcpp_flush_log_output();
                 fprintf(stderr, "\nFailed to predict at token position %d! Check your context buffer sizes!\n",n_past);
+                fflush(stderr);
                 media_composite_image_signature = ""; //force invalidate
                 output.text = nullptr;
                 output.status = 0;
@@ -6275,7 +6828,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
             int draft_accepted_this_round = 0;
             if(draft_used)
             {
-                logits_to_sample = draft_results.drafted_amount;
+                logits_to_sample = draft_results.drafted_amount + 1;
             }
             while(logits_sampled<logits_to_sample && remaining_tokens>0 && !abort_draft && !early_abort)
             {
@@ -6401,20 +6954,28 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
 
                 if(draft_used)
                 {
-                    int32_t draftedid = draft_results.draftids[logits_sampled];
-                    if(debugmode==1 && !is_quiet)
+                    if(logits_sampled < draft_results.drafted_amount)
                     {
-                        std::string drafttok = FileFormatTokenizeID(draftedid, file_format, true);
-                        std::string realtok = FileFormatTokenizeID(id, file_format, true);
-                        printf("(Draft %d/%d): Predicted=%d (%s), Actual=%d (%s) [%s]\n",(logits_sampled+1),logits_to_sample,draftedid,drafttok.c_str(),id,realtok.c_str(),(draftedid==id?"PASS":"FAIL"));
+                        int32_t draftedid = draft_results.draftids[logits_sampled];
+                        if(debugmode==1 && !is_quiet)
+                        {
+                            std::string drafttok = FileFormatTokenizeID(draftedid, file_format, true);
+                            std::string realtok = FileFormatTokenizeID(id, file_format, true);
+                            printf("(Draft %d/%d): Predicted=%d (%s), Actual=%d (%s) [%s]\n",(logits_sampled+1),draft_results.drafted_amount,draftedid,drafttok.c_str(),id,realtok.c_str(),(draftedid==id?"PASS":"FAIL"));
+                        }
+                        if(draftedid!=id) //draft mismatch, abort
+                        {
+                            draft_failures += 1;
+                            abort_draft = true;
+                        } else {
+                            draft_successes += 1;
+                            draft_accepted_this_round += 1;
+                        }
                     }
-                    if(draftedid!=id) //draft mismatch, abort
+                    else if(debugmode==1 && !is_quiet)
                     {
-                        draft_failures += 1;
-                        abort_draft = true;
-                    } else {
-                        draft_successes += 1;
-                        draft_accepted_this_round += 1;
+                        std::string realtok = FileFormatTokenizeID(id, file_format, true);
+                        printf("(Draft Bonus): Actual=%d (%s)\n",id,realtok.c_str());
                     }
                 }
 
@@ -6459,6 +7020,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                 if (startedsampling && allow_regular_prints)
                 {
                     printf("\rGenerating (%d / %d tokens)", (kcpp_data->n_predict - remaining_tokens), kcpp_data->n_predict);
+                    fflush(stdout);
                 }
                 if(debugmode==1 && !is_quiet && top_picks_history.size()>0)
                 {
@@ -6654,7 +7216,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
             while ((int)embd_inp.size() > input_consumed)
             {
                 int currtoken = embd_inp[input_consumed];
-                if(currtoken==MEDIA_TOKEN_IDENTIFIER_A || currtoken==MEDIA_TOKEN_IDENTIFIER_B) //special media token hit
+                int curr_media_index = kcpp_media_index_from_token(currtoken);
+                if(curr_media_index >= 0) //special media token hit
                 {
                     if(!media_embds_built) //this should never happen! however, handle it anyway
                     {
@@ -6675,7 +7238,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                         int mediatokensevaled = 0;
                         int introsize = media_intro.size();
                         int outrosize = media_outro.size();
-                        while(input_consumed < embd_inp.size() && (embd_inp[input_consumed]==MEDIA_TOKEN_IDENTIFIER_A || embd_inp[input_consumed]==MEDIA_TOKEN_IDENTIFIER_B))
+                        while(input_consumed < embd_inp.size() && embd_inp[input_consumed]==currtoken)
                         {
                             if (!last_n_tokens.empty())
                             {
@@ -6686,10 +7249,15 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                             ++input_consumed;
                             ++mediatokenscounted;
                         }
-                        for(int i=0;i<media_objects.size();++i)
+                        bool include_media_header = false;
+                        if(curr_media_index == 0 && curr_media_index < (int) media_object_token_counts.size())
+                        {
+                            include_media_header = (mediatokenscounted == media_object_token_counts[curr_media_index] + introsize + outrosize);
+                        }
+                        if(curr_media_index < (int) media_objects.size())
                         {
                             //note: no handling for draft_ctx as we don't support vision for it
-                            if(introsize>0 && i==0)
+                            if(include_media_header && introsize>0)
                             {
                                 //added at the start of everything
                                 kcpp_embd_batch batch = kcpp_embd_batch(media_intro, n_past, use_mrope, false);
@@ -6706,10 +7274,10 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                 mediatokensevaled += introsize;
                             }
 
-                            int start_size = media_objects[i].chunk_start_seq.size();
+                            int start_size = media_objects[curr_media_index].chunk_start_seq.size();
                             if (start_size > 0) {
                                 //add a separator between each image
-                                kcpp_embd_batch batch = kcpp_embd_batch(media_objects[i].chunk_start_seq, n_past, use_mrope, false);
+                                kcpp_embd_batch batch = kcpp_embd_batch(media_objects[curr_media_index].chunk_start_seq, n_past, use_mrope, false);
                                 auto evr = llama_decode(llama_ctx_v4, batch.batch);
                                 if(evr!=0)
                                 {
@@ -6723,12 +7291,12 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                 mediatokensevaled += start_size;
                             }
 
-                            for(int j=0;j<media_objects[i].mediachunks.size();++j)
+                            for(int j=0;j<media_objects[curr_media_index].mediachunks.size();++j)
                             {
-                                media_chunk chunk = media_objects[i].mediachunks[j];
+                                media_chunk chunk = media_objects[curr_media_index].mediachunks[j];
                                 if(allow_regular_prints)
                                 {
-                                    printf("\rProcessing Media Embedding %d (%d tokens)",(i+1), chunk.clp_image_tokens);
+                                    printf("\rProcessing Media Embedding %d (%d tokens)",(curr_media_index+1), chunk.clp_image_tokens);
                                 }
                                 bool err = kcpp_eval_media(llama_ctx_v4,chunk,kcpp_data->n_batch,&n_past);
                                 mediatokensevaled += chunk.clp_image_tokens;
@@ -6746,10 +7314,10 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                 }
                             }
 
-                            int end_size = media_objects[i].chunk_end_seq.size();
+                            int end_size = media_objects[curr_media_index].chunk_end_seq.size();
                             if (end_size > 0) {
                                 //add a separator between each image
-                                kcpp_embd_batch batch = kcpp_embd_batch(media_objects[i].chunk_end_seq, n_past, use_mrope, false);
+                                kcpp_embd_batch batch = kcpp_embd_batch(media_objects[curr_media_index].chunk_end_seq, n_past, use_mrope, false);
                                 auto evr = llama_decode(llama_ctx_v4, batch.batch);
                                 if(evr!=0)
                                 {
@@ -6763,7 +7331,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                 mediatokensevaled += end_size;
                             }
                         }
-                        if(media_objects.size()>0 && outrosize>0)
+                        if(include_media_header && media_objects.size()>0 && outrosize>0)
                         {
                             //added after all media but before prompt
                             kcpp_embd_batch batch = kcpp_embd_batch(media_outro, n_past, use_mrope, false);
@@ -6999,6 +7567,12 @@ bool gpttype_load_state_kv(int slot)
         if (savestates[slot].current_savestate_buffer.empty()) {
             return false;
         }
+        if(draft_ctx && savestates[slot].current_draft_savestate_size>0)
+        {
+            llama_memory_clear(llama_get_memory(draft_ctx),true);
+            auto res2 = llama_state_set_data(draft_ctx, savestates[slot].current_draft_savestate_buffer.data(), savestates[slot].current_draft_savestate_size);
+            printf("\nKV Load DraftSaveState %d: Restored KV with %zu tokens.\n", slot,current_context_tokens.size());
+        }
         llama_memory_clear(llama_get_memory(llama_ctx_v4),true);
         auto res = llama_state_set_data(llama_ctx_v4, savestates[slot].current_savestate_buffer.data(), savestates[slot].current_savestate_size);
         if(res > 0)
@@ -7006,12 +7580,6 @@ bool gpttype_load_state_kv(int slot)
             current_context_tokens = savestates[slot].savestate_context_tokens;
             loaded_latest_logits = savestates[slot].latest_logits;
             printf("\nKV Load SaveState %d: Restored KV with %zu tokens.\n", slot,current_context_tokens.size());
-            if(draft_ctx && savestates[slot].current_draft_savestate_size>0)
-            {
-                llama_memory_clear(llama_get_memory(draft_ctx),true);
-                auto res2 = llama_state_set_data(draft_ctx, savestates[slot].current_draft_savestate_buffer.data(), savestates[slot].current_draft_savestate_size);
-                printf("\nKV Load DraftSaveState %d: Restored KV with %zu tokens.\n", slot,current_context_tokens.size());
-            }
             touch_slot(slot);
         }
         return (res > 0);
