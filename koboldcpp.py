@@ -36,17 +36,18 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Tuple
+from typing import Any, Dict, Optional, Tuple
 import shutil
 import subprocess
 import gzip
 import queue
 
 # constants
+num_server_threads = 40
 sampler_order_max = 7
 tensor_split_max = 16
-images_max = 16
-audio_max = 16
+images_max = 64
+audio_max = 64
 bias_min_value = -100.0
 bias_max_value = 100.0
 logprobs_max = 10
@@ -61,10 +62,10 @@ default_vae_tile_threshold = 640
 default_sdvaedevice = 'main'
 default_sdclipdevice = 'CPU'
 default_native_ctx = 16384
-default_genlen = 1536
+default_genlen = 2048
 overridekv_max = 16
 default_autofit_padding = 1024
-lora_filenames_max = 4
+lora_filenames_max = 10
 multiuser_concurrent_limit = 10
 swa_padding_default = 0
 default_reqtimeout = 600 # 10 min default
@@ -78,7 +79,7 @@ dry_seq_break_max = 128
 extra_images_max = 4 # for kontext/qwen img
 
 # global vars
-KcppVersion = "1.115.2.yr0-gh-ROCm"
+KcppVersion = "1.120.yr0-gh-ROCm"
 showdebug = True
 kcpp_instance = None #global running instance
 global_memory = {"tunnel_url": "", "restart_target":"", "input_to_exit":False, "load_complete":False, "restart_override_base_config":"", "last_active_timestamp":datetime.now(), "triggered_sleeping":False, "current_model":"initial_model", "base_config":"", "swapReqType": None, "autoswapmode": False}
@@ -97,6 +98,9 @@ musicName = None
 imageName = None
 mmprojName = None
 lastgeneratedcomfyimg = b''
+lastgeneratedcachedimg = b''
+lastgeneratedcachedimgkey = b''
+currgenimgkey = ''
 lastuploadedcomfyimg = b''
 fullsdmodelpath = ""  #if empty, it's not initialized
 password = "" #if empty, no auth key required
@@ -180,10 +184,12 @@ zenity_recent_dir = os.getcwd()
 zenity_permitted = True
 default_rpc_port = 5551
 thinkformats = [{"start":"<|channel|>analysis<|message|>","end":"<|start|>assistant<|channel|>final<|message|>"},
+                {"start":" to=self<|message|>","end":"<|eom|><|start|>assistant"},
                 {"start":"<think>","end":"</think>"},
                 {"start":"<seed:think>","end":"</seed:think>"},
                 {"start":"<|START_THINKING|>","end":"<|END_THINKING|>"},
-                {"start":"<|channel>thought","end":"<channel|>"}]
+                {"start":"<|channel>thought","end":"<channel|>"},
+                {"start":"[THINK]","end":"[/THINK]"}]
 tool_call_pairs = [ #third element is optional str to match in chat template before we use this pair, fourth element is whether its stream-handleable
     ("<tool_call>", "</tool_call>", None, True), #qwen, glm
     ("<seed:tool_call>", "</seed:tool_call>", None, True), #seed oss
@@ -195,7 +201,49 @@ tool_call_pairs = [ #third element is optional str to match in chat template bef
     ("<|tool_call_start|>", "<|tool_call_end|>", "CONTINUE_FINAL_MESSAGE_TAG", True), #lfm2.5
     ("<tool_calls>", "</tool_calls>", "[BEGIN FINAL RESPONSE]", True), #apriel
     ("<|START_ACTION|>", "<|END_ACTION|>", "<|START_OF_TURN_TOKEN|>", True), #cohere
+    ("<atem:function_calls>", "</atem:function_calls>", "<|eom|>", True), #muse glimmer
 ]
+
+address_header_formats = [
+    {
+        "required": ["<|start|>assistant", " to=", "<|message|>", "<|eom|>"],
+        "pattern": r'(?s)(?:^|<\|start\|>assistant)\s*to=[^\s<]+<\|message\|>',
+        "tail_start_pattern": r'(?:^|<\|start\|>assistant)\s*to=[^\s<]*$',
+        "tail_message_pattern": r'(?:^|<\|start\|>assistant)\s*to=[^\s<]*',
+        "tail_message_tag": "<|message|>",
+    },
+]
+
+def active_address_header_formats():
+    global cached_chat_template
+    tmpl = cached_chat_template or ""
+    return [fmt for fmt in address_header_formats if all(item in tmpl for item in fmt["required"])]
+
+def strip_address_headers(text):
+    if not text:
+        return text
+    for fmt in active_address_header_formats():
+        text = re.sub(fmt["pattern"], '', text)
+    return text
+
+def split_address_header_tail(text, stream_done=False):
+    if not text or stream_done:
+        return text, ""
+    tail = ""
+    for fmt in active_address_header_formats():
+        start_match = re.search(fmt["tail_start_pattern"], text)
+        msg_tail = fmt["tail_message_tag"]
+        for n in range(1, len(msg_tail)):
+            prefix = msg_tail[:n]
+            marker = re.search(fmt["tail_message_pattern"] + re.escape(prefix) + r'$', text)
+            if marker and len(text[marker.start():]) > len(tail):
+                tail = text[marker.start():]
+        if start_match and len(text[start_match.start():]) > len(tail):
+            tail = text[start_match.start():]
+    if tail:
+        return text[:-len(tail)], tail
+    return text, ""
+
 deprecated_keys = {
     "hordeconfig",
     "sdconfig",
@@ -272,6 +320,8 @@ class load_model_inputs(ctypes.Structure):
                 ("visionmaxtokens", ctypes.c_int),
                 ("use_mmap", ctypes.c_bool),
                 ("use_mlock", ctypes.c_bool),
+                ("use_direct_io", ctypes.c_bool),
+                ("no_host", ctypes.c_bool),
                 ("use_mtp", ctypes.c_bool),
                 ("use_smartcontext", ctypes.c_bool),
                 ("use_contextshift", ctypes.c_bool),
@@ -378,14 +428,12 @@ class generation_outputs(ctypes.Structure):
 class sd_load_model_inputs(ctypes.Structure):
     _fields_ = [("model_filename", ctypes.c_char_p),
                 ("executable_path", ctypes.c_char_p),
-                ("kcpp_main_device", ctypes.c_int),
+                ("backend", ctypes.c_char_p),
                 ("threads", ctypes.c_int),
                 ("quant", ctypes.c_int),
                 ("flash_attention", ctypes.c_bool),
-                ("offload_cpu", ctypes.c_bool),
+                ("params_backend", ctypes.c_char_p),
                 ("use_mmap", ctypes.c_bool),
-                ("kcpp_vae_device", ctypes.c_int),
-                ("kcpp_clip_device", ctypes.c_int),
                 ("diffusion_conv_direct", ctypes.c_bool),
                 ("vae_conv_direct", ctypes.c_bool),
                 ("taesd", ctypes.c_bool),
@@ -403,8 +451,10 @@ class sd_load_model_inputs(ctypes.Structure):
                 ("upscaler_filename", ctypes.c_char_p),
                 ("img_hard_limit", ctypes.c_int),
                 ("img_soft_limit", ctypes.c_int),
-                ("max_vram", ctypes.c_float),
+                ("max_vram", ctypes.c_char_p),
+                ("split_mode", ctypes.c_char_p),
                 ("stream_layers", ctypes.c_bool),
+                ("auto_fit", ctypes.c_bool),
                 ("devices_override", ctypes.c_char_p),
                 ("quiet", ctypes.c_bool),
                 ("debugmode", ctypes.c_int)]
@@ -414,6 +464,7 @@ class sd_generation_inputs(ctypes.Structure):
                 ("negative_prompt", ctypes.c_char_p),
                 ("init_images", ctypes.c_char_p),
                 ("mask", ctypes.c_char_p),
+                ("audio_data", ctypes.c_char_p),
                 ("extra_images_len", ctypes.c_int),
                 ("extra_images", ctypes.POINTER(ctypes.c_char_p)),
                 ("reverse_refimg", ctypes.c_bool),
@@ -430,6 +481,8 @@ class sd_generation_inputs(ctypes.Structure):
                 ("sample_method", ctypes.c_char_p),
                 ("scheduler", ctypes.c_char_p),
                 ("eta", ctypes.c_float),
+                ("extra_sample_args", ctypes.c_char_p),
+                ("ref_image_args", ctypes.c_char_p),
                 ("clip_skip", ctypes.c_int),
                 ("vid_req_frames", ctypes.c_int),
                 ("vid_fps", ctypes.c_int),
@@ -499,7 +552,9 @@ class tts_generation_inputs(ctypes.Structure):
                 ("custom_speaker_text", ctypes.c_char_p),
                 ("custom_speaker_data", ctypes.c_char_p),
                 ("reference_audio", ctypes.c_char_p),
-                ("speaker_instruction", ctypes.c_char_p)]
+                ("speaker_instruction", ctypes.c_char_p),
+                ("language", ctypes.c_char_p),
+                ("use_mp3", ctypes.c_bool)]
 
 class tts_generation_outputs(ctypes.Structure):
     _fields_ = [("status", ctypes.c_int),
@@ -934,6 +989,11 @@ def init_library():
     dir_path = getdirpath()
     abs_path = getabspath()
 
+    if os.name == 'posix' and "GGML_METAL_PATH_RESOURCES" not in os.environ:
+        metal_resource_path = os.path.join(dir_path, "kernels")
+        if os.path.isdir(metal_resource_path):
+            os.environ["GGML_METAL_PATH_RESOURCES"] = dir_path
+
     #add all potential paths
     if os.name=='nt':
         os.add_dll_directory(dir_path)
@@ -993,6 +1053,9 @@ def init_library():
     handle.token_count.restype = token_count_outputs
     handle.get_pending_output.restype = ctypes.c_char_p
     handle.get_chat_template.restype = ctypes.c_char_p
+    handle.parse_chat_tool_calls.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_bool]
+    handle.parse_chat_tool_calls.restype = ctypes.c_char_p
+
     handle.calc_new_state_kv.restype = ctypes.c_size_t
     handle.calc_new_state_tokencount.restype = ctypes.c_size_t
     handle.calc_old_state_kv.argtypes = [ctypes.c_int]
@@ -1012,6 +1075,12 @@ def init_library():
     handle.sd_upscale.restype = sd_generation_outputs
     handle.sd_get_info.argtypes = []
     handle.sd_get_info.restype = sd_info_outputs
+    handle.sd_abort_generation.argtypes = []
+    handle.sd_abort_generation.restype = None
+    handle.sd_get_ongoing_generation_info.argtypes = []
+    handle.sd_get_ongoing_generation_info.restype = sd_info_outputs
+    handle.sd_request_ongoing_generation_preview.argtypes = []
+    handle.sd_request_ongoing_generation_preview.restype = None
     handle.whisper_load_model.argtypes = [whisper_load_model_inputs]
     handle.whisper_load_model.restype = ctypes.c_bool
     handle.whisper_generate.argtypes = [whisper_generation_inputs]
@@ -1138,9 +1207,21 @@ def is_incomplete_utf8_sequence(byte_seq): #note, this will only flag INCOMPLETE
 def strip_base64_prefix(encoded_data):
     if not encoded_data:
         return ""
-    if encoded_data.startswith("data:image"):
+    if encoded_data.startswith("data:image") or encoded_data.startswith("data:audio"):
         encoded_data = encoded_data.split(',', 1)[-1]
     return encoded_data
+
+def get_audio_response_format(genparams, audio_data):
+    if audio_data.startswith(b"ID3") or audio_data[:2] == b"\xff\xfb" or audio_data[:2] == b"\xff\xf3" or audio_data[:2] == b"\xff\xf2":
+        return "mp3", "audio/mpeg"
+    if audio_data.startswith(b"RIFF") and audio_data[8:12] == b"WAVE":
+        return "wav", "audio/wav"
+    use_mp3 = genparams.get("use_mp3", False)
+    if isinstance(use_mp3, str):
+        use_mp3 = use_mp3.lower() in ("1", "true", "yes", "on")
+    if genparams.get("response_format") == "mp3" or use_mp3:
+        return "mp3", "audio/mpeg"
+    return "wav", "audio/wav"
 
 def fix_unquoted_keys(s: str) -> str:
     """
@@ -2011,6 +2092,8 @@ def load_model(model_filename):
     inputs.blasthreads = args.blasthreads
     inputs.use_mmap = args.usemmap
     inputs.use_mlock = args.usemlock
+    inputs.use_direct_io = args.usedirectio
+    inputs.no_host = False
     inputs.use_mtp = args.usemtp
     inputs.lora_filename = "".encode("UTF-8")
     inputs.lora_multiplier = args.loramult
@@ -2121,6 +2204,23 @@ def load_model(model_filename):
     ret = handle.load_model(inputs)
     return ret
 
+def coerce_ban_list(value):
+    # banned tokens/strings are consumed as a list of substrings. A bare string satisfies
+    # every operation there, but iterates character by character, banning single letters.
+    if not value:
+        return []
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if stripped.startswith('[') and stripped.endswith(']'): # a JSON array sent as a string, e.g. through gendefaults
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed]
+        except json.JSONDecodeError:
+            pass
+    return [value]
+
 def generate(genparams, stream_flag=False):
     global maxctx, args, currentusergenkey, totalgens, pendingabortkey
     default_adapter = {} if chatcompl_adapter is None else chatcompl_adapter
@@ -2185,8 +2285,8 @@ def generate(genparams, stream_flag=False):
         min_p = 0.002
     logit_biases = genparams.get('logit_bias', {})
     render_special = genparams.get('render_special', False)
-    banned_strings = genparams.get('banned_strings', []) # SillyTavern uses that name
-    banned_tokens = genparams.get('banned_tokens', banned_strings)
+    banned_strings = coerce_ban_list(genparams.get('banned_strings', [])) # SillyTavern uses that name
+    banned_tokens = coerce_ban_list(genparams.get('banned_tokens', banned_strings))
     bypass_eos_token = genparams.get('bypass_eos', False)
     tool_call_fix = genparams.get('using_openai_tools', False)
     custom_token_bans = genparams.get('custom_token_bans', '')
@@ -2241,6 +2341,9 @@ def generate(genparams, stream_flag=False):
         reasoning_budget = tryparseint(0.5 * max_length,-1)  # 50% of gen amount
     else:
         pass #unrestricted
+
+    if reasoning_budget==-1 and genparams.get('thinking_budget_tokens',-1)!=-1: #lcpp compat thinking budget
+        reasoning_budget = genparams.get('thinking_budget_tokens',-1)
 
     inputs.max_context_length = max_context_length   # this will resize the context buffer if changed
     inputs.max_length = max_length
@@ -2397,7 +2500,7 @@ def continuous_batching_python_eligible(genparams, api_format):
     if model_path and not model_path.endswith(".gguf"):
         utfprint("Batching disabled due to file format",2)
         return False
-    if not getattr(args, "noshift", False) or getattr(args, "smartcontext", False) or getattr(args, "draftmodel", "") or getattr(args, "enableguidance", False):
+    if not getattr(args, "noshift", False) or getattr(args, "smartcontext", False) or getattr(args, "draftmodel", "") or getattr(args, "usemtp", False) or getattr(args, "enableguidance", False):
         utfprint("Batching disabled due to loaded settings",2)
         return False
     if genparams.get("negative_prompt") or genparams.get("images") or genparams.get("audio"):
@@ -2531,9 +2634,26 @@ def sd_resolve_device(name, default_=-1):
         name = str(max(name, -2))
     return sd_get_device_number(name)
 
+def sd_get_device_override(deviceid, module=''):
+    '''formats a device id and a module name in sd.cpp --backend syntax'''
+    global cached_sd_info
+    devices = cached_sd_info.get('devices', [])
+    device_name = ''
+    if deviceid <= -2:
+        device_name = "CPU"
+    elif deviceid >= 0 and deviceid < len(devices):
+        device_name = devices[deviceid]['name']
+    if device_name and module:
+        result = module + '=' + device_name
+    else:
+        result = device_name
+    return result
+
 def sd_load_model(model_filename,vae_filename,t5xxl_filename,clip1_filename,clip2_filename,photomaker_filename,upscaler_filename,audio_vae_filename):
-    global args
+    global args, cached_sd_info
     inputs = sd_load_model_inputs()
+    inputs = set_backend_props(inputs)
+    cached_sd_info = sd_get_info()
     inputs.model_filename = model_filename.encode("UTF-8")
     thds = args.threads
 
@@ -2545,10 +2665,14 @@ def sd_load_model(model_filename,vae_filename,t5xxl_filename,clip1_filename,clip
     inputs.threads = thds
     inputs.quant = args.sdquant
     inputs.flash_attention = args.sdflashattention
-    inputs.offload_cpu = args.sdoffloadcpu
+    inputs.params_backend = b'CPU' if args.sdoffloadcpu else b''
     inputs.use_mmap = args.usemmap
-    inputs.kcpp_vae_device = sd_resolve_device(args.sdvaedevice, default_sdvaedevice)
-    inputs.kcpp_clip_device = sd_resolve_device(args.sdclipdevice, default_sdclipdevice)
+    backends = [
+        sd_get_device_override(sd_resolve_device(args.sdmaingpu, 'main')),
+        sd_get_device_override(sd_resolve_device(args.sdclipdevice, default_sdclipdevice), 'CLIP'),
+        sd_get_device_override(sd_resolve_device(args.sdvaedevice, default_sdvaedevice), 'VAE'),
+    ]
+    inputs.backend = ','.join([b for b in backends if b]).encode("UTF-8")
     sdconvdirect = sd_convdirect_option(args.sdconvdirect)
     inputs.diffusion_conv_direct = sdconvdirect == 'full'
     inputs.vae_conv_direct = sdconvdirect in ['vaeonly', 'full']
@@ -2561,7 +2685,7 @@ def sd_load_model(model_filename,vae_filename,t5xxl_filename,clip1_filename,clip
     inputs.clip2_filename = clip2_filename.encode("UTF-8")
     inputs.photomaker_filename = photomaker_filename.encode("UTF-8")
     inputs.upscaler_filename = upscaler_filename.encode("UTF-8")
-    inputs.max_vram = (args.sdvramlimit/1024.0) if args.sdvramlimit > 0 else 0
+    inputs.max_vram = str((args.sdvramlimit/1024.0) if args.sdvramlimit > 0 else '').encode('UTF-8')
     inputs.stream_layers = False
 
     lora_filenames, lora_multipliers = prepare_initial_lora_multipliers()
@@ -2578,8 +2702,6 @@ def sd_load_model(model_filename,vae_filename,t5xxl_filename,clip1_filename,clip
 
     inputs.img_hard_limit = args.sdclamped
     inputs.img_soft_limit = args.sdclampedsoft
-    inputs = set_backend_props(inputs)
-    inputs.kcpp_main_device = sd_resolve_device(args.sdmaingpu, 'main')
     ret = handle.sd_load_model(inputs)
     return ret
 
@@ -2592,6 +2714,24 @@ def sd_oai_transform_params(genparams):
         height = int(match.group(2))
         genparams["width"] = width
         genparams["height"] = height
+    return genparams
+
+def sd_oai_transform_edit_params(genparams):
+    genparams = sd_oai_transform_params(genparams)
+    images = genparams.pop("image", None)
+    if images is None:
+        images = genparams.pop("image[]", None)
+    if images and not isinstance(images, list):
+        images = [images]
+    images = [img for img in (images or []) if img]
+    if images:
+        genparams["init_images"] = []
+        extra_images = genparams.get("extra_images", images)
+        if not isinstance(extra_images, list):
+            extra_images = [extra_images]
+        genparams["extra_images"] = extra_images
+    if not genparams.get("denoising_strength"):
+        genparams["denoising_strength"] = 0.6
     return genparams
 
 def sd_comfyui_tranform_params(genparams):
@@ -2701,6 +2841,8 @@ def gendefaults_parse_meta_field(value):
         # match sd.cpp flag
         'cache-option': 'cache_options',
         'cache_option': 'cache_options',
+        'extra-sample-args': 'extra_sample_args',
+        'ref-image-args': 'ref_image_args',
     }
     parsed = parse_json_object(value, 'gendefaults') or {}
     result = {}
@@ -2847,7 +2989,7 @@ def sd_generate(genparams):
     negative_prompt = genparams.get("negative_prompt", "")
     def build_prompt(prompt, forced):
         # truncate before the forced prompt to ensure it can't be "pushed away" by long inputs
-        prompt = prompt.encode('utf-8')[:2048].decode("UTF-8", errors='ignore')
+        prompt = prompt.encode('utf-8')[:3000].decode("UTF-8", errors='ignore') #for now, limit sd image gen prompts to 3000 chars
         return ", ".join([prompt, forced])
     prompt = build_prompt(prompt, forced_posprompt)
     negative_prompt = build_prompt(negative_prompt, forced_negprompt)
@@ -2869,6 +3011,8 @@ def sd_generate(genparams):
         seed = random.randint(100000, 999999)
     sample_method = (genparams.get("sampler_name") or "default")
     scheduler = (genparams.get("scheduler") or "default").lower()
+    extra_sample_args = str(genparams.get("extra_sample_args") or "")
+    ref_image_args = str(genparams.get("ref_image_args") or "").strip()
     clip_skip = tryparseint(genparams.get("clip_skip", -1),-1)
     eta = tryparsefloat(genparams.get("eta", None), None)
     vid_req_frames = tryparseint(genparams.get("frames", 1),1)
@@ -2880,6 +3024,11 @@ def sd_generate(genparams):
     extra_images_arr = genparams.get("extra_images", [])
     extra_images_arr = ([] if not extra_images_arr else extra_images_arr)
     extra_images_arr = [img for img in extra_images_arr if img not in (None, "")]
+
+    audio_data = next((img for img in extra_images_arr if img.startswith("data:audio")), None)
+    extra_images_arr = [img for img in extra_images_arr if not img.startswith("data:audio")]
+    audio_data = strip_base64_prefix(audio_data)
+
     extra_images_arr = extra_images_arr[:extra_images_max]
     lora_filenames, lora_multipliers = prepare_lora_multipliers(genparams.get("lora", []))
 
@@ -2906,6 +3055,7 @@ def sd_generate(genparams):
     inputs.negative_prompt = negative_prompt.encode("UTF-8")
     inputs.init_images = init_images.encode("UTF-8")
     inputs.mask = "".encode("UTF-8") if not mask else mask.encode("UTF-8")
+    inputs.audio_data = "".encode("UTF-8") if not audio_data else audio_data.encode("UTF-8")
     inputs.extra_images_len = len(extra_images_arr)
     inputs.extra_images = (ctypes.c_char_p * inputs.extra_images_len)()
     for n, estr in enumerate(extra_images_arr):
@@ -2928,11 +3078,13 @@ def sd_generate(genparams):
     inputs.sample_method = sd_sampler_canonical_name(sample_method).encode("UTF-8")
     inputs.scheduler = scheduler.encode("UTF-8")
     inputs.eta = -1.0 if eta is None else eta
+    inputs.extra_sample_args = extra_sample_args.encode("UTF-8")
     inputs.clip_skip = clip_skip
     inputs.vid_req_frames = vid_req_frames
     inputs.vid_fps = vid_fps
     inputs.video_output_type = video_output_type
     inputs.remove_limits = allow_remove_limits
+    inputs.ref_image_args = ref_image_args.encode("UTF-8")
     inputs.circular_x = tryparseint(adapter_obj.get("circular_x", genparams.get("circular_x",0)),0)
     inputs.circular_y = tryparseint(adapter_obj.get("circular_y", genparams.get("circular_y",0)),0)
     inputs.cache_mode = cache_mode.encode("UTF-8")
@@ -2957,6 +3109,119 @@ def sd_generate(genparams):
     info["job_timestamp"] = job_timestamp
     return {"animated": animated, "data":data_main, "data_extra":data_extra, "final_frame":final_frame, "info": info}
 
+def sd_get_ongoing_generation_info():
+    info = handle.sd_get_ongoing_generation_info()
+    if info.status == 0:
+        try:
+            return json.loads(info.data)
+        except Exception:
+            print("An error occurred while decoding sd ongoing generation info")
+    else:
+        print("An error occurred while getting sd ongoing generation info")
+    return {}
+
+def parse_query_bool(parsed_dict, key, default=False):
+    value = parsed_dict.get(key, [default])
+    if isinstance(value, list):
+        value = value[0] if value else default
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    value = str(value).strip().lower()
+    if value in ('1', 'true', 'yes', 'on'):
+        return True
+    if value in ('0', 'false', 'no', 'off'):
+        return False
+    return default
+
+def build_a1111_progress_response(
+    status: str,
+    step_count: int = 0,
+    total_steps: int = 0,
+    elapsed_time: float = 0.0,
+    current_image: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Maps generation state from the backend to the AUTOMATIC1111 ProgressResponse format.
+
+    :param status: one of 'idle', 'conditioning', 'diffusing', 'vae'
+    :param step_count: current sampling step
+    :param total_steps: total sampling steps for the job
+    :param elapsed_time: seconds since the generation started
+    :param current_image: base64 encoded string of the preview image, or None
+    """
+
+    # "idle" state signature from A1111
+    progress = 0.0
+    eta_relative = 0.0
+    state = {
+        "job_count": 0,
+        "job_no": 0,
+        "sampling_step": 0,
+        "sampling_steps": 0,
+        "interrupted": False,
+        "skipped": False
+    }
+    textinfo = None
+
+    if status != 'idle':
+
+        # single job (queue is client-side)
+        state["job_count"] = 1
+        state["job_no"] = 0
+        state["sampling_step"] = step_count
+        state["sampling_steps"] = total_steps
+
+        # calculate progress estimate: fixed portion allocated to conditioning,
+        # and decoding estimate based on the total number of steps
+        conditioning_progress = 0.03
+        decoding_steps = 0.8
+        effective_total = total_steps + decoding_steps
+
+        progress_per_step = (1.0 - conditioning_progress) / effective_total if effective_total > 0 else 0.0
+
+        if status == 'conditioning':
+            # A1111 sets progress to > 0.0 during initialization to show activity
+            # and avoid dividing by zero in the ETA calculation later.
+            progress = conditioning_progress
+            textinfo = "Status: conditioning"
+        elif status == 'diffusing':
+            progress = conditioning_progress + (step_count * progress_per_step)
+            textinfo = f"Status: diffusing, Step: {step_count}/{total_steps}"
+        elif status == 'decoding':
+            # A1111 sets this as a fixed 0.99, but we keep it proportional
+            progress = conditioning_progress + (total_steps * progress_per_step)
+            textinfo = "Status: decoding"
+        else:
+            # shouldn't happen
+            progress = 0.99
+
+        # note A1111 caps progress below 1.0 until the final image is actually
+        # returned by the blocking txt2img endpoint, preventing the progress bar
+        # from jumping to 100% early
+
+        eta_relative = (elapsed_time / progress) - elapsed_time
+
+    return {
+        "progress": round(progress, 4),
+        "eta_relative": round(eta_relative, 2),
+        "state": state,
+        "current_image": current_image,
+        "textinfo": textinfo
+    }
+
+def a1111_progress_response(preview=False):
+    if preview:
+        handle.sd_request_ongoing_generation_preview()
+    status = sd_get_ongoing_generation_info()
+    result = build_a1111_progress_response(
+        status.get('status', 0),
+        status.get('step', 0),
+        status.get('steps', 1),
+        status.get('elapsed_time', 0),
+        preview and status.get('preview') or None)
+    return result
 
 def whisper_load_model(model_filename):
     global args
@@ -3041,6 +3306,7 @@ def tts_generate(genparams):
     speaker_json = tts_prepare_voice_json(genparams.get("speaker_json","")) #handle custom json voices
     voicestr = genparams.get("voice", genparams.get("speaker_wav", ""))
     oai_voicemap = ["alloy","onyx","echo","nova","shimmer"] # map to kcpp defaults
+    q3tts_voicemap = ["aiden","serena","ono_anna","ryan","sohee","eric","dylan","vivian","uncle_fu"]
     voice_mapping = voicelist
     normalized_voice = voicestr.strip().lower() if voicestr else ""
     if normalized_voice.endswith(".wav"):
@@ -3049,15 +3315,21 @@ def tts_generate(genparams):
         voice = voice_mapping.index(normalized_voice) + 1
     elif normalized_voice in oai_voicemap:
         voice = oai_voicemap.index(normalized_voice) + 1
+    elif normalized_voice in q3tts_voicemap:
+        voice = q3tts_voicemap.index(normalized_voice) + 1
     else:
         voice = simple_lcg_hash(voicestr.strip()) if voicestr else 1
     inputs = tts_generation_inputs()
     inputs.custom_speaker_voice = normalized_voice.encode("UTF-8")
     ttsinstruction = genparams.get("instruction", "")
+    ttslang = genparams.get("language", "en")
     # if no instruction provided, extract from text
     if not genparams.get("instruction", ""):
         prompt, ttsinstruction = tts_extract_instruction(prompt)
     inputs.speaker_instruction = ttsinstruction.encode("UTF-8")
+    inputs.language = ttslang.encode("UTF-8")
+    response_format_mp3 = True if (genparams.get("response_format")=="mp3") else False
+    inputs.use_mp3 = genparams.get("use_mp3", response_format_mp3)
     inputs.prompt = prompt.encode("UTF-8")
     inputs.speaker_seed = voice
     aseed = -1
@@ -3146,7 +3418,8 @@ def music_generate_codes(genparams):
     inputs = music_generation_inputs()
     inputs.is_planner_mode = True
     inputs.stereo = genparams.get('stereo', True)
-    inputs.use_mp3 = genparams.get('use_mp3', False)
+    response_format_mp3 = True if (genparams.get("response_format")=="mp3") else False
+    inputs.use_mp3 = genparams.get("use_mp3", response_format_mp3)
     inputs.gen_codes =  genparams.get('gen_codes', False)
     inputs.rewrite_caption =  genparams.get('rewrite_caption', True)
     inputs.input_json = input_json.encode("UTF-8")
@@ -3164,7 +3437,8 @@ def music_generate_audio(genparams):
     inputs = music_generation_inputs()
     inputs.is_planner_mode = False
     inputs.stereo = genparams.get('stereo', True)
-    inputs.use_mp3 = genparams.get('use_mp3', False)
+    response_format_mp3 = True if (genparams.get("response_format")=="mp3") else False
+    inputs.use_mp3 = genparams.get("use_mp3", response_format_mp3)
     inputs.gen_codes =  genparams.get('gen_codes', False)
     inputs.rewrite_caption =  genparams.get('rewrite_caption', True)
     inputs.input_json = input_json.encode("UTF-8")
@@ -3213,13 +3487,13 @@ def websearch(query):
         return []
     query = query[:300] # only search first 300 chars, due to search engine limits
     if query==websearch_lastquery:
-        print("Returning cached websearch...")
+        print("\nReturning cached websearch...")
         return websearch_lastresponse
     import difflib
     from html.parser import HTMLParser
     num_results = 3
     searchresults = []
-    utfprint("Performing new websearch...",1)
+    utfprint("\nPerforming new websearch...",1)
 
     def fetch_searched_webpage(url, random_agent=False):
         from urllib.parse import quote, urlsplit, urlunsplit
@@ -3513,6 +3787,28 @@ def coerce_tool_argtypes(tool_calls: list, tool_list: list) -> list:
 def toolcall_to_normalized_json(text,start_tag,end_tag,required_match_txt): #convert weird formats into standard tool call json
     global cached_chat_template
     text = text.strip()
+    def parse_muse_glimmer(text: str) -> str:
+        results = []
+        for invoke in re.finditer(
+            r'<atem:invoke\s+name=["\']?([^"\'>\s]+)["\']?>(.*?)</atem:invoke>',
+            text, re.DOTALL
+        ):
+            fn_name = invoke.group(1).strip()
+            params = {}
+            for p in re.finditer(
+                r'<atem:parameter\s+name=["\']?([^"\'>\s]+)["\']?>(.*?)</atem:parameter>',
+                invoke.group(2), re.DOTALL
+            ):
+                val = p.group(2)
+                try:
+                    params[p.group(1).strip()] = json.loads(val)
+                except Exception:
+                    params[p.group(1).strip()] = val
+            results.append({"name": fn_name, "arguments": params})
+        if not results:
+            return text
+        return json.dumps(results) if len(results) > 1 else json.dumps(results[0])
+
     def parse_qwen35(text: str) -> str:
         fn_match = re.search(r"<function=(.*?)>", text)
         if not fn_match:
@@ -3695,6 +3991,9 @@ def toolcall_to_normalized_json(text,start_tag,end_tag,required_match_txt): #con
     if "<invoke " in text: #minimax
         return parse_minimax(text)
 
+    if "<atem:invoke " in text: #muse glimmer
+        return parse_muse_glimmer(text)
+
     if '<｜tool▁sep｜>' in text: #deepseek
         return parse_deepseek_r1_sep(text)
 
@@ -3705,6 +4004,47 @@ def toolcall_to_normalized_json(text,start_tag,end_tag,required_match_txt): #con
         return parse_gpt_oss(text)
 
     return text #fallback
+
+def native_parse_toolcall_tags(text: str, genparams: dict) -> list:
+    global cached_chat_template, cached_jinja_kwargs
+    if not text or not genparams.get('using_openai_tools', False):
+        return []
+    tools = genparams.get('tools', [])
+    if not tools:
+        return []
+    try:
+        kwargs = dict(cached_jinja_kwargs or {})
+        user_kwargs = genparams.get("chat_template_kwargs")
+        if isinstance(user_kwargs, dict):
+            kwargs.update(user_kwargs)
+        if "reasoning_effort" in genparams and genparams["reasoning_effort"] is not None:
+            kwargs["reasoning_effort"] = genparams["reasoning_effort"]
+
+        tool_choice = genparams.get("tool_choice", "auto")
+        if isinstance(tool_choice, dict):
+            tool_choice = "required"
+        elif tool_choice is None:
+            tool_choice = "auto"
+        else:
+            tool_choice = str(tool_choice)
+
+        raw = handle.parse_chat_tool_calls(
+            text.encode("UTF-8"),
+            json.dumps(tools).encode("UTF-8"),
+            (cached_chat_template or "").encode("UTF-8"),
+            json.dumps(kwargs).encode("UTF-8"),
+            tool_choice.encode("UTF-8"),
+            True,
+            False)
+        if not raw:
+            return []
+        parsed = json.loads(ctypes.string_at(raw).decode("UTF-8", "ignore"))
+        if not isinstance(parsed, list):
+            return []
+        parsed = [normalize_tool_call_resp(obj) for obj in parsed if isinstance(obj, dict)]
+        return coerce_tool_argtypes(parsed, tools)
+    except Exception:
+        return []
 
 def repack_toolcall_tags(text: str, original_tools:list):
     global thinkformats, tool_call_pairs
@@ -3761,28 +4101,26 @@ def format_jinja(messages_orig, tools, chat_template_kwargs=None):
         for m in messages:
             if m.get("content") is None:
                 m["content"] = ""
+            # strip mcp image b64 from tool string content so it isn't rendered as text (image is swept out separately)
+            elif m.get("role", "") == "tool" and isinstance(m.get("content"), str):
+                m["content"] = strip_mcpcontent_of_media(m["content"])
         # fix image placeholders, erase them and slap a reference onto the turn text message
         mediacount = 1
         for m in messages:
             if isinstance(m.get("content"), list):
                 normalized = []
                 turn_text = ""
-                media_text = ""
                 for item in m["content"]:
                     if item.get("type")=="text":
                         turn_text += item.get("text","")
-                for item in m["content"]:
-                    if item.get("type")=="text":
-                        pass
                     elif item.get("type")=="image_url" or item.get("type")=="image":
-                        media_text += f"\n(Attached Image {mediacount})\n"
+                        turn_text += f"\n(Attached Image {mediacount})\n"
                         mediacount += 1
                     elif item.get("type")=="input_audio":
-                        media_text += f"\n(Attached Audio {mediacount})\n"
+                        turn_text += f"\n(Attached Audio {mediacount})\n"
                         mediacount += 1
                     else:
                         normalized.append(item)
-                turn_text = media_text + turn_text
                 if turn_text:
                     normalized.append({"type": "text","text": turn_text})
                 m["content"] = normalized
@@ -3876,6 +4214,29 @@ def normalize_tool_call_resp(obj): # Normalize various tool call formats to Open
             }
 
     return obj
+
+def convert_tool_calls_to_ollama(tool_calls):
+    ollama_tool_calls = []
+    for idx, tool_call in enumerate(tool_calls or []):
+        try:
+            func = tool_call.get("function", {})
+            args = func.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            ollama_tool_calls.append({
+                "type": "function",
+                "function": {
+                    "index": idx,
+                    "name": func.get("name", ""),
+                    "arguments": args
+                }
+            })
+        except Exception:
+            pass
+    return ollama_tool_calls
 
 # Used to parse json for openai tool calls
 def extract_json_from_string(input_string, check_strict=False):
@@ -3994,6 +4355,28 @@ def strip_oaicontent_of_media(oaicontent):
         return outarr
     return oaicontent
 
+def get_base64_from_media_data(data):
+    if isinstance(data, str) and data.startswith("data:") and "," in data:
+        return data.split(",", 1)[1]
+    return data
+
+def sweep_media_from_mcpcontent(mcpcontentstr):
+    images = []
+    try:
+        if isinstance(mcpcontentstr, str):
+            mcp_pl = json.loads(mcpcontentstr)
+            if isinstance(mcp_pl, dict) and isinstance(mcp_pl.get("content",None),list):
+                for item in mcp_pl.get("content",[]):
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type","")=="image":
+                        data = get_base64_from_media_data(item.get("data",""))
+                        if data:
+                            images.append(data)
+    except Exception:
+        pass
+    return images
+
 def strip_mcpcontent_of_media(mcpcontentstr):
     try:
         if isinstance(mcpcontentstr, str):
@@ -4003,7 +4386,7 @@ def strip_mcpcontent_of_media(mcpcontentstr):
             if isinstance(mcp_pl, dict) and isinstance(mcp_pl.get("content",None),list):
                 pl_arr = mcp_pl.get("content",[])
                 for idx in range(len(pl_arr)):
-                    if pl_arr[idx].get("type","")=="image" and pl_arr[idx].get("data","")!="":
+                    if isinstance(pl_arr[idx], dict) and pl_arr[idx].get("type","")=="image" and pl_arr[idx].get("data","")!="":
                         pl_arr[idx]["data"] = "(base64 data attached)"
                         pl_modified = True
                 if pl_modified:
@@ -4045,7 +4428,10 @@ def determine_tool_json_to_use(genparams, curr_ctx, assistant_message_start, is_
         for message in reversed_messages:
             if message["role"] == "tool":
                 toolrespstr = message["content"]
-                # toolrespstr = strip_mcpcontent_of_media(toolrespstr)
+                if isinstance(toolrespstr, str):
+                    toolrespstr = strip_mcpcontent_of_media(toolrespstr)
+                else:
+                    toolrespstr = strip_oaicontent_of_media(toolrespstr)
                 tool_call_chunk.append(toolrespstr)
             else:
                 break
@@ -4154,23 +4540,22 @@ def sweep_media_from_messages(messages_array):
         curr_content = message.get("content", None)
         if isinstance(curr_content, list):
             for item in curr_content:
+                if not isinstance(item, dict):
+                    continue
                 if item.get("type") == "image_url":
                     url = item.get("image_url", {}).get("url", "")
                     if url.startswith("data:image"):
                         images.append(url.split(",", 1)[1])
+                elif item.get("type") == "image": #handle mcp image content blocks in a list
+                    data = item.get("data", "")
+                    if data:
+                        images.append(get_base64_from_media_data(data))
                 elif item.get("type") == "input_audio":
                     data = item.get("input_audio", {}).get("data")
                     if data:
                         audio.append(data)
         elif message.get("role", "")=="tool" and isinstance(curr_content, str): #handle mcp returned images
-            try:
-                mcp_pl = json.loads(curr_content)
-                if isinstance(mcp_pl, dict) and isinstance(mcp_pl.get("content",None),list):
-                    pl_arr = mcp_pl.get("content",[])
-                    if len(pl_arr)>0 and pl_arr[0].get("type","")=="image" and pl_arr[0].get("data","")!="":
-                        images.append(pl_arr[0].get("data",""))
-            except Exception:
-                pass
+            images.extend(sweep_media_from_mcpcontent(curr_content))
         imgs_ollama = message.get("images", None)
         if imgs_ollama:
             for img in imgs_ollama:
@@ -4245,7 +4630,7 @@ ws ::= | " " | "\n" [ \t]{0,20}
         # openai allows either a string or a list as a stop sequence
         if genparams.get('stop',[]) is not None:
             if isinstance(genparams.get('stop',[]), list):
-                genparams["stop_sequence"] = genparams.get('stop', [])
+                genparams["stop_sequence"] = genparams.get('stop', genparams.get('stop_sequence', []))
             else:
                 genparams["stop_sequence"] = [genparams.get('stop')]
 
@@ -4311,6 +4696,10 @@ ws ::= | " " | "\n" [ \t]{0,20}
                     copied_jinja_kwargs.update(user_chat_template_kwargs)
                 if "reasoning_effort" in genparams and genparams["reasoning_effort"] is not None:
                     copied_jinja_kwargs["reasoning_effort"] = genparams["reasoning_effort"]
+                if "enable_thinking" in copied_jinja_kwargs and not copied_jinja_kwargs["enable_thinking"]:
+                    copied_jinja_kwargs["reasoning_strength"] = "none"
+                elif "reasoning_effort" in copied_jinja_kwargs and copied_jinja_kwargs["reasoning_effort"]:
+                    copied_jinja_kwargs["reasoning_strength"] = copied_jinja_kwargs["reasoning_effort"]
                 jinja_output = format_jinja(messages_array,jinjatools,copied_jinja_kwargs)
             if jinja_output:
                 messages_string = jinja_output
@@ -4373,20 +4762,28 @@ ws ::= | " " | "\n" [ \t]{0,20}
                                 messages_string += "\n(Made a function call)\n"
                         pass  # do nothing
                     elif isinstance(curr_content, str):
-                        if latest_turn_was_tool and message_index < len(messages_array):
+                        if latest_turn_was_tool:
+                            images_added.extend(sweep_media_from_mcpcontent(curr_content))
                             curr_content = strip_mcpcontent_of_media(curr_content)
                         messages_string += curr_content
                     elif isinstance(curr_content, list): #is an array
                         for item in curr_content:
                             if isinstance(item, dict):
-                                if item['type']=="text":
+                                item_type = item.get("type", "")
+                                if item_type=="text":
                                         messages_string += item['text']
-                                elif item['type']=="image_url":
+                                elif item_type=="image_url":
                                     if 'image_url' in item and item['image_url'] and item['image_url']['url'] and item['image_url']['url'].startswith("data:image"):
                                         images_added.append(item['image_url']['url'].split(",", 1)[1])
                                         attachedimgid += 1
                                         messages_string += f"\n(Attached Image {attachedimgid})\n"
-                                elif item['type']=="input_audio":
+                                elif item_type=="image":
+                                    data = get_base64_from_media_data(item.get("data", ""))
+                                    if data:
+                                        images_added.append(data)
+                                        attachedimgid += 1
+                                        messages_string += f"\n(Attached Image {attachedimgid})\n"
+                                elif item_type=="input_audio":
                                     if 'input_audio' in item and item['input_audio'] and item['input_audio']['data']:
                                         audio_added.append(item['input_audio']['data'])
                                         attachedaudid += 1
@@ -4445,10 +4842,9 @@ ws ::= | " " | "\n" [ \t]{0,20}
             if len(audio_added)>0:
                 genparams["audio"] = audio_added
             if len(genparams.get('stop_sequence', []))==0: #only set stop seq if it wont overwrite existing
-                genparams["stop_sequence"] = [user_message_start.strip(),assistant_message_start.strip()]
+                genparams["stop_sequence"] = [user_message_start.strip()]
             else:
                 genparams["stop_sequence"].append(user_message_start.strip())
-                genparams["stop_sequence"].append(assistant_message_start.strip())
             if not used_tool_json and jinjatools and latest_turn_was_tool:
                 genparams["stop_sequence"].append("(Made a function call") # qol prevent fake toolcalls
             genparams["trim_stop"] = True
@@ -4705,7 +5101,7 @@ ws ::= | " " | "\n" [ \t]{0,20}
                     prompt = replace_last_in_string(prompt,"{{[OUTPUT]}}",assistant_message_gen)
                 elif "{{[OUTPUT]}}" in memory:
                     memory = replace_last_in_string(memory,"{{[OUTPUT]}}",assistant_message_gen)
-                elif assistant_message_start and prompt.rstrip().endswith(assistant_message_start):
+                elif assistant_message_start and not assistant_message_gen.endswith(assistant_message_start) and prompt.rstrip().endswith(assistant_message_start):
                     prompt = replace_last_in_string(prompt, assistant_message_start, assistant_message_gen)
             if "{{[INPUT_END]}}" in prompt or "{{[OUTPUT_END]}}" in prompt:
                 prompt = prompt.replace("{{[INPUT]}}", user_message_start)
@@ -4842,7 +5238,7 @@ class KcppProxyHandler(http.server.BaseHTTPRequestHandler):
         is_chat_completions_path = (clean_path.endswith('/v1/chat/completions') or clean_path=='/chat/completions')
 
         #any requests to the following endpoints is capable of waking the server
-        wake_requests = ["/api/extra/generate/stream","/api/extra/tokencount","/api/v1/generate","/sdapi/v1/interrogate","/v1/completions","/v1/chat/completions","/v1/responses","/completions","/chat/completions","/responses","/api/extra/transcribe","/v1/audio/transcriptions","/api/extra/tts","/v1/audio/speech","/api/extra/embeddings","/v1/embeddings","/api/extra/music/prepare","/api/extra/music/generate","/sdapi/v1/txt2img","/sdapi/v1/img2img","/sdapi/v1/upscale"]
+        wake_requests = ["/api/extra/generate/stream","/api/extra/tokencount","/api/v1/generate","/sdapi/v1/interrogate","/v1/completions","/v1/chat/completions","/v1/responses","/completions","/chat/completions","/responses","/api/extra/transcribe","/v1/audio/transcriptions","/api/extra/tts","/v1/audio/speech","/api/extra/embeddings","/v1/embeddings","/api/embed","/api/extra/music/prepare","/api/extra/music/generate","/images/generations","/v1/images/generations","/images/edits","/v1/images/edits","/sdapi/v1/txt2img","/sdapi/v1/img2img","/sdapi/v1/upscale"]
         is_wake_request = clean_path in wake_requests
 
         autoswapEnabled = global_memory["autoswapmode"] is not None and global_memory["autoswapmode"]
@@ -4866,11 +5262,11 @@ class KcppProxyHandler(http.server.BaseHTTPRequestHandler):
                     is_different_model = True
 
                 if is_different_model or was_auto_unloaded:
-                    model_switch_pass = True
                     whitelist = get_current_admindir_list() # see if its an allowed swap
                     if was_auto_unloaded and not model_name:
                         model_name = "initial_model"
-                    if is_different_model and (model_name in whitelist):
+                    if model_name and model_name != global_memory["current_model"] and (model_name in whitelist):
+                        model_switch_pass = True # only claim the request if we really are swapping
                         global_memory["last_active_timestamp"] = datetime.now()
                         global_memory["triggered_sleeping"] = False
                         reqbody = json.dumps({"filename":model_name})
@@ -4894,9 +5290,9 @@ class KcppProxyHandler(http.server.BaseHTTPRequestHandler):
                 textReqs = ["/api/extra/generate/stream","/api/extra/tokencount","/api/v1/generate","/sdapi/v1/interrogate","/v1/completions","/v1/chat/completions","/v1/responses","/completions","/chat/completions","/responses"]
                 sttReqs = ["/api/extra/transcribe","/v1/audio/transcriptions"]
                 ttsReqs = ["/api/extra/tts", "/v1/audio/speech"]
-                embedReqs = ["/api/extra/embeddings", "/v1/embeddings"]
+                embedReqs = ["/api/extra/embeddings", "/v1/embeddings", "/api/embed"]
                 musicReqs = ["/api/extra/music/prepare","/api/extra/music/generate"]
-                imageReqs = ["/sdapi/v1/txt2img", "/sdapi/v1/img2img", "/sdapi/v1/upscale"] # "/sdapi/v1/sd-models", "/sdapi/v1/options", "/sdapi/v1/samplers"
+                imageReqs = ["/images/generations", "/v1/images/generations", "/images/edits", "/v1/images/edits", "/sdapi/v1/txt2img", "/sdapi/v1/img2img", "/sdapi/v1/upscale"] # "/sdapi/v1/sd-models", "/sdapi/v1/options", "/sdapi/v1/samplers"
 
                 swapModeChanged = False
                 if any(clean_path.endswith(e) for e in textReqs) and (global_memory["swapReqType"] is None or global_memory["swapReqType"] != "text"):
@@ -5117,6 +5513,58 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             print(f"File Upload Process Error: {e}")
             return result
 
+    def extract_multipart_formdata(self, body):
+        result = {"fields": {}, "files": {}}
+        try:
+            content_type = self.headers.get('content-type', '') or self.headers.get('Content-Type', '')
+            boundary_match = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', content_type, flags=re.IGNORECASE)
+            if not boundary_match:
+                return result
+            boundary = (boundary_match.group(1) or boundary_match.group(2) or "").strip()
+            if not boundary:
+                return result
+            delimiter = ("--" + boundary).encode()
+            for part in body.split(delimiter):
+                part = part.strip(b"\r\n")
+                if not part or part == b"--":
+                    continue
+                if part.endswith(b"--"):
+                    part = part[:-2].rstrip(b"\r\n")
+                header_end = part.find(b"\r\n\r\n")
+                if header_end < 0:
+                    continue
+                header_text = part[:header_end].decode("utf-8", errors="ignore")
+                content = part[header_end + 4:]
+                if content.endswith(b"\r\n"):
+                    content = content[:-2]
+                name_match = re.search(r'Content-Disposition[^;]*;.*\bname=(?:"([^"]+)"|([^;\s]+))', header_text, flags=re.IGNORECASE)
+                if not name_match:
+                    continue
+                name = name_match.group(1) or name_match.group(2)
+                filename_match = re.search(r'\bfilename=(?:"([^"]*)"|([^;\s]*))', header_text, flags=re.IGNORECASE)
+                if filename_match:
+                    file_data_base64 = base64.b64encode(content).decode("utf-8", "ignore")
+                    result["files"].setdefault(name, []).append(file_data_base64)
+                else:
+                    result["fields"][name] = content.decode("utf-8", errors="ignore").strip()
+            return result
+        except Exception as e:
+            print(f"Multipart FormData Process Error: {e}")
+            return result
+
+    def extract_oai_image_edit_formdata(self, body):
+        formdata = self.extract_multipart_formdata(body)
+        genparams = dict(formdata.get("fields", {}))
+        files = formdata.get("files", {})
+        images = []
+        for key in ("image", "image[]"):
+            images.extend(files.get(key, []))
+        if images:
+            genparams["image"] = images
+        if files.get("mask"):
+            genparams["mask"] = files["mask"][0]
+        return genparams
+
     def prepare_basic_responses_body(self,resp_id,genparams):
         global friendlymodelname
         global autoswapmode, textName, sttName, ttsName, embedName, musicName, imageName, mmprojName
@@ -5184,6 +5632,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             genout = run_blocking()
 
         recvtxt = genout['text']
+        if recvtxt is not None and not isinstance(recvtxt, str):
+            recvtxt = recvtxt.decode("UTF-8", "ignore") if isinstance(recvtxt, bytes) else str(recvtxt)
         prompttokens = genout['prompt_tokens'] if genout['prompt_tokens'] > 0 else 0
         comptokens = genout['completion_tokens'] if genout['completion_tokens'] > 0 else 0
         currfinishreason = "error" if (genout['stopreason'] == -2) else ("length" if (genout['stopreason'] != 1) else "stop")
@@ -5201,34 +5651,6 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             last_non_horde_req_time = time.time()
 
         utfprint("\nOutput: " + recvtxt,1)
-
-        #tool calls resolution
-        tool_calls = []
-        if api_format == 4 or api_format == 2 or api_format == 8 or api_format == 9:
-            using_openai_tools = genparams.get('using_openai_tools', False)
-            if using_openai_tools:
-                # first, check and potentially segment multiple tags for multi-tool calls
-                tool_calls = repack_toolcall_tags(recvtxt,genparams.get('tools', []))
-                if tool_calls and len(tool_calls)>0:
-                    flat = []
-                    for obj in tool_calls:
-                        if isinstance(obj, list):
-                            flat.extend(obj)
-                        else:
-                            flat.append(obj)
-                    tool_calls = [normalize_tool_call_resp(obj) for obj in flat]
-                    for tc in tool_calls:
-                        tcarg = tc.get("function",{}).get("arguments",None)
-                        tc["id"] = f"call_{random.randint(10000, 99999)}"
-                        if tcarg is not None and not isinstance(tcarg, str):
-                            tc["function"]["arguments"] = json.dumps(tcarg)
-                    recvtxt = None
-                    currfinishreason = "tool_calls"
-                    utfprint(f"\nExecute Toolcall: {json.dumps(tool_calls)}",1)
-
-        modelNameToReturn = friendlymodelname
-        if autoswapmode and textName is not None:
-            modelNameToReturn = textName
 
         #handle potential think tags, but only chat completions will return them. the others just drop them
         reasoningtxt = ""
@@ -5248,6 +5670,41 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                         reasoningtxt = parts[0]
                         recvtxt = parts[1]
                         break
+
+        #tool calls resolution
+        tool_calls = []
+        if api_format == 4 or api_format == 2 or api_format == 7 or api_format == 8 or api_format == 9:
+            using_openai_tools = genparams.get('using_openai_tools', False)
+            if using_openai_tools:
+                # first, let llama.cpp's chat parser handle known template-specific tool formats
+                tool_calls = native_parse_toolcall_tags(recvtxt, genparams)
+                # fallback: check and potentially segment multiple tags for multi-tool calls
+                if not tool_calls:
+                    tool_calls = repack_toolcall_tags(recvtxt,genparams.get('tools', []))
+                if tool_calls and len(tool_calls)>0:
+                    flat = []
+                    for obj in tool_calls:
+                        if isinstance(obj, list):
+                            flat.extend(item for item in obj if isinstance(item, dict))
+                        elif isinstance(obj, dict):
+                            flat.append(obj)
+                    tool_calls = [normalize_tool_call_resp(obj) for obj in flat]
+                    tool_calls = [tc for tc in tool_calls if isinstance(tc, dict) and isinstance(tc.get("function", None), dict) and tc["function"].get("name")]
+                if tool_calls and len(tool_calls)>0:
+                    for tc in tool_calls:
+                        tcarg = tc.get("function",{}).get("arguments",None)
+                        tc["id"] = f"call_{random.randint(10000, 99999)}"
+                        if tcarg is not None and not isinstance(tcarg, str):
+                            tc["function"]["arguments"] = json.dumps(tcarg)
+                    recvtxt = None
+                    currfinishreason = "tool_calls"
+                    utfprint(f"\nExecute Toolcall: {json.dumps(tool_calls)}",1)
+        if recvtxt:
+            recvtxt = strip_address_headers(recvtxt)
+
+        modelNameToReturn = friendlymodelname
+        if autoswapmode and textName is not None:
+            modelNameToReturn = textName
         if api_format == 1:
             res = {"data": {"seqs": [recvtxt]}}
         elif api_format == 3:
@@ -5270,7 +5727,11 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             tokarr = tokenize_ids(oldprompt+recvtxt,False)
             res = {"model": modelNameToReturn,"created_at": str(datetime.now(timezone.utc).isoformat()),"response":recvtxt,"done": True,"done_reason":currfinishreason,"context": tokarr,"total_duration": 1,"load_duration": 1,"prompt_eval_count": prompttokens,"prompt_eval_duration": 1,"eval_count": comptokens,"eval_duration": 1}
         elif api_format == 7:
-            res = {"model": modelNameToReturn,"created_at": str(datetime.now(timezone.utc).isoformat()),"message":{"role":"assistant","content":recvtxt},"done": True,"done_reason":currfinishreason,"total_duration": 1,"load_duration": 1,"prompt_eval_count": prompttokens,"prompt_eval_duration": 1,"eval_count": comptokens,"eval_duration": 1}
+            ccmsg = {"role":"assistant","content":recvtxt or ""}
+            ollama_tool_calls = convert_tool_calls_to_ollama(tool_calls)
+            if ollama_tool_calls:
+                ccmsg["tool_calls"] = ollama_tool_calls
+            res = {"model": modelNameToReturn,"created_at": str(datetime.now(timezone.utc).isoformat()),"message":ccmsg,"done": True,"done_reason":currfinishreason,"total_duration": 1,"load_duration": 1,"prompt_eval_count": prompttokens,"prompt_eval_duration": 1,"eval_count": comptokens,"eval_duration": 1}
         elif api_format == 8: #oai-responses
             resp_id = f"resp-A{genparams.get('oai_uniqueid', 1)}"
             output_item_id = f"msg_0{genparams.get('oai_uniqueid', 1)}"
@@ -5357,6 +5818,10 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(f'data: {data}\n\n'.encode())
         self.wfile.flush()
 
+    async def send_ollama_stream_event(self, data):
+        self.wfile.write(f'{data}\n'.encode())
+        self.wfile.flush()
+
     async def handle_sse_stream(self, genparams, api_format):
         global friendlymodelname, currfinishreason, thinkformats, tool_call_pairs, cached_chat_template
         global autoswapmode, textName, sttName, ttsName, embedName, musicName, imageName, mmprojName
@@ -5373,7 +5838,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.send_header("cache-control", "no-cache")
         self.send_header("connection", "keep-alive")
-        self.end_headers(content_type='text/event-stream')
+        stream_content_type = 'application/x-ndjson' if api_format == 6 or api_format == 7 else 'text/event-stream'
+        self.end_headers(content_type=stream_content_type)
 
         # if tools, do not send anything else - OAI tool calls will be handled with fakestreaming!
         # only exception is if we know the exact toolcall tag to segment!
@@ -5385,7 +5851,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 tool_segment_tag = start
                 break
         jinjatools = (args.jinja and args.jinja_tools)
-        if (api_format == 4 or api_format == 9) and using_openai_tools:
+        if (api_format == 4 or api_format == 7 or api_format == 9) and using_openai_tools:
             if not jinjatools or not tool_segment_tag:
                 genparams['sync_toolcall_stream_ineligible'] = True
                 return
@@ -5477,11 +5943,31 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                     if sindex != -1 and trim_str!="":
                                         tokenStr = tokenStr[:sindex]
 
+                            tokenStr, address_header_tail = split_address_header_tail(tokenStr, streamDone)
+                            if address_header_tail:
+                                tokenReserve += address_header_tail
+                                if tokenStr == "":
+                                    await asyncio.sleep(async_sleep_short)
+                                    continue
+
                         sync_potential_toolcall_splitmatch = ""
                         if tokenStr!="" or streamDone:
+                            if (api_format == 4 or api_format == 7 or api_format == 9) and using_openai_tools and tool_segment_tag and not streamDone and not genparams.get("sync_toolcall_potential_triggered", False) and tool_segment_tag not in tokenStr:
+                                tail = ""
+                                for n in range(1, len(tool_segment_tag)):
+                                    prefix = tool_segment_tag[:n]
+                                    if tokenStr.endswith(prefix) and len(prefix) > len(tail):
+                                        tail = prefix
+                                if tail:
+                                    tokenReserve += tail
+                                    tokenStr = tokenStr[:-len(tail)]
+                                    if tokenStr == "":
+                                        await asyncio.sleep(async_sleep_short)
+                                        continue
+
                             # Tool boundary detection for tool-capable chat completions.
                             # if triggered, stop real streaming, and let the buffered fakestreaming take over
-                            if (api_format == 4 or api_format == 9) and using_openai_tools:
+                            if (api_format == 4 or api_format == 7 or api_format == 9) and using_openai_tools:
                                 tokenStr = tokenReserve + tokenStr
                                 tokenReserve = ""
                                 if tool_segment_tag in tokenStr:
@@ -5510,7 +5996,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                             if pair["end"] in out2:
                                                 out2 = out2.replace(pair["end"], "")
                                             if out2:
-                                                delta['content'] = out2
+                                                delta['content'] = strip_address_headers(out2)
                                             break
                                     if not foundend:
                                         # Still thinking - swallow extraneous start tags from THIS pair only
@@ -5547,7 +6033,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                                 delta['reasoning_content'] = out2_think
                                                 # Append anything after the end tag to the content part
                                                 if out2_content:
-                                                    delta['content'] = delta.get('content', '') + out2_content
+                                                    delta['content'] = delta.get('content', '') + strip_address_headers(out2_content)
                                             matched_start = True
                                             break
                                     # Condition C: No start tag found, just normal text
@@ -5557,10 +6043,10 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                         # Only swallow stray end tags if we've already locked in a pair
                                         if len(thinkpairs) == 1 and thinkpairs[0]["end"] in cleaned:
                                             cleaned = cleaned.replace(thinkpairs[0]["end"], "")
-                                        delta['content'] = cleaned
+                                        delta['content'] = strip_address_headers(cleaned)
                                 encap_first_loop = False
                             else:
-                                delta['content'] = tokenStr
+                                delta['content'] = strip_address_headers(tokenStr)
 
                             if genparams.get("sync_toolcall_potential_triggered",False) and delta: # if sync_toolcall_potential_triggered, buffer up the impending content chunk for tools in fakestreaming, in case toolcalls fail
                                 ec = genparams.get("sync_toolcall_extra_content","")
@@ -5591,6 +6077,16 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                 elif api_format == 3:  # non chat completions
                                     event_str = json.dumps({"id":cmpl_id,"object":"text_completion","created":int(time.time()),"model":modelNameToReturn,"choices":[{"index":0,"finish_reason":None,"text":tokenStr}]})
                                     await self.send_oai_sse_event(event_str)
+                                elif api_format == 6 or api_format == 7:
+                                    created_at = str(datetime.now(timezone.utc).isoformat())
+                                    ollama_content = ""
+                                    if api_format == 6:
+                                        event_str = json.dumps({"model":modelNameToReturn,"created_at":created_at,"response":tokenStr,"done":False})
+                                    else:
+                                        ollama_content = delta.get("content", tokenStr) if delta else tokenStr
+                                        event_str = json.dumps({"model":modelNameToReturn,"created_at":created_at,"message":{"role":"assistant","content":ollama_content},"done":False})
+                                    if api_format == 6 or ollama_content:
+                                        await self.send_ollama_stream_event(event_str)
                                 elif api_format == 9:
                                     if anthropic_first_loop:
                                         await self.send_anthropic_sse_event("message_start", json.dumps({"type":"message_start","message":{"type":"message","id":f"msg_A{req_id_suffix}","role":"assistant","model":modelNameToReturn,"usage":{"input_tokens":prompttokens,"output_tokens":0}}}))
@@ -5634,6 +6130,28 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                     await self.send_oai_sse_event(addonstr)
                                 event_str = json.dumps({"id":cmpl_id,"object":"text_completion","created":int(time.time()),"model":modelNameToReturn,"choices":[{"index":0,"finish_reason":currfinishreason,"text":tokenStr}]})
                                 await self.send_oai_sse_event(event_str)
+                            elif api_format == 6 or api_format == 7: # Ollama newline-delimited JSON streaming
+                                created_at = str(datetime.now(timezone.utc).isoformat())
+                                ollama_content = delta.get("content", tokenStr) if api_format == 7 and delta else tokenStr
+                                if tokenStr and (api_format == 6 or ollama_content):
+                                    if api_format == 6:
+                                        event_str = json.dumps({"model":modelNameToReturn,"created_at":created_at,"response":tokenStr,"done":False})
+                                    else:
+                                        event_str = json.dumps({"model":modelNameToReturn,"created_at":created_at,"message":{"role":"assistant","content":ollama_content},"done":False})
+                                    await self.send_ollama_stream_event(event_str)
+                                if streamDone:
+                                    prompttokens = batch_final_result.prompt_tokens if using_batch_stream else handle.get_last_input_count()
+                                    completion_tokens = current_token
+                                    final_chunk = {"model":modelNameToReturn,"created_at":created_at,"done":True,"done_reason":currfinishreason,"total_duration":1,"load_duration":1,"prompt_eval_count":prompttokens,"prompt_eval_duration":1,"eval_count":completion_tokens,"eval_duration":1}
+                                    if api_format == 6:
+                                        finalraw = handle.batch_generate_pending_output(batch_request_id) if using_batch_stream else handle.get_pending_output()
+                                        finaltxt = finalraw.decode("UTF-8", "ignore")
+                                        oldprompt = genparams.get('ollamabodyprompt', "")
+                                        final_chunk["response"] = ""
+                                        final_chunk["context"] = tokenize_ids(oldprompt+finaltxt,False)
+                                    else:
+                                        final_chunk["message"] = {"role":"assistant","content":""}
+                                    await self.send_ollama_stream_event(json.dumps(final_chunk))
                             elif api_format == 8: #oai-responses
                                 resp_id = f"resp-A{genparams.get('oai_uniqueid', 1)}"
                                 item_id = f"msg_0{genparams.get('oai_uniqueid', 1)}"
@@ -5759,7 +6277,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.close_connection = True
         await asyncio.sleep(0.05)
 
-    async def monitor_connection(self): #Poll the socket to detect client disconnection during prompt processing
+    async def monitor_connection(self, cancel_fn): #Poll the socket to detect client disconnection
         import select
         loop = asyncio.get_event_loop()
         def check_connection_closed():
@@ -5769,7 +6287,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 if exceptional:
                     return True
                 if readable:
-                    data = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+                    dontwait = getattr(socket, "MSG_DONTWAIT", 0)
+                    data = sock.recv(1, socket.MSG_PEEK | dontwait)
                     if len(data) == 0:
                         return True
                 return False
@@ -5782,7 +6301,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 if disconnected:
                     if args.debugmode:
                         print("\nClient disconnected unexpectedly, aborting...")
-                    handle.abort_generate()
+                    cancel_fn()
                     return
             except Exception:
                 return
@@ -5797,7 +6316,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             generate_task = asyncio.create_task(self.generate_text(genparams, api_format, stream_flag))
             tasks.append(generate_task)
             if stream_flag:
-                monitor_task = asyncio.create_task(self.monitor_connection())
+                monitor_task = asyncio.create_task(self.monitor_connection(handle.abort_generate))
             await asyncio.gather(*tasks)
             generate_result = generate_task.result()
             return generate_result
@@ -5808,6 +6327,31 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             await asyncio.sleep(0.1) #short delay
         except Exception as e:
             print(e)
+        finally:
+            if monitor_task and not monitor_task.done():
+                monitor_task.cancel()
+                try:
+                    await monitor_task
+                except asyncio.CancelledError:
+                    pass
+
+    async def handle_image_request(self, generate_fn, param, cancel_fn):
+        monitor_task = None
+        try:
+            if cancel_fn:
+                monitor_task = asyncio.create_task(self.monitor_connection(cancel_fn))
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, generate_fn, param)
+            return result
+        except (BrokenPipeError, ConnectionAbortedError) as cae: # attempt to abort if connection lost
+            print("An ongoing connection was aborted or interrupted!")
+            print(cae)
+            if cancel_fn:
+                cancel_fn()
+            await asyncio.sleep(0.1) #short delay
+        except Exception as e:
+            print(e)
+            raise
         finally:
             if monitor_task and not monitor_task.done():
                 monitor_task.cancel()
@@ -6018,7 +6562,7 @@ Change Mode<br>
     def do_GET(self):
         global embedded_kailite, embedded_kcpp_docs, embedded_kcpp_sdui, embedded_kailite_gz, embedded_kcpp_docs_gz, embedded_kcpp_sdui_gz, embedded_lcpp_ui_gz, embedded_musicui, embedded_musicui_gz
         global last_req_time, start_time, cached_chat_template, cached_sd_info, has_vision_support, has_audio_support, has_whisper, friendlymodelname
-        global savedata_obj, has_multiplayer, multiplayer_turn_major, multiplayer_turn_minor, multiplayer_story_data_compressed, multiplayer_dataformat, multiplayer_lastactive, maxctx, maxhordelen, friendlymodelname, lastuploadedcomfyimg, lastgeneratedcomfyimg, KcppVersion, totalgens, preloaded_story, exitcounter, currentusergenkey, friendlysdmodelname, fullsdmodelpath, password, friendlyembeddingsmodelname, voicelist
+        global savedata_obj, has_multiplayer, multiplayer_turn_major, multiplayer_turn_minor, multiplayer_story_data_compressed, multiplayer_dataformat, multiplayer_lastactive, maxctx, maxhordelen, friendlymodelname, lastuploadedcomfyimg, lastgeneratedcomfyimg, lastgeneratedcachedimg, lastgeneratedcachedimgkey, currgenimgkey, KcppVersion, totalgens, preloaded_story, exitcounter, currentusergenkey, friendlysdmodelname, fullsdmodelpath, password, friendlyembeddingsmodelname, voicelist
         global autoswapmode, textName, sttName, ttsName, embedName, musicName, imageName, mmprojName
 
         clean_path = self.path.split("?")[0] #for cases where we do not want query params
@@ -6030,6 +6574,13 @@ Change Mode<br>
             return None
 
         clean_path = clean_path.rstrip('/')
+        if clean_path=="/mcp":
+            self.send_response(405)
+            self.send_header('allow', 'POST')
+            self.send_header('content-length', '0')
+            self.end_headers(content_type='application/json')
+            return
+
         response_body = None
         content_type = 'application/json'
         content_encoding = None
@@ -6164,11 +6715,11 @@ Change Mode<br>
             if autoswapmode and textName is not None:
                 modelNameToReturn = textName
 
-            mlist = [{"id":modelNameToReturn,"object":"model","created":int(time.time()),"owned_by":"koboldcpp","permission":[],"root":"koboldcpp"}]
+            mlist = [{"id":modelNameToReturn,"object":"model","created":int(time.time()),"owned_by":"koboldcpp","status":{"value":"loaded"},"permission":[],"root":"koboldcpp"}]
             if args.routermode:
                 alist = get_current_admindir_list()
                 for itm in alist:
-                    mlist.append({"id":itm,"object":"model","created":int(time.time()),"owned_by":"koboldcpp","permission":[],"root":"koboldcpp"})
+                    mlist.append({"id":itm,"object":"model","created":int(time.time()),"owned_by":"koboldcpp","status":{"value":"loaded"},"permission":[],"root":"koboldcpp"})
             response_body = (json.dumps({"object":"list","data":mlist}).encode())
 
         elif clean_path.endswith('/sdapi/v1/loras'):
@@ -6204,8 +6755,6 @@ Change Mode<br>
                 response_body = (json.dumps([{"name":name,"label":name} for name in cached_sd_info.get('available_schedulers', [])]).encode())
         elif clean_path.endswith('/sdapi/v1/latent-upscale-modes'):
            response_body = (json.dumps([]).encode())
-        elif clean_path.endswith('/sdapi/v1/upscalers'):
-           response_body = (json.dumps([]).encode())
 
         #vits compatible
         elif clean_path=='/voice/check':
@@ -6238,7 +6787,7 @@ Change Mode<br>
             modelNameToReturn = friendlymodelname
             if autoswapmode and textName is not None:
                 modelNameToReturn = textName
-            response_body = (json.dumps({"models":[{"name":"koboldcpp","model":f"{modelNameToReturn}:latest","modified_at":"2024-07-19T15:26:55.6122841+08:00","expires_at": "2055-06-04T19:06:25.5433636+08:00","size":394998579,"size_vram":394998579,"digest":"b5dc5e784f2a3ee1582373093acf69a2f4e2ac1710b253a001712b86a61f88bb","details":{"parent_model":"","format":"gguf","family":"koboldcpp","families":["koboldcpp"],"parameter_size":"128M","quantization_level":"Q4_0"}},{"name":"koboldcpp","model":modelNameToReturn,"modified_at":"2025-01-01T01:00:00.0000000+00:00","expires_at": "2069-01-01T01:00:00.0000000+00:00","size":394998579,"size_vram":394998579,"digest":"b5dc5e784f2a3ee1582373093acf69a2f4e2ac1710b253a001712b86a61f88bb","details":{"parent_model":"","format":"gguf","family":"koboldcpp","families":["koboldcpp"],"parameter_size":"128M","quantization_level":"Q4_0"}}]}).encode())
+            response_body = (json.dumps({"models":[{"name":f"{modelNameToReturn}","model":f"{modelNameToReturn}:latest","modified_at":"2024-07-19T15:26:55.6122841+08:00","expires_at": "2055-06-04T19:06:25.5433636+08:00","size":394998579,"size_vram":394998579,"digest":"b5dc5e784f2a3ee1582373093acf69a2f4e2ac1710b253a001712b86a61f88bb","details":{"parent_model":"","format":"gguf","family":"koboldcpp","families":["koboldcpp"],"parameter_size":"128M","quantization_level":"Q4_0"}},{"name":modelNameToReturn,"model":modelNameToReturn,"modified_at":"2025-01-01T01:00:00.0000000+00:00","expires_at": "2069-01-01T01:00:00.0000000+00:00","size":394998579,"size_vram":394998579,"digest":"b5dc5e784f2a3ee1582373093acf69a2f4e2ac1710b253a001712b86a61f88bb","details":{"parent_model":"","format":"gguf","family":"koboldcpp","families":["koboldcpp"],"parameter_size":"128M","quantization_level":"Q4_0"}}]}).encode())
         elif clean_path.endswith('/api/version'): #ollama compatible, NOT the kcpp version
             response_body = (json.dumps({"version":"0.7.0"}).encode())
         elif clean_path=='/ping':
@@ -6264,6 +6813,24 @@ Change Mode<br>
         elif clean_path=='/view' or clean_path=='/view.png' or clean_path=='/api/view' or clean_path.startswith('/view_image'): #emulate comfyui
             content_type = 'image/png'
             response_body = lastgeneratedcomfyimg
+        elif clean_path.startswith('/sdapi/v1/get_last.png'):
+            parsed_url = urllib.parse.urlparse(self.path)
+            parsed_dict = urllib.parse.parse_qs(parsed_url.query)
+            genkey = parsed_dict.get('genkey', [''])[0]
+            if genkey and genkey==lastgeneratedcachedimgkey and lastgeneratedcachedimg:
+                content_type = 'image/png'
+                response_body = lastgeneratedcachedimg
+            else:
+                response_body = None
+        elif clean_path.startswith('/sdapi/v1/progress'):
+            parsed_url = urllib.parse.urlparse(self.path)
+            parsed_dict = urllib.parse.parse_qs(parsed_url.query)
+            genkey = parsed_dict.get('genkey', [''])[0]
+            skip_current_image = parse_query_bool(parsed_dict, 'skip_current_image')
+            # with no auth, reveal status without preview image
+            auth = bool(genkey and genkey==currgenimgkey)
+            info = a1111_progress_response(auth and not skip_current_image)
+            response_body = json.dumps(info).encode()
         elif clean_path=='/history' or clean_path=='/api/history' or clean_path.startswith('/api/history/') or clean_path.startswith('/history/'): #emulate comfyui
             modelNameToReturn = friendlysdmodelname
             if autoswapmode and imageName is not None:
@@ -6305,7 +6872,7 @@ Change Mode<br>
             mmprojOverride = False
             if autoswapmode and mmprojName is not None:
                 mmprojOverride = True
-            response_body = (json.dumps({
+            props_obj = {
                 "chat_template": cached_chat_template,
                 "id": 0,
 		        "id_task": -1,
@@ -6319,7 +6886,10 @@ Change Mode<br>
                 "default_generation_settings": {
                     "n_ctx": maxctx,
                 },
-            }).encode())
+            }
+            if args.routermode:
+                props_obj["role"] = "router"
+            response_body = (json.dumps(props_obj).encode())
 
         elif clean_path=="/slots":
             self.send_response(501)
@@ -6396,7 +6966,7 @@ Change Mode<br>
 
     def do_POST(self):
         global thinkformats
-        global modelbusy, batched_request_runner_count, requestsinqueue, currentusergenkey, totalgens, pendingabortkey, lastuploadedcomfyimg, lastgeneratedcomfyimg, multiplayer_turn_major, multiplayer_turn_minor, multiplayer_story_data_compressed, multiplayer_dataformat, multiplayer_lastactive, net_save_slots, has_vision_support, savestate_limit, mcp_lock
+        global modelbusy, batched_request_runner_count, requestsinqueue, currentusergenkey, totalgens, pendingabortkey, lastuploadedcomfyimg, lastgeneratedcomfyimg, lastgeneratedcachedimg, lastgeneratedcachedimgkey, currgenimgkey, multiplayer_turn_major, multiplayer_turn_minor, multiplayer_story_data_compressed, multiplayer_dataformat, multiplayer_lastactive, net_save_slots, has_vision_support, savestate_limit, mcp_lock
         global autoswapmode, textName, sttName, ttsName, embedName, musicName, imageName, mmprojName
         contlenstr = self.headers['content-length']
         content_length = 0
@@ -6765,13 +7335,18 @@ Change Mode<br>
                 return
             try:
                 tempbody = json.loads(body)
+                request_id = tempbody.get("id", None)
                 method = tempbody.get("method","")
-                if method == "initialize":
+                if request_id is None: # notifications do not get a JSON-RPC response
+                    response_code = 202
+                    response_body = b''
+                elif method == "initialize":
+                    requested_version = tempbody.get("params", {}).get("protocolVersion", "2024-11-05")
                     reply = {
                         "jsonrpc": "2.0",
-                        "id": random.randint(100000, 999999),
+                        "id": request_id,
                         "result": {
-                            "protocolVersion": "2024-11-05",
+                            "protocolVersion": requested_version if requested_version else "2024-11-05",
                             "capabilities": {"tools": {"listChanged": False}},
                             "serverInfo": {"name": "mcp-koboldcpp", "version": "1.0.0"},
                         },
@@ -6780,7 +7355,7 @@ Change Mode<br>
                 elif method == "tools/list":
                     reply = {
                         "jsonrpc": "2.0",
-                        "id": random.randint(100000, 999999),
+                        "id": request_id,
                         "result": {"tools": []},
                     }
                     with mcp_lock:
@@ -6804,14 +7379,13 @@ Change Mode<br>
                                     response_body = (json.dumps(mcpresp).encode())
                                     break
                     if not foundtool:
-                        response_code = 400
-                        response_body = (json.dumps({"error": {"code": -32700, "message": "Tool not found"}}).encode())
-                else: #probably a notify, send empty response
-                    response_body = (json.dumps({}).encode())
+                        response_body = (json.dumps({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "Tool not found"}}).encode())
+                else:
+                    response_body = (json.dumps({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found"}}).encode())
             except Exception as e:
                 print(f"MCP Call Error: {e}")
                 response_code = 400
-                response_body = (json.dumps({"error": {"code": -32700, "message": "Parse error"}}).encode())
+                response_body = (json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}).encode())
 
         elif clean_path=="/api/extra/shutdown":
             # if args.singleinstance:
@@ -6884,10 +7458,12 @@ Change Mode<br>
             is_imggen = False
             is_comfyui_imggen = False
             is_oai_imggen = False
+            is_oai_imgedit = False
             is_img_upscale = False
             is_transcribe = False
             is_tts = False
             is_embeddings = False
+            is_ollama_embeddings = False
             is_music_codes = False
             is_music_audio = False
             response_body = None
@@ -6982,18 +7558,22 @@ Change Mode<br>
                 api_format = 9
             elif clean_path.endswith('/sdapi/v1/extra-single-image') or clean_path.endswith('/sdapi/v1/upscale'):
                 is_img_upscale = True
-            elif clean_path=="/prompt" or clean_path=="/images/generations" or clean_path.endswith('/v1/images/generations') or clean_path.endswith('/sdapi/v1/txt2img') or clean_path.endswith('/sdapi/v1/img2img'):
+            elif clean_path=="/prompt" or clean_path=="/images/generations" or clean_path.endswith('/v1/images/generations') or clean_path=="/images/edits" or clean_path.endswith('/v1/images/edits') or clean_path.endswith('/sdapi/v1/txt2img') or clean_path.endswith('/sdapi/v1/img2img'):
                 is_imggen = True
                 if clean_path=="/prompt":
                     is_comfyui_imggen = True
                 elif clean_path.endswith('/v1/images/generations') or clean_path=="/images/generations":
                     is_oai_imggen = True
+                elif clean_path.endswith('/v1/images/edits') or clean_path=="/images/edits":
+                    is_oai_imggen = True
+                    is_oai_imgedit = True
             elif clean_path.endswith('/api/extra/transcribe') or clean_path.endswith('/v1/audio/transcriptions') or clean_path=="/audio/transcriptions":
                 is_transcribe = True
             elif clean_path.endswith('/api/extra/tts') or clean_path.endswith('/v1/audio/speech') or clean_path=="/audio/speech" or clean_path.endswith('/tts_to_audio'):
                 is_tts = True
-            elif clean_path.endswith('/api/extra/embeddings') or clean_path.endswith('/v1/embeddings'):
+            elif clean_path.endswith('/api/extra/embeddings') or clean_path.endswith('/v1/embeddings') or clean_path=="/api/embed":
                 is_embeddings = True
+                is_ollama_embeddings = (clean_path=="/api/embed")
             elif clean_path.endswith('/api/extra/music/prepare'):
                 is_music_codes = True
             elif clean_path.endswith('/api/extra/music/generate'):
@@ -7026,6 +7606,8 @@ Change Mode<br>
                                 genparams["prompt"] = formdata["prompt"]
                             if "language" in formdata and formdata["language"]:
                                 genparams["language"] = formdata["language"]
+                    elif is_oai_imgedit:
+                        genparams = self.extract_oai_image_edit_formdata(body)
 
                     if not genparams:
                         utfprint("Body Err: " + str(body))
@@ -7092,6 +7674,8 @@ Change Mode<br>
                     # Check if streaming chat completions, if so, set stream mode to true
                     if (api_format == 4 or api_format == 3 or api_format == 8 or api_format == 9) and "stream" in genparams and genparams["stream"]:
                         sse_stream_flag = True
+                    if (api_format == 6 or api_format == 7) and genparams.get('stream', True):
+                        sse_stream_flag = True
                     if continuous_batching_python_eligible(genparams, api_format):
                         genparams['_batch_expected'] = True
                         modelbusy.release()
@@ -7106,41 +7690,13 @@ Change Mode<br>
                         if autoswapmode and textName is not None:
                             modelNameToReturn = textName
                         # Headers are already sent when streaming
-                        if (api_format == 6 or api_format == 7) and genparams.get('stream', True):
-                            #ollama fake streaming
-                            self.send_response(200)
-                            self.send_header("X-Accel-Buffering", "no")
-                            self.send_header("cache-control", "no-cache")
-                            self.send_header("connection", "keep-alive")
-                            self.end_headers(content_type='text/event-stream')
-                            if api_format == 6:
-                                bodytxt = gendat.get("response","") # extract and erase the AI response from the sync payload.
-                                gendat["response"] = ""
-                                pl = {"model":modelNameToReturn,"created_at":str(datetime.now(timezone.utc).isoformat()),"response":bodytxt,"done":False}
-                                self.wfile.write(f'{json.dumps(pl)}\n'.encode())
-                                self.wfile.flush()
-                                time.sleep(0.05) #short delay
-                                self.wfile.write(f'{json.dumps(gendat)}\n'.encode()) # note: gendat already contains done=true and empty response
-                                self.wfile.flush()
-                                time.sleep(0.05) #short delay
-                            else:
-                                bodytxt = gendat.get("message",{}).get("content","") # extract and erase the AI response from the sync payload.
-                                gendat["message"] = {"role":"assistant","content":""}
-                                pl = {"model":modelNameToReturn,"created_at":str(datetime.now(timezone.utc).isoformat()),"message":{"role":"assistant","content":bodytxt},"done":False}
-                                self.wfile.write(f'{json.dumps(pl)}\n'.encode())
-                                self.wfile.flush()
-                                time.sleep(0.05) #short delay
-                                self.wfile.write(f'{json.dumps(gendat)}\n'.encode()) # note: gendat already contains done=true and empty response
-                                self.wfile.flush()
-                                time.sleep(0.05) #short delay
-                            self.close_connection = True
-                        elif not sse_stream_flag:
+                        if not sse_stream_flag:
                             self.send_response(200)
                             genresp = (json.dumps(gendat).encode())
                             self.send_header('content-length', str(len(genresp)))
                             self.end_headers(content_type='application/json')
                             self.wfile.write(genresp)
-                        elif (api_format == 4 or api_format == 9) and genparams.get('using_openai_tools', False): #special case, fake streaming for openai tool calls
+                        elif (api_format == 4 or api_format == 7 or api_format == 9) and genparams.get('using_openai_tools', False): #special case, fake streaming for tool calls
                             # we only send content_text and reasoning_text if tools aren't used. they contain the balance of the output after sync_toolcall_potential_triggered was triggered
                             content_text = genparams.get('sync_toolcall_extra_content', "") #populated by the sse call, we don't use gendat['choices'][0]['message'].get('content', None)
                             reasoning_text = genparams.get('sync_toolcall_extra_reasoning_content', "")
@@ -7150,6 +7706,8 @@ Change Mode<br>
                                     toolsdata_res = gendat['choices'][0]['message']['tool_calls']
                                     if toolsdata_res and len(toolsdata_res)>0:
                                         toolsdata_res[0]["index"] = 0 # need to add an index for OWUI
+                                elif api_format == 7:
+                                    toolsdata_res = gendat.get("message", {}).get("tool_calls", [])
                                 elif api_format == 9:
                                     # gendat["content"] is a list of Anthropic content blocks; pull out the tool_use ones and reformat to OAI shape for the shared emission code
                                     for block in gendat.get("content", []):
@@ -7165,7 +7723,23 @@ Change Mode<br>
                             except Exception:
                                 toolsdata_res = []
 
-                            if api_format == 9: # Anthropic fake-stream for tool calls
+                            if api_format == 7: # Ollama fake-stream for tool calls
+                                created_at = str(datetime.now(timezone.utc).isoformat())
+                                if not content_text and genparams.get('sync_toolcall_stream_ineligible', False):
+                                    content_text = gendat.get("message", {}).get("content", "")
+                                if content_text or toolsdata_res:
+                                    chunk_msg = {"role":"assistant","content":"" if toolsdata_res else (content_text or "")}
+                                    if toolsdata_res:
+                                        chunk_msg["tool_calls"] = toolsdata_res
+                                    chunk = {"model":modelNameToReturn,"created_at":created_at,"message":chunk_msg,"done":False}
+                                    self.wfile.write(f'{json.dumps(chunk)}\n'.encode())
+                                    self.wfile.flush()
+                                final_msg = {"role":"assistant","content":""}
+                                final_chunk = {"model":modelNameToReturn,"created_at":created_at,"message":final_msg,"done":True,"done_reason":gendat.get("done_reason", currfinishreason),"total_duration":gendat.get("total_duration", 1),"load_duration":gendat.get("load_duration", 1),"prompt_eval_count":gendat.get("prompt_eval_count", handle.get_last_input_count()),"prompt_eval_duration":gendat.get("prompt_eval_duration", 1),"eval_count":gendat.get("eval_count", handle.get_last_token_count()),"eval_duration":gendat.get("eval_duration", 1)}
+                                self.wfile.write(f'{json.dumps(final_chunk)}\n'.encode())
+                                self.wfile.flush()
+
+                            elif api_format == 9: # Anthropic fake-stream for tool calls
                                 req_id_suffix = genparams.get('oai_uniqueid', 1)
                                 start_msg = {"type": "message", "id": f"msg_A{req_id_suffix}", "role": "assistant", "model": modelNameToReturn, "usage": {"input_tokens": 0, "output_tokens": 0}}
                                 self.wfile.write(f'event: message_start\ndata: {json.dumps({"type":"message_start","message":start_msg})}\n\n'.encode())
@@ -7359,9 +7933,14 @@ Change Mode<br>
                     return
                 elif is_imggen: #image gen
                     try:
+                        lastgeneratedcachedimg = b''
+                        lastgeneratedcachedimgkey = ''
+                        currgenimgkey = genparams.get('genkey', '')
                         if is_comfyui_imggen:
                             lastgeneratedcomfyimg = b''
                             genparams = sd_comfyui_tranform_params(genparams)
+                        elif is_oai_imgedit:
+                            genparams = sd_oai_transform_edit_params(genparams)
                         elif is_oai_imggen:
                             genparams = sd_oai_transform_params(genparams)
                         if not genparams.get('lora'):
@@ -7370,13 +7949,23 @@ Change Mode<br>
                             if loras:
                                 genparams['prompt'] = prompt
                                 genparams['lora'] = lora_map_name_to_path(loras)
-                        gen = sd_generate(genparams)
+                        abort_gen = handle.sd_abort_generation
+                        override_abort_gen = genparams.get('kcpp_extra_args', {}).get('keep_image_gen_on_disconnect', gendefaults.get('keep_image_gen_on_disconnect'))
+                        if override_abort_gen is not None and tryparseint(override_abort_gen, 1):
+                            abort_gen = None
+                        gen = asyncio.run(self.handle_image_request(sd_generate, genparams, abort_gen))
                         gendat = gen["data"]
                         genanim = gen["animated"]
                         gendatextra = gen["data_extra"]
                         genfinalframe = gen["final_frame"]
                         geninfo = json.dumps(gen["info"]) # sdapi really expects a stringified JSON
+                        currgenimgkey = ''
                         genresp = None
+                        if gendat:
+                            lastgeneratedcachedimg = base64.b64decode(gendat)
+                            lastgeneratedcachedimgkey = genparams.get('genkey', '')
+                        else:
+                            lastgeneratedcachedimg = b''
                         if is_comfyui_imggen:
                             if gendat:
                                 lastgeneratedcomfyimg = base64.b64decode(gendat)
@@ -7384,7 +7973,8 @@ Change Mode<br>
                                 lastgeneratedcomfyimg = b''
                             genresp = (json.dumps({"prompt_id": "12345678-0000-0000-0000-000000000001","number": 0,"node_errors":{}}).encode())
                         elif is_oai_imggen:
-                            genresp = (json.dumps({"created":int(time.time()),"data":[{"b64_json":gendat}],"background":"opaque","output_format":"png","size":"1024x1024","quality":"medium"}).encode())
+                            response_size = genparams.get("size", f"{genparams.get('width', 1024)}x{genparams.get('height', 1024)}")
+                            genresp = (json.dumps({"created":int(time.time()),"data":[{"b64_json":gendat}],"background":"opaque","output_format":"png","size":response_size,"quality":"medium"}).encode())
                         else:
                             genresp = (json.dumps({"images":[gendat],"parameters":{},"info":geninfo,"animated":genanim,"extra_data":gendatextra, "final_frame":genfinalframe}).encode())
                         self.send_response(200)
@@ -7392,6 +7982,7 @@ Change Mode<br>
                         self.end_headers(content_type='application/json')
                         self.wfile.write(genresp)
                     except Exception as ex:
+                        currgenimgkey = ''
                         utfprint(ex,1)
                         print("Generate Image: The response could not be sent, maybe connection was terminated?")
                         time.sleep(0.2) #short delay
@@ -7433,14 +8024,15 @@ Change Mode<br>
                 elif is_tts:
                     try:
                         gendat = tts_generate(genparams)
-                        wav_data = b''
+                        audio_data = b''
                         if gendat:
-                            wav_data = base64.b64decode(gendat) # Decode the Base64 string into binary data
+                            audio_data = base64.b64decode(gendat) # Decode the Base64 string into binary data
+                        audio_ext, audio_content_type = get_audio_response_format(genparams, audio_data)
                         self.send_response(200)
-                        self.send_header('content-length', str(len(wav_data)))  # Set content length
-                        self.send_header('Content-Disposition', 'attachment; filename="output.wav"')
-                        self.end_headers(content_type='audio/wav')
-                        self.wfile.write(wav_data) # Write the binary WAV data to the response
+                        self.send_header('content-length', str(len(audio_data)))  # Set content length
+                        self.send_header('Content-Disposition', f'attachment; filename="output.{audio_ext}"')
+                        self.end_headers(content_type=audio_content_type)
+                        self.wfile.write(audio_data) # Write the binary audio data to the response
                     except Exception as ex:
                         utfprint(ex,1)
                         print("TTS: The response could not be sent, maybe connection was terminated?")
@@ -7452,17 +8044,20 @@ Change Mode<br>
                         if autoswapmode and embedName is not None:
                             modelNameToReturn = embedName
                         gendat = embeddings_generate(genparams)
-                        outdatas = []
-                        odidx = 0
-                        for od in gendat["data"]:
-                            if genparams.get("encoding_format", "")=="base64":
-                                binary_data = struct.pack('<' + 'f' * len(od), *od)
-                                b64_string = base64.b64encode(binary_data).decode('utf-8')
-                                outdatas.append({"object":"embedding","index":odidx,"embedding":b64_string})
-                            else:
-                                outdatas.append({"object":"embedding","index":odidx,"embedding":od})
-                            odidx += 1
-                        genresp = (json.dumps({"object":"list","data":outdatas,"model":modelNameToReturn,"usage":{"prompt_tokens":gendat["count"],"total_tokens":gendat["count"]}}).encode())
+                        if is_ollama_embeddings:
+                            genresp = (json.dumps({"model":modelNameToReturn,"embeddings":gendat["data"],"total_duration":1,"load_duration":1,"prompt_eval_count":gendat["count"]}).encode())
+                        else:
+                            outdatas = []
+                            odidx = 0
+                            for od in gendat["data"]:
+                                if genparams.get("encoding_format", "")=="base64":
+                                    binary_data = struct.pack('<' + 'f' * len(od), *od)
+                                    b64_string = base64.b64encode(binary_data).decode('utf-8')
+                                    outdatas.append({"object":"embedding","index":odidx,"embedding":b64_string})
+                                else:
+                                    outdatas.append({"object":"embedding","index":odidx,"embedding":od})
+                                odidx += 1
+                            genresp = (json.dumps({"object":"list","data":outdatas,"model":modelNameToReturn,"usage":{"prompt_tokens":gendat["count"],"total_tokens":gendat["count"]}}).encode())
                         self.send_response(200)
                         self.send_header('content-length', str(len(genresp)))
                         self.end_headers(content_type='application/json')
@@ -7490,14 +8085,15 @@ Change Mode<br>
                 elif is_music_audio:
                     try:
                         gendat = music_generate_audio(genparams)
-                        wav_data = b''
+                        audio_data = b''
                         if gendat:
-                            wav_data = base64.b64decode(gendat) # Decode the Base64 string into binary data
+                            audio_data = base64.b64decode(gendat) # Decode the Base64 string into binary data
+                        audio_ext, audio_content_type = get_audio_response_format(genparams, audio_data)
                         self.send_response(200)
-                        self.send_header('content-length', str(len(wav_data)))  # Set content length
-                        self.send_header('Content-Disposition', 'attachment; filename="output.wav"')
-                        self.end_headers(content_type='audio/wav')
-                        self.wfile.write(wav_data) # Write the binary WAV data to the response
+                        self.send_header('content-length', str(len(audio_data)))  # Set content length
+                        self.send_header('Content-Disposition', f'attachment; filename="output.{audio_ext}"')
+                        self.end_headers(content_type=audio_content_type)
+                        self.wfile.write(audio_data) # Write the binary audio data to the response
                     except Exception as ex:
                         utfprint(ex,1)
                         print("Music Gen Audio: The response could not be sent, maybe connection was terminated?")
@@ -7526,16 +8122,23 @@ Change Mode<br>
         self.end_headers(content_type='text/html')
 
     def end_headers(self, content_type=None):
-        self.send_header('access-control-allow-origin', '*')
+        origin = self.headers.get('Origin')
+        if origin:
+            self.send_header('access-control-allow-origin', origin)
+            self.send_header('access-control-allow-credentials', 'true')
+            self.send_header('vary', 'Origin')
+        else:
+            self.send_header('access-control-allow-origin', '*')
         self.send_header('access-control-allow-methods', '*')
         self.send_header('access-control-allow-headers', '*, Accept, Content-Type, Content-Length, Cache-Control, Accept-Encoding, X-CSRF-Token, Client-Agent, X-Fields, Content-Type, Authorization, X-Requested-With, X-HTTP-Method-Override, apikey, genkey')
+        self.send_header('access-control-allow-private-network', 'true')
         self.send_header("cache-control", "no-store")
         if content_type is not None:
             self.send_header('content-type', content_type)
         return super(KcppServerRequestHandler, self).end_headers()
 
 def RunServerMultiThreaded(addr, port, server_handler):
-    global exitcounter, sslvalid, global_memory
+    global exitcounter, sslvalid, global_memory, num_server_threads
     if is_port_in_use(port):
         print(f"Warning: Port {port} already appears to be in use by another program.")
 
@@ -7557,10 +8160,9 @@ def RunServerMultiThreaded(addr, port, server_handler):
         if ipv6_sock:
             ipv6_sock = context.wrap_socket(ipv6_sock, server_side=True)
 
-    numThreads = 24
     try:
         ipv4_sock.bind((addr, port))
-        ipv4_sock.listen(numThreads)
+        ipv4_sock.listen(num_server_threads)
     except Exception:
         ipv4_sock = None
         print("IPv4 Socket Failed to Bind.")
@@ -7568,7 +8170,7 @@ def RunServerMultiThreaded(addr, port, server_handler):
     if ipv6_sock:
         try:
             ipv6_sock.bind((addr, port))
-            ipv6_sock.listen(numThreads)
+            ipv6_sock.listen(num_server_threads)
         except Exception:
             ipv6_sock = None
             print("IPv6 Socket Failed to Bind. IPv6 will be unavailable.")
@@ -7586,7 +8188,7 @@ def RunServerMultiThreaded(addr, port, server_handler):
             with http.server.HTTPServer((addr, port), handler, False) as self.httpd:
                 try:
                     if ipv4_sock and ipv6_sock:
-                        self.httpd.socket = ipv4_sock if self.i < 16 else ipv6_sock
+                        self.httpd.socket = ipv4_sock if self.i < (num_server_threads/2) else ipv6_sock
                     elif ipv6_sock:
                         self.httpd.socket = ipv6_sock
                     elif ipv4_sock:
@@ -7611,7 +8213,7 @@ def RunServerMultiThreaded(addr, port, server_handler):
             self.httpd.server_close()
 
     threadArr = []
-    for i in range(numThreads):
+    for i in range(num_server_threads):
         threadArr.append(Thread(i))
     while 1:
         try:
@@ -7619,7 +8221,7 @@ def RunServerMultiThreaded(addr, port, server_handler):
         except (KeyboardInterrupt,SystemExit):
             global exitcounter
             exitcounter = 999
-            for i in range(numThreads):
+            for i in range(num_server_threads):
                 try:
                     threadArr[i].stop()
                 except Exception:
@@ -7765,7 +8367,7 @@ def save_config_dict(filename, savdict, template):
         filenamestr += ".kcpps"
     if not filenamestr.endswith(".kcppt") and template:
         filenamestr += ".kcppt"
-    do_not_save = {'analyze', 'config', 'exportconfig', 'exporttemplate', 'testmemory', 'unpack', 'version'}
+    do_not_save = {'allow_config_onready', 'analyze', 'config', 'exportconfig', 'exporttemplate', 'testmemory', 'unpack', 'version'}
     filtered = {k: v for k, v in savdict.items() if k not in do_not_save}
     if 'gendefaults' in filtered:
         gendefaults = parse_json_object(filtered['gendefaults'], 'gendefaults')
@@ -7781,7 +8383,8 @@ def splitmode_choices_to_int(value): #layer=1, row=2, tensor=3
     if value=='layer':
         return 1
     elif value=='row':
-        return 2
+        print("!!!\nWARNING: split mode row was removed! Using tensor split instead!\n!!!")
+        return 3
     elif value=='tensor':
         return 3
     return 1
@@ -7906,8 +8509,13 @@ def show_gui():
         resizing = False
         resizing_id1 = None
     def actually_resize(windowwidth,windowheight,lastpos,smallratio):
+        nonlocal gtooltip_box, gtooltip_label
         root.geometry(str(windowwidth) + "x" + str(windowheight) + str(lastpos))
         ctk.set_widget_scaling(smallratio)
+        if gtooltip_box:
+            gtooltip_box.destroy()
+            gtooltip_box = None
+            gtooltip_label = None
         update_runmode_gui()
         togglerope(1,1,1)
         toggleflashattn(1,1,1)
@@ -8027,6 +8635,7 @@ def show_gui():
     highpriority = ctk.IntVar()
     usemmap = ctk.IntVar(value=0)
     usemlock = ctk.IntVar()
+    usedirectio = ctk.IntVar()
     debugmode = ctk.IntVar()
     keepforeground = ctk.IntVar()
     terminalonly = ctk.IntVar()
@@ -8917,7 +9526,8 @@ def show_gui():
         "Remote Tunnel": [remotetunnel_var,  "Creates a trycloudflare tunnel.\nAllows you to access koboldcpp from other devices over an internet URL."],
         "Use FlashAttention": [flashattention_var, "Enable flash attention for GGUF models."],
         "Force AutoFit": [autofit_var, "Automatically attempt to fit the model in the best possible way. Overrides everything else.\nNot recommended for multi model setups. Experimental."],
-        "Quiet Mode": [quietmode, "Prevents all generation related terminal output from being displayed."]
+        "Quiet Mode": [quietmode, "Prevents all generation related terminal output from being displayed."],
+        "Use Jinja": [jinja_var, "Enables using jinja chat template formatting for chat completions endpoint. Other endpoints are unaffected."]
     }
 
     for idx, (name, properties) in enumerate(quick_boxes.items()):
@@ -8971,6 +9581,7 @@ def show_gui():
         "Use MMAP": [usemmap, "Use mmap to load models if enabled, model will not be unloadable"],
         "Use mlock": [usemlock, "Enables mlock, preventing the RAM used to load the model from being paged out."],
         "Debug Mode": [debugmode, "Enables debug mode, with extra info printed to the terminal."],
+        "Direct I/O": [usedirectio, "Use direct I/O when loading GGUF models. May improve cold-load times on some storage."],
         "Keep Foreground": [keepforeground, "Bring KoboldCpp to the foreground every time there is a new generation."],
         "CLI Terminal Only": [terminalonly, "Does not launch KoboldCpp HTTP server. Instead, enables KoboldCpp from the command line, accepting interactive console input and displaying responses to the terminal."],
         "Pipeline Parallel": [pipelineparallel, "Enable Pipeline Parallelism for faster multigpu speeds but using more memory, only active for multigpu."],
@@ -9352,7 +9963,7 @@ def show_gui():
     makecheckbox(admin_tab, "Enable Model Administration", admin_var, 1, 0, command=toggleadmin,tooltiptxt="Enable a admin server, allowing you to remotely relaunch and swap models and configs.")
     makelabelentry(admin_tab, "Admin Password:" , admin_password_var, 3, 150,padx=(120),singleline=True,tooltip="Require a password to access admin functions. You are strongly advised to use one for publically accessible instances!")
     makefileentry(admin_tab, "Config Directory (Required):", "Select directory containing .gguf or .kcpps files to relaunch from", admin_dir_var, 5, width=280, dialog_type=2, tooltiptxt="Specify a directory to look for .kcpps configs in, which can be used to swap models.")
-    makefileentry(admin_tab, "Base config .kcpps (For reloading):", "", baseconfig_var, 7, width=280, dialog_type=0, tooltiptxt="Specify a base .kcpps config to apply, if no custom base config is selected during a model swap.")
+    makefileentry(admin_tab, "Base config .kcpps (Optional, for reloading):", "", baseconfig_var, 7, width=280, dialog_type=0, tooltiptxt="Specify a base .kcpps config to apply, if no custom base config is selected during a model swap.")
     makelabelentry(admin_tab, "Auto Unload Timeout:" , admin_unload_timeout_var, 17, 70,padx=(150),singleline=True,tooltip="Set an idle timeout in seconds after which KoboldCpp will automatically unload the current model.")
     makecheckbox(admin_tab, "SingleInstance Mode", singleinstance_var, 19, 0,tooltiptxt="Allows this server to be shut down by another KoboldCpp instance with singleinstance starting on the same port.")
     router_mode_box = makecheckbox(admin_tab, "Router Mode", router_mode_var, 21, 0, command=togglerouter, tooltiptxt="Router mode uses a reverse proxy router, allowing you to easily hotswap models and configs within a single request. Requires admin mode.")
@@ -9465,7 +10076,8 @@ def show_gui():
         args.debugmode  = debugmode.get()
         args.launch     = launchbrowser.get()==1
         args.highpriority = highpriority.get()==1
-        args.usemmap = usemmap.get()==1
+        args.usedirectio = usedirectio.get()==1
+        args.usemmap = (usemmap.get()==1 and not args.usedirectio)
         args.smartcontext = smartcontext_var.get()==1
         args.noflashattention = flashattention_var.get()==0
         args.noshift = contextshift_var.get()==0
@@ -9528,6 +10140,7 @@ def show_gui():
             args.noavx2 = True
             args.usecpu = True
             args.usemmap = False
+            args.usedirectio = False
             args.failsafe = True
         args.tensor_split = None
         if tensor_split_str_vars.get()!="":
@@ -9719,7 +10332,8 @@ def show_gui():
             debugmode.set(mydict["debugmode"])
         launchbrowser.set(1 if "launch" in mydict and mydict["launch"] else 0)
         highpriority.set(1 if "highpriority" in mydict and mydict["highpriority"] else 0)
-        usemmap.set(1 if "usemmap" in mydict and mydict["usemmap"] else 0)
+        usedirectio.set(1 if (("usedirectio" in mydict and mydict["usedirectio"]) or ("directio" in mydict and mydict["directio"])) else 0)
+        usemmap.set(1 if "usemmap" in mydict and mydict["usemmap"] and not usedirectio.get() else 0)
         smartcontext_var.set(1 if "smartcontext" in mydict and mydict["smartcontext"] else 0)
         flashattention_var.set(0 if "noflashattention" in mydict and mydict["noflashattention"] else 1)
         contextshift_var.set(0 if "noshift" in mydict and mydict["noshift"] else 1)
@@ -9785,7 +10399,7 @@ def show_gui():
                             gpu_choice_var.set(str(opt))
                             break
 
-        elif ("noavx2" in mydict and "usecpu" in mydict and mydict["usecpu"] and mydict["noavx2"]) or ("failsafe" in mydict and mydict["failsafe"]):
+        elif ("failsafe" in mydict and mydict["failsafe"]):
             if failsafe_option is not None:
                 runopts_var.set(failsafe_option)
         elif "noavx2" in mydict and mydict["noavx2"]:
@@ -9963,7 +10577,7 @@ def show_gui():
         sd_photomaker_var.set(mydict["sdphotomaker"] if ("sdphotomaker" in mydict and mydict["sdphotomaker"]) else "")
         sd_upscaler_var.set(mydict["sdupscaler"] if ("sdupscaler" in mydict and mydict["sdupscaler"]) else "")
         sd_vaeauto_var.set(1 if ("sdvaeauto" in mydict and mydict["sdvaeauto"]) else 0)
-        sd_tiled_vae_var.set(str(mydict["sdtiledvae"]) if ("sdtiledvae" in mydict and mydict["sdtiledvae"]) else str(default_vae_tile_threshold))
+        sd_tiled_vae_var.set(str(mydict["sdtiledvae"]) if "sdtiledvae" in mydict else str(default_vae_tile_threshold))
         sdl_sanitized = sanitize_lora_list(mydict.get('sdlora'))
         sd_lora_var.set("|".join(sdl_sanitized))
         sd_loramult_var.set(" ".join(f"{n:.3f}".rstrip('0').rstrip('.') for n in mydict.get("sdloramult", [])))
@@ -10455,6 +11069,22 @@ def convert_invalid_args(args):
         dict["sdclip2"] = dict["sdclipg"]
     if "jinja_tools" in dict and dict["jinja_tools"]:
         dict["jinja"] = True
+    if "jinjathink" in dict and dict["jinjathink"] and dict["jinjathink"]!="default":
+        dict["jinja"] = True
+        jinja_kwargs = None
+        if "jinja_kwargs" in dict and dict["jinja_kwargs"]:
+            try:
+                if isinstance(dict["jinja_kwargs"], str):
+                    jinja_kwargs = json.loads(dict["jinja_kwargs"])
+                elif isinstance(dict["jinja_kwargs"], type({})):
+                    jinja_kwargs = dict["jinja_kwargs"]
+            except Exception:
+                jinja_kwargs = None
+        else:
+            jinja_kwargs = {}
+        if isinstance(jinja_kwargs, type({})):
+            jinja_kwargs["enable_thinking"] = dict["jinjathink"]=="true"
+            dict["jinja_kwargs"] = json.dumps(jinja_kwargs)
     if "jinja_kwargs" in dict and dict["jinja_kwargs"]:
         dict["jinja"] = True
     if "sdgendefaults" in dict and "gendefaults" not in dict:
@@ -10567,8 +11197,11 @@ def reload_from_new_args(newargs):
     try:
         args.istemplate = False
         newargs = convert_invalid_args(newargs)
+        protected_args = ["remotetunnel","showgui","port","host","port_param","admin","adminpassword","password","adminunloadtimeout","routermode","admindir","ssl","nocertify","benchmark","prompt","config","baseconfig","downloaddir","rpcmode","rpchost","rpcport","rpcdevice","allow_config_onready"]
         for key, value in newargs.items(): #do not overwrite certain values
-            if key not in ["remotetunnel","showgui","port","host","port_param","admin","adminpassword","password","adminunloadtimeout","routermode","admindir","ssl","nocertify","benchmark","prompt","config","baseconfig","downloaddir","onready","rpcmode","rpchost","rpcport","rpcdevice"]:
+            if key == "onready" and getattr(args, "allow_config_onready", False):
+                setattr(args, key, value)
+            elif key not in protected_args and key != "onready":
                 setattr(args, key, value)
         setattr(args,"showgui",False)
         setattr(args,"benchmark",False)
@@ -10598,8 +11231,10 @@ def load_config_cli(filename):
     with open(filename, 'r', encoding='utf-8', errors='ignore') as f:
         config = json.load(f)
         config = convert_invalid_args(config)
-        if "onready" in config:
+        if "onready" in config and not getattr(args, "allow_config_onready", False):
             config["onready"] = "" #do not allow onready commands from config
+        if "allow_config_onready" in config:
+            del config["allow_config_onready"] #do not allow configs to opt into onready commands
         args.istemplate = False
         raw_args = (sys.argv[1:]) #a lousy hack to allow for overriding kcpps
         # special: overriding model applies to model_param too
@@ -10630,6 +11265,7 @@ def convert_args_to_template(savdict):
     savdict["adminpassword"] = None
     savdict["usemmap"] = False
     savdict["usemlock"] = False
+    savdict["usedirectio"] = False
     savdict["debugmode"] = 0
     savdict["ssl"] = None
     savdict["usecuda"] = None
@@ -10686,6 +11322,40 @@ def sanitize_string(input_string):
     sanitized_string = re.sub( r'[^\w\d\.\-_]', '', input_string)
     return sanitized_string
 
+def resolve_huggingface_xet_url(input_url):
+    global nocertify
+    if "https://huggingface.co/" not in input_url or "/resolve/" not in input_url:
+        return input_url
+
+    ssl_cert_dir = os.environ.get('SSL_CERT_DIR')
+    if not ssl_cert_dir and not nocertify and os.name != 'nt':
+        os.environ['SSL_CERT_DIR'] = '/etc/ssl/certs'
+
+    def resolve_with_context(ssl_context=None):
+        req = urllib.request.Request(input_url, headers={'User-Agent': 'Mozilla/5.0'}, method="HEAD")
+        try:
+            with urllib.request.urlopen(req, timeout=10, context=ssl_context) as response:
+                return response.geturl()
+        except Exception:
+            req = urllib.request.Request(input_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=10, context=ssl_context) as response:
+                return response.geturl()
+
+    try:
+        resolved_url = resolve_with_context()
+    except Exception as first_error:
+        try:
+            import ssl
+            resolved_url = resolve_with_context(ssl._create_unverified_context())
+        except Exception as e:
+            print(f"Could not pre-resolve Hugging Face URL, using original URL: {first_error}; {e}")
+            return input_url
+    # resolved_host = urllib.parse.urlparse(resolved_url).netloc.lower()
+    if ("xet-bridge" in resolved_url) and resolved_url != input_url:
+        utfprint(f"Resolved Hugging Face xet URL to {resolved_url}", 0)
+        return resolved_url
+    return input_url
+
 def downloader_internal(input_url, output_filename, capture_output, min_file_size=64): # 64 bytes required by default
     download_dir_path = args.downloaddir
     if "https://huggingface.co/" in input_url and "/blob/main/" in input_url:
@@ -10720,38 +11390,35 @@ def downloader_internal(input_url, output_filename, capture_output, min_file_siz
     dl_success = False
     out_dir = os.path.dirname(os.path.abspath(output_filename)) or os.getcwd()
     out_name = os.path.basename(output_filename)
-    try:
-        if os.name == 'nt':
-            basepath = os.path.abspath(os.path.dirname(__file__))
-            a2cexe = os.path.join(basepath, "aria2c-win.exe")
-            if os.path.exists(a2cexe):  # on windows try using embedded aria2c
-                rc = subprocess.run([
-                        a2cexe, "-x", "16", "-s", "16",
-                        "--summary-interval=15", "--console-log-level=error", "--log-level=error",
-                        "--download-result=default", "--continue=true", "--allow-overwrite=true",
-                        "--file-allocation=none", "--max-tries=3",
-                        "-d", out_dir, "-o", out_name, input_url
-                    ], capture_output=capture_output, text=True, check=True, encoding='utf-8')
-                dl_success = (rc.returncode == 0 and os.path.exists(output_filename) and os.path.getsize(output_filename) > min_file_size)
-    except subprocess.CalledProcessError as e:
-        print(f"aria2c-win failed: {e}")
-
-    try:
-        if not dl_success and shutil.which("aria2c") is not None:
-            rc = subprocess.run([
-                    "aria2c", "-x", "16", "-s", "16",
-                    "--summary-interval=15", "--console-log-level=error", "--log-level=error",
-                    "--download-result=default", "--allow-overwrite=true",
-                    "--file-allocation=none", "--max-tries=3",
-                    "-d", out_dir, "-o", out_name, input_url
-                ], capture_output=capture_output, text=True, check=True, encoding='utf-8')
+    download_url = resolve_huggingface_xet_url(input_url)
+    aria2_candidates = []
+    if os.name == 'nt':
+        basepath = os.path.abspath(os.path.dirname(__file__))
+        a2cexe = os.path.join(basepath, "aria2c-win.exe")
+        if os.path.exists(a2cexe):  # on windows try using embedded aria2c
+            aria2_candidates.append((a2cexe, "aria2c-win"))
+    if shutil.which("aria2c") is not None:
+        aria2_candidates.append(("aria2c", "aria2c"))
+    aria2_args = [
+        "-x", "16", "-s", "16",
+        "--summary-interval=10", "--console-log-level=error", "--log-level=error",
+        "--download-result=default", "--continue=true", "--allow-overwrite=true",
+        "--file-allocation=none", "--max-tries=3", "--retry-wait=5",
+        "-d", out_dir, "-o", out_name, download_url
+    ]
+    for aria2_exe, aria2_name in aria2_candidates:
+        if dl_success:
+            break
+        try:
+            rc = subprocess.run([aria2_exe, *aria2_args],
+                capture_output=capture_output, text=True, check=True, encoding='utf-8')
             dl_success = (rc.returncode == 0 and os.path.exists(output_filename) and os.path.getsize(output_filename) > min_file_size)
-    except subprocess.CalledProcessError as e:
-        print(f"aria2c failed: {e}")
+        except subprocess.CalledProcessError as e:
+            print(f"{aria2_name} failed: {e}")
 
     try:
         if not dl_success and shutil.which("curl") is not None:
-            rc = subprocess.run(["curl", "-fLo", output_filename, input_url],
+            rc = subprocess.run(["curl", "-fLo", output_filename, download_url],
                 capture_output=capture_output, text=True, check=True, encoding="utf-8")
             dl_success = (rc.returncode == 0 and os.path.exists(output_filename) and os.path.getsize(output_filename) > min_file_size)
     except subprocess.CalledProcessError as e:
@@ -10759,7 +11426,7 @@ def downloader_internal(input_url, output_filename, capture_output, min_file_siz
 
     try:
         if not dl_success and shutil.which("wget") is not None:
-            rc = subprocess.run(["wget", "-O", output_filename, input_url],
+            rc = subprocess.run(["wget", "-O", output_filename, download_url],
                 capture_output=capture_output, text=True, check=True, encoding="utf-8")
             dl_success = (rc.returncode == 0 and os.path.exists(output_filename) and os.path.getsize(output_filename) > min_file_size)
     except subprocess.CalledProcessError as e:
@@ -11688,7 +12355,7 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
         global maxctx
         maxctx = args.contextsize
 
-    args.defaultgenamt = max(64, min(args.defaultgenamt, 16384))
+    args.defaultgenamt = max(64, min(args.defaultgenamt, 32768))
     args.defaultgenamt = min(args.defaultgenamt, maxctx / 2)
 
     #this uses the true port instead of the displayport, because we dont want to shut down a router
@@ -11938,7 +12605,6 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
             friendlysdmodelname = os.path.splitext(friendlysdmodelname)[0]
             friendlysdmodelname = sanitize_string(friendlysdmodelname)
             loadok = sd_load_model(imgmodel,imgvae,imgt5xxl,imgclip1,imgclip2,imgphotomaker,imgupscaler,imgaudiovae)
-            cached_sd_info = sd_get_info()
             print("Load Image Model OK: " + str(loadok))
             if not loadok:
                 exitcounter = 999
@@ -12346,11 +13012,13 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
                 print(f"Output: {result}\n-----")
                 if save_to_file:
                     try:
-                        with open(args.benchmark, "a") as file:
+                        import csv
+                        with open(args.benchmark, "a", newline="", encoding="utf-8") as file:
                             file.seek(0, 2)
+                            writer = csv.writer(file)
                             if file.tell() == 0: #empty file
-                                file.write("Timestamp,Backend,Layers,Model,MaxCtx,GenAmount,ProcessingTime,ProcessingSpeed,GenerationTime,GenerationSpeed,TotalTime,Output,Flags")
-                            file.write(f"\n{datetimestamp},{libname},{args.gpulayers},{benchmodel},{benchmaxctx},{benchlen},{t_pp:.2f},{s_pp:.2f},{t_gen:.2f},{s_gen:.2f},{(t_pp+t_gen):.2f},{result},\"{benchflagstr}\"")
+                                writer.writerow(["Timestamp","Backend","Layers","Model","MaxCtx","GenAmount","ProcessingTime","ProcessingSpeed","GenerationTime","GenerationSpeed","TotalTime","Output","Flags"])
+                            writer.writerow([datetimestamp,libname,args.gpulayers,benchmodel,benchmaxctx,benchlen,f"{t_pp:.2f}",f"{s_pp:.2f}",f"{t_gen:.2f}",f"{s_gen:.2f}",f"{(t_pp+t_gen):.2f}",result,benchflagstr])
                     except Exception as e:
                         print(f"Error writing benchmark to file: {e}")
                 if global_memory and using_gui_launcher and not save_to_file:
@@ -12394,7 +13062,7 @@ if __name__ == '__main__':
     modelgroup.add_argument("--model","-m", metavar=('[filenames]'), help="Model file to load. Accepts multiple values if they are URLs.", type=str, nargs='+', default=[])
     modelgroup.add_argument("model_param", help="Model file to load (positional)", nargs="?")
     parser.add_argument("--config", metavar=('[filename]'), help="Load settings from a .kcpps file. Other arguments will be ignored", type=str, nargs=1)
-    parser.add_argument("--contextsize","--ctx-size", "-c", help=f"Controls the memory allocated for maximum context size, only change if you need more RAM for big contexts. (default {default_maxctx}).",metavar=('[256 to 262144]'), type=check_range(int,256,262144), default=default_maxctx)
+    parser.add_argument("--contextsize","--ctx-size", "-c", help=f"Controls the memory allocated for maximum context size, only change if you need more RAM for big contexts. (default {default_maxctx}).",metavar=('[256 to 524288]'), type=check_range(int,256,524288), default=default_maxctx)
     parser.add_argument("--gpulayers","--gpu-layers","--n-gpu-layers","-ngl", help="Set number of layers to offload to GPU (when using GPU). Set to -1 to enable autofit (default), set to 0 to disable GPU offload.",metavar=('[GPU layers]'), nargs='?', const=1, type=int, default=-1)
     parser.add_argument("--host", metavar=('[ipaddr]'), help="Host IP to listen on. If this flag is not set, all routable interfaces are accepted.", default="")
     parser.add_argument("--launch", help="Launches a web browser when load is completed.", action='store_true')
@@ -12416,10 +13084,10 @@ if __name__ == '__main__':
     advparser.add_argument("--chatcompletionsadapter", metavar=('[filename]'), help="Select an optional ChatCompletions Adapter JSON file to force custom instruct tags.", default="AutoGuess")
     advparser.add_argument("--cli", help="Does not launch KoboldCpp HTTP server. Instead, enables KoboldCpp from the command line, accepting interactive console input and displaying responses to the terminal.", action='store_true')
     advparser.add_argument("--debugmode", help="Shows additional debug info in the terminal. Levels: -1 (Horde-quiet, suppresses non-essential prints; auto-applied when Horde args are set), 0 (default, normal output), 1 (verbose: extra slot/cache info, larger print buffers, retains horde-debug prefix). Passing the flag without a value implies 1.", nargs='?', const=1, type=int, default=0)
-    advparser.add_argument("--defaultgenamt", help="How many tokens to generate by default, if not specified. Must be smaller than context size. Usually, your frontend GUI will override this.", type=check_range(int,64,16384), default=default_genlen)
+    advparser.add_argument("--defaultgenamt", help="How many tokens to generate by default, if not specified. Must be smaller than context size. Usually, your frontend GUI will override this.", type=check_range(int,64,32768), default=default_genlen)
     advparser.add_argument("--device", "-dev", metavar=('<dev1,dev2,..>'), help="Set llama.cpp compatible device selection override. Comma separated. Overrides normal device choices.", default="")
     advparser.add_argument("--downloaddir", metavar=('[directory]'), help="Specify a directory that models will be downloaded to or searched from, if unset uses the working directory.", default="")
-    advparser.add_argument("--draftamount","--draft-max","--draft-n", metavar=('[tokens]'), help="How many tokens to draft per chunk before verifying results", type=int, default=default_draft_amount)
+    advparser.add_argument("--draftamount","--draft-max","--draft-n","--spec-draft-n-max", metavar=('[tokens]'), help="How many tokens to draft per chunk before verifying results", type=int, default=default_draft_amount)
     advparser.add_argument("--draftgpulayers","--gpu-layers-draft","--n-gpu-layers-draft","-ngld", metavar=('[layers]'), help="How many layers to offload to GPU for the draft model (default=full offload)", type=int, default=999)
     advparser.add_argument("--draftgpusplit", help="GPU layer distribution ratio for draft model (default=same as main). Only works if multi-GPUs selected for MAIN model and tensor_split is set!", metavar=('[Ratios]'), type=float, nargs='+')
     advparser.add_argument("--draftmodel","--model-draft","-md", metavar=('[filename]'), help="Load a small draft model for speculative decoding. It will be fully offloaded. Vocab must match the main model.", default="")
@@ -12461,6 +13129,7 @@ if __name__ == '__main__':
     advparser.add_argument("--noshift","--no-context-shift", help="If set, do not attempt to Trim and Shift the GGUF context.", action='store_true')
     advparser.add_argument("--noswa","--swa-full", help="If set, uses full-size SWA KV Cache. Otherwise, SWA will be enabled automatically on models that support it. SWA saves memory but cannot be used with context shifting.", action='store_true')
     advparser.add_argument("--onready", help="An optional shell command to execute after the model has been loaded.", metavar=('[shell command]'), type=str, default="")
+    advparser.add_argument("--allow-config-onready", help="Allow .kcpps config files loaded after launch to set --onready commands. Only use with trusted configs.", action='store_true')
     advparser.add_argument("--overridekv","--override-kv", metavar=('[name=type:value]'), help="Override metadata value by key. Separate multiple values with commas. Format is name=type:value. Types: int, float, bool, str", default="")
     advparser.add_argument("--overridenativecontext", help="Overrides the native trained context of the loaded model with a custom value to be used for Rope scaling.",metavar=('[trained context]'), type=int, default=0)
     advparser.add_argument("--overridetensors","--override-tensor","-ot", metavar=('[tensor name pattern=buffer type]'), help="Override selected backend for specific tensors matching tensor_name_regex_pattern=buffer_type, same as in llama.cpp.", default="")
@@ -12486,6 +13155,7 @@ if __name__ == '__main__':
     advparser.add_argument("--usemlock","--mlock", help="Enables mlock, preventing the RAM used to load the model from being paged out. Not usually recommended.", action='store_true')
     compatgroup3 = advparser.add_mutually_exclusive_group()
     compatgroup3.add_argument("--usemmap", help="If set, uses mmap to load model.", action='store_true')
+    compatgroup3.add_argument("--usedirectio","--directio","--direct-io","-dio", help="Use direct I/O to load GGUF models if available. May improve cold-load times on some storage.", action='store_true')
     advparser.add_argument("--visionmaxres", metavar=('[max px]'), help="Clamp MMProj vision maximum allowed resolution. Allowed values are between 512 to 2048 px (default 1024).", type=int, default=default_visionmaxres)
     advparser.add_argument("--visionmaxtokens","--image-max-tokens", metavar=('[tokens]'), help="Override the maximum tokens for the MMProj embedding (default -1).", type=int, default=-1)
     advparser.add_argument("--visionmintokens","--image-min-tokens", metavar=('[tokens]'), help="Override the minimum tokens for the MMProj embedding (default -1).", type=int, default=-1)

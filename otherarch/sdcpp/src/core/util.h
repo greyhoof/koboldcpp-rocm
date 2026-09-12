@@ -83,6 +83,8 @@ void pretty_bytes_progress(int step, int steps, uint64_t bytes_processed, float 
 
 void log_printf(sd_log_level_t level, const char* file, int line, const char* format, ...);
 
+ggml_type sd_type_to_ggml_type(sd_type_t sdtype);
+
 std::string trim(const std::string& s);
 
 std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::string& text);
@@ -98,6 +100,9 @@ preview_t sd_get_preview_mode();
 int sd_get_preview_interval();
 bool sd_should_preview_denoised();
 bool sd_should_preview_noisy();
+
+sd_graph_eval_callback_t sd_get_backend_eval_callback();
+void* sd_get_backend_eval_callback_data();
 
 // test if the backend is a specific one, e.g. "CUDA", "ROCm", "Vulkan" etc.
 bool sd_backend_is(ggml_backend_t backend, const std::string& name);

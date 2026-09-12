@@ -12,13 +12,16 @@
 #include "llama-sampler.cpp"
 #include "llama-kv-cache.cpp"
 #include "llama-kv-cache-dsa.cpp"
+#include "llama-kv-cache-dsa-iswa.cpp"
+#include "llama-kv-cache-dsv4.cpp"
 #include "llama-kv-cache-iswa.cpp"
+#include "llama-kv-cache-msa.cpp"
 #include "llama-memory-hybrid.cpp"
+#include "llama-memory-hybrid-idx.cpp"
 #include "llama-memory-hybrid-iswa.cpp"
 #include "llama-memory-recurrent.cpp"
 #include "llama-model-loader.cpp"
 #include "llama-model-saver.cpp"
-#include "llama-model.cpp"
 #include "llama-quant.cpp"
 #include "llama-hparams.cpp"
 #include "llama-graph.cpp"
@@ -30,6 +33,7 @@
 #include "ggml-cpp.h"
 #include "ggml-backend.h"
 #include "gguf.h"
+#include "build-info.h"
 
 #include <algorithm>
 #include <cassert>
@@ -45,10 +49,6 @@
 #include <type_traits>
 #include <iostream>
 #include <vector>
-
-#ifdef GGML_USE_CUDA
-#  include "ggml-cuda.h"
-#endif
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -68,6 +68,34 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
             return "enabled";
     }
     GGML_ABORT("fatal error");
+}
+
+const char * llama_load_mode_name(enum llama_load_mode load_mode) {
+    switch (load_mode) {
+        case LLAMA_LOAD_MODE_AUTO:
+            return "auto";
+        case LLAMA_LOAD_MODE_NONE:
+            return "none";
+        case LLAMA_LOAD_MODE_MMAP:
+            return "mmap";
+        case LLAMA_LOAD_MODE_MLOCK:
+            return "mlock";
+        case LLAMA_LOAD_MODE_MMAP_MLOCK:
+            return "mmap+mlock";
+        case LLAMA_LOAD_MODE_DIRECT_IO:
+            return "dio";
+    }
+    GGML_ABORT("fatal error");
+}
+
+enum llama_load_mode llama_load_mode_from_str(const char * str) {
+    if (std::strcmp(str, "auto")       == 0) { return LLAMA_LOAD_MODE_AUTO;       }
+    if (std::strcmp(str, "none")       == 0) { return LLAMA_LOAD_MODE_NONE;       }
+    if (std::strcmp(str, "mmap")       == 0) { return LLAMA_LOAD_MODE_MMAP;       }
+    if (std::strcmp(str, "mlock")      == 0) { return LLAMA_LOAD_MODE_MLOCK;      }
+    if (std::strcmp(str, "mmap+mlock") == 0) { return LLAMA_LOAD_MODE_MMAP_MLOCK; }
+    if (std::strcmp(str, "dio")        == 0) { return LLAMA_LOAD_MODE_DIRECT_IO;  }
+    throw std::invalid_argument(std::string("unknown load mode: ") + str);
 }
 
 struct llama_sampler_chain_params llama_sampler_chain_default_params() {
@@ -108,6 +136,10 @@ bool llama_supports_rpc(void) {
         ggml_backend_load_all();
     }
     return ggml_backend_reg_by_name("RPC") != nullptr;
+}
+
+const char * llama_version(void) {
+    return LLAMA_VERSION;
 }
 
 void llama_backend_init(void) {
@@ -249,7 +281,11 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                     }
 
                     case GGML_BACKEND_DEVICE_TYPE_IGPU:
-                        if (igpus.empty()) {
+                        // igpus.empty() - workaround for integrated devices seen by multiple backends
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/23897
+                        // ggml_backend_dev_backend_reg - allow devices of the same backend regardless if integrated
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/23897#issuecomment-5264222997
+                        if (igpus.empty() || ggml_backend_dev_backend_reg(dev) == ggml_backend_dev_backend_reg(igpus.back().dev)) {
                             igpus.push_back({false, dev});
                         }
                         break;
@@ -273,7 +309,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
     }
 
     // if using single GPU mode, remove all except the main GPU
-    if (params.split_mode == LLAMA_SPLIT_MODE_NONE) {
+    if (params.split_mode == LLAMA_SPLIT_MODE_NONE && !model->devices.empty()) {
         if (params.main_gpu < 0) {
             model->devices.clear();
         } else {
@@ -303,8 +339,10 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
-        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.use_mmap, params.use_direct_io,
-            params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
+        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+
+        ml.tensor_read_lazy = params.tensor_read_lazy;
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
@@ -436,7 +474,7 @@ struct llama_model * llama_model_init_from_user(
     GGML_ASSERT(metadata != nullptr);
     std::string path_model;
     std::vector<std::string> splits = {};
-    params.use_mmap = false;
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
     params.use_extra_bufts = false;
     return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, /*file*/ nullptr, params);
 }

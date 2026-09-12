@@ -36,7 +36,7 @@ using candidates_memos = std::unordered_map<size_t, llama_grammar_candidates>;
 using stack_memos = std::unordered_map<size_t, candidates_memos>;
 static stack_memos memo_cache;
 
-static void llama_grammar_reset_memos() {
+void llama_grammar_reset_memos() {
     memo_cache.clear();
 }
 
@@ -197,6 +197,7 @@ static std::pair<uint32_t, const char *> parse_char(const char * src) {
             case '"':
             case '[':
             case ']':
+            case '-':
                       return std::make_pair(src[1], src + 2);
             default:
                       throw std::runtime_error(std::string("unknown escape at ") + src);
@@ -673,9 +674,11 @@ const char * llama_grammar_parser::parse_sequence(
             } else {
                 throw std::runtime_error(std::string("expecting ',' at ") + pos);
             }
-            bool has_max = max_times != UINT64_MAX;
-            if (min_times > MAX_REPETITION_THRESHOLD || (has_max && max_times > MAX_REPETITION_THRESHOLD)) {
+            if (min_times > MAX_REPETITION_THRESHOLD) {
                 throw std::runtime_error(std::string("number of repetitions exceeds sane defaults, please reduce the number of repetitions"));
+            }
+            if (max_times != UINT64_MAX && max_times > MAX_REPETITION_THRESHOLD) {
+                max_times = UINT64_MAX;
             }
             handle_repetitions(min_times, max_times);
         } else {
@@ -1197,6 +1200,18 @@ struct llama_grammar * llama_grammar_init_impl(
             vec_rules[i].push_back(*pos);
         }
         vec_rules[i].push_back({LLAMA_GRETYPE_END, 0});
+    }
+
+    // Validate that all rule references point to valid rules
+    for (size_t i = 0; i < n_rules; i++) {
+        for (const auto & elem : vec_rules[i]) {
+            if (elem.type == LLAMA_GRETYPE_RULE_REF) {
+                if (elem.value >= n_rules || vec_rules[elem.value].empty()) {
+                    LLAMA_LOG_ERROR("invalid grammar: rule %zu references undefined rule %u\n", i, elem.value);
+                    return nullptr;
+                }
+            }
+        }
     }
 
     // Check for left recursion

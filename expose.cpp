@@ -213,6 +213,18 @@ extern "C"
     {
         return sdtype_get_info();
     }
+    void sd_abort_generation()
+    {
+        sdtype_abort_generation();
+    }
+    sd_info_outputs sd_get_ongoing_generation_info()
+    {
+        return sdtype_get_ongoing_generation_info();
+    }
+    void sd_request_ongoing_generation_preview()
+    {
+        sdtype_request_ongoing_generation_preview();
+    }
 
     bool whisper_load_model(const whisper_load_model_inputs inputs)
     {
@@ -345,6 +357,25 @@ extern "C"
     const char* get_chat_template() {
         chat_template = gpttype_get_chat_template();
         return chat_template.c_str();
+    }
+
+    static std::string parsed_tool_calls = "";
+    const char* parse_chat_tool_calls(const char * generated_text,
+                                      const char * tools_json,
+                                      const char * chat_template,
+                                      const char * chat_template_kwargs_json,
+                                      const char * tool_choice,
+                                      bool parallel_tool_calls,
+                                      bool is_partial) {
+        parsed_tool_calls = gpttype_parse_chat_tool_calls(
+            generated_text ? generated_text : "",
+            tools_json ? tools_json : "",
+            chat_template ? chat_template : "",
+            chat_template_kwargs_json ? chat_template_kwargs_json : "",
+            tool_choice ? tool_choice : "",
+            parallel_tool_calls,
+            is_partial);
+        return parsed_tool_calls.c_str();
     }
 
     const char* get_pending_output() {

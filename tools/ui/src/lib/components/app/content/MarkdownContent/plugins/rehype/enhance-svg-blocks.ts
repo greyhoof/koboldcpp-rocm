@@ -9,24 +9,20 @@
  * Operates directly on the HAST tree and reuses the shared code-block builders.
  */
 
-import type { Plugin } from 'unified';
-import type { Root, Element, ElementContent } from 'hast';
-import { visit } from 'unist-util-visit';
-import {
-	SVG_WRAPPER_CLASS,
-	SVG_SCROLL_CONTAINER_CLASS,
-	SVG_BLOCK_CLASS,
-	SVG_LANGUAGE,
-	SVG_SOURCE_ATTR,
-	SVG_ID_ATTR
-} from '$lib/constants';
 import {
 	createBlockHeader,
 	createCopyButton,
 	createPreviewButton,
+	createSourceView,
+	createToggleSourceButton,
 	createWrapper,
 	generateBlockId
 } from './code-block-utils';
+import type { DiagramPreData } from './pre-transform';
+import { DIAGRAM_VIEW_MODE_ATTR, DIAGRAM_VIEW_RENDERED, SVG } from '$lib/constants';
+import type { Element, ElementContent, Root } from 'hast';
+import type { Plugin } from 'unified';
+import { visit } from 'unist-util-visit';
 
 declare global {
 	interface Window {
@@ -40,18 +36,19 @@ export const rehypeEnhanceSvgBlocks: Plugin<[], Root> = () => {
 			if (node.tagName !== 'pre' || !parent || index === undefined) return;
 
 			const className = node.properties?.className;
+
 			if (!Array.isArray(className)) return;
 
-			const isSvg = className.some((cls) => typeof cls === 'string' && cls === SVG_BLOCK_CLASS);
+			const isSvg = className.some((cls) => typeof cls === 'string' && cls === SVG.BLOCK_CLASS);
 
 			if (!isSvg) return;
 
-			const svgId = generateBlockId(SVG_LANGUAGE, 'idxSvgBlock');
-
+			const svgId = generateBlockId(SVG.LANGUAGE, 'idxSvgBlock');
 			// Extract the svg source (text content of the pre element)
 			const svgSource = node.children
 				.map((child) => {
 					if (child.type === 'text') return child.value;
+
 					return '';
 				})
 				.join('');
@@ -59,19 +56,29 @@ export const rehypeEnhanceSvgBlocks: Plugin<[], Root> = () => {
 			// Store the svg source in data attribute for copy and render
 			node.properties = {
 				...node.properties,
-				[SVG_SOURCE_ATTR]: svgSource,
-				[SVG_ID_ATTR]: svgId
+				[SVG.ID_ATTR]: svgId,
+				[SVG.SOURCE_ATTR]: svgSource
 			};
 
 			const actions = [
-				createCopyButton(svgId, SVG_ID_ATTR, 'Copy svg source'),
-				createPreviewButton(svgId, SVG_ID_ATTR, 'Preview svg')
+				createCopyButton(svgId, SVG.ID_ATTR, 'Copy svg source'),
+				createToggleSourceButton(svgId, SVG.ID_ATTR, 'Toggle svg source'),
+				createPreviewButton(svgId, SVG.ID_ATTR, 'Preview svg')
 			];
-
-			const header = createBlockHeader(SVG_LANGUAGE, svgId, SVG_ID_ATTR, actions);
-			const wrapper = createWrapper(header, node, SVG_WRAPPER_CLASS, SVG_SCROLL_CONTAINER_CLASS, {
-				[SVG_ID_ATTR]: svgId
-			});
+			const header = createBlockHeader(SVG.LANGUAGE, svgId, SVG.ID_ATTR, actions);
+			const preservedCode = (node.data as DiagramPreData | undefined)?.sourceCode;
+			const sourceView = createSourceView(preservedCode, svgSource, SVG.LANGUAGE);
+			const wrapper = createWrapper(
+				header,
+				node,
+				SVG.WRAPPER_CLASS,
+				SVG.SCROLL_CONTAINER_CLASS,
+				{
+					[DIAGRAM_VIEW_MODE_ATTR]: DIAGRAM_VIEW_RENDERED,
+					[SVG.ID_ATTR]: svgId
+				},
+				[sourceView]
+			);
 
 			// Replace pre with wrapper in parent
 			(parent.children as ElementContent[])[index] = wrapper;

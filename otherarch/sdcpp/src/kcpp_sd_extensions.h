@@ -19,13 +19,14 @@ namespace kcpp_sd {
         bool is_wan;
         bool is_zimage;
         bool is_ltx;
+        bool is_minimaxh3;
+        bool is_boogu;
+        bool supports_ref_image;
         int vae_scale_factor;
         int spatial_multiple;
     };
 
     model_info get_model_info(sd_ctx_t* ctx);
-
-    void SetCircularAxesAll(sd_ctx_t* ctx, bool circular_x, bool circular_y);
 
     void set_lora_cache(sd_ctx_t *ctx, bool enable);
 
